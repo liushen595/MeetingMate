@@ -78,15 +78,20 @@
 *   **设备头**：`X-Client-Id: device_abc`，所有登录后的写接口必填，对应 Block 中的 `client_id`。
 *   **幂等头**：`Idempotency-Key: <uuid>`，所有创建任务、上传、导出、AI 调用和同步写接口必填。服务端以 `user_id + endpoint + Idempotency-Key` 去重。
 *   **请求追踪**：客户端可传 `X-Request-Id`；服务端响应必须返回 `X-Request-Id`，没有传入时由服务端生成。
-*   **分页参数**：列表接口统一使用 `limit` 和 `cursor`，`limit` 默认 20，最大 100。
-*   **分页响应**：列表响应统一返回 `{ "items": [], "next_cursor": null }`。
+*   **分页参数**：列表接口统一使用 `limit` 和 `cursor`，`limit` 默认 20，最大 100。`cursor` 是服务端生成的不透明字符串，客户端只能保存和回传，不得解析、拼接或假设其内部结构。
+*   **分页响应**：列表响应统一返回 `{ "items": [], "next_cursor": null, "sort_by": "updated_at,id", "sort_order": "desc" }`。`next_cursor` 只保证在当前资源 revision 附近稳定，不承诺永久有效。
 *   **ID 格式**：服务端生成带前缀字符串 ID，例如 `u_`、`device_`、`asset_`、`m_`、`doc_`、`block_`、`task_`、`export_`。
 *   **权限模型**：MVP 支持 `owner`、`editor`、`viewer` 三种文档权限；默认新建文档和手稿只有 `owner` 可访问。
 *   **平台枚举**：`platform` 固定为 `ios`、`android`、`mac`、`windows`、`web`。
 *   **Token 时效**：`access_token` 有效期 30 分钟，`refresh_token` 有效期 30 天。刷新成功后旧 refresh token 立即失效，采用轮换机制。
 *   **限流响应**：超过限制返回 `429 Too Many Requests`，响应头包含 `Retry-After` 秒数。
-*   **写入字段归属**：客户端负责生成 `block.id`、`op_id`、`client_id`、`platform` 和离线编辑时的 `created_at` / `updated_at`；服务端根据 Token 校验或填充 `author_id`，并生成资源级 `revision`。如果请求体中的 `author_id` 与当前 Token 用户不一致，返回 `422 validation_error`。
+*   **写入字段归属**：客户端负责生成 `block.id`、`op_id`、`client_id`、`platform` 和离线编辑时的 `created_at`；服务端根据 Token 校验或填充 `author_id`，并生成资源级 `revision`。如果请求体中的 `author_id` 与当前 Token 用户不一致，返回 `422 validation_error`。
 *   **Revision 规则**：`base_revision` 必须等于客户端最后一次成功同步时拿到的资源级 `revision`。服务端成功应用操作后，资源级 `revision` 自增；Block 级 `revision` 用于定位 Block 内部变更，不作为资源级冲突判断的唯一依据。
+*   **幂等有效期**：`Idempotency-Key` 有效期 24 小时。服务端缓存 `(user_id, endpoint, key) -> {request_hash, response}`；请求体 hash 相同则返回缓存响应，请求体 hash 不同则返回 `409 idempotency_conflict`。缓存丢失时允许重新执行，业务层仍需通过资源 ID、任务 ID 或引用计数避免不可逆副作用。
+*   **时间可信度**：客户端提交的 `created_at` 用于还原离线创作时间，服务端不覆盖，但必须校验与服务端当前时间差不超过 24 小时，超出返回 `422 validation_error`。客户端提交的 `updated_at` 仅作参考，服务端成功写入后使用服务端时间覆盖。审计、排序和排障以服务端内部 `server_received_at` 为准，该字段不对客户端暴露。
+*   **MVP 富文本边界**：MVP 所有文本类 `props.content` 都是纯文本字符串，不支持行内加粗、斜体、下划线、链接、评论锚点或混合 inline JSON。移动端和电脑端都必须按纯文本处理。行内格式属于 P1 能力，启用前必须先扩展 `DocumentBlock.props` 契约并通过 OpenAPI/codegen 同步三端类型。
+*   **大对象限制**：单次同步 `operations` 最多 100 条；单个 Block JSON 序列化后最大 256KB；单个 `handwriting.props.strokes` 总点数最多 5000。超过限制时客户端必须拆分为多个 handwriting Block，或将渲染结果上传为 `image_asset_id` 并保留精简 strokes。超限请求返回 `413 payload_too_large`。
+*   **source_refs 归属**：`source_refs` 只能由服务端写入和更新。客户端同步 Document Block 时如果携带 `source_refs`，服务端必须忽略该字段并保留服务端已有值；用户编辑 `props.content`、移动 Block 或改变 Block type 不会自动清空 `source_refs`。重新转换手稿会创建新 Document，不覆盖旧 Document 的 `source_refs`。
 
 统一错误结构：
 
@@ -114,6 +119,7 @@
 | 404 | `not_found` | 资源不存在 |
 | 409 | `revision_conflict` | `revision` 冲突，需要客户端拉取最新状态 |
 | 409 | `idempotency_conflict` | 同一幂等键被用于不同请求体 |
+| 409 | `resource_conflict` | 删除或状态变更与当前资源引用关系冲突 |
 | 413 | `payload_too_large` | 文件或请求体超过限制 |
 | 422 | `validation_error` | 字段格式正确但业务校验失败 |
 | 429 | `rate_limited` | 触发限流或配额 |
@@ -168,6 +174,19 @@ Asset 结构：
 ```
 
 `asset.kind` 取值：`audio`、`image`、`export`、`attachment`。`asset.status` 取值：`pending_upload`、`uploaded`、`ready`、`failed`。
+
+Asset 状态机：
+
+| 当前状态 | 触发 | 下一状态 | 说明 |
+|---|---|---|---|
+| `pending_upload` | `POST /assets/upload` 创建 | `pending_upload` | 服务端只生成预签名上传地址，文件尚未确认上传 |
+| `pending_upload` | 客户端上传对象存储成功后调用 `/complete` | `uploaded` | 服务端校验 `size_bytes` 和 `checksum_sha256` |
+| `uploaded` | 服务端完成元数据解析或安全检查 | `ready` | Block 只能引用 `ready` 状态的 Asset |
+| `pending_upload` / `uploaded` | 校验失败、超时或对象不存在 | `failed` | 客户端可重新创建 Asset 上传 |
+
+`pending_upload` 超过 24 小时未完成时，服务端可以自动标记为 `failed`。`ready` Asset 被 Block 引用后不能直接删除，必须先删除或改写引用它的 Block。
+
+上传协议：MVP 统一使用预签名 multipart 上传。图片和小文件也可以只有 1 个 part；音频默认分片大小为 5MB。客户端本地必须保存 `asset_id`、`upload_id` 和已完成的 `part_number`，用于弱网断点续传。
 
 音频 speaker segment 结构：
 
@@ -300,6 +319,12 @@ Document 结构：
   "title": "会议纪要",
   "owner_id": "u_123",
   "source_manuscript_ids": ["m_88392"],
+  "derived_from": {
+    "manuscript_id": "m_88392",
+    "task_id": "task_123",
+    "mode": "meeting_minutes",
+    "converted_at": "2026-07-14T10:10:00Z"
+  },
   "revision": 18,
   "blocks": [],
   "permission": "owner",
@@ -307,6 +332,8 @@ Document 结构：
   "updated_at": "2026-07-14T10:10:00Z"
 }
 ```
+
+手动创建的空白 Document 的 `derived_from` 为 `null`。由 Manuscript 转换生成的 Document 必须写入 `derived_from`。
 
 同步操作结构：
 
@@ -323,6 +350,15 @@ Document 结构：
 ```
 
 `operation.type` 取值：`upsert_block`、`delete_block`、`move_block`、`restore_block`。`upsert_block` 必须传 `block`；`delete_block` 和 `restore_block` 必须传 `block_id`；`move_block` 必须传 `block_id`，并在 `before_block_id` 或 `after_block_id` 中至少传一个。
+
+同步提交语义：
+
+*   服务端必须按 `operations` 数组顺序执行。
+*   单次同步请求是原子事务，成功则全部 operations 生效，失败则全部不生效。
+*   任意 op 校验失败、权限失败或发生不可安全合并的冲突时，整个请求失败。
+*   MVP 不做部分成功，不返回“部分 op 已应用”的状态。
+*   成功时资源级 `revision` 只自增一次，`applied_op_ids` 必须等于请求内全部 `op_id`。
+*   `applied_op_ids` 主要用于调试和幂等响应，不作为客户端判断部分成功的依据。
 
 同步响应结构：
 
@@ -368,6 +404,7 @@ Document 结构：
   "result": null,
   "error": null,
   "retry_count": 0,
+  "billing": null,
   "created_at": "2026-07-14T10:00:00Z",
   "updated_at": "2026-07-14T10:01:00Z"
 }
@@ -398,6 +435,8 @@ Document 结构：
   "export_document": {
     "export_id": "export_123",
     "asset_id": "asset_export1",
+    "document_id": "doc_123",
+    "document_revision": 19,
     "format": "pdf"
   },
   "ai_rewrite": {
@@ -506,7 +545,9 @@ Response `200`:
       "created_at": "2026-07-01T10:00:00Z"
     }
   ],
-  "next_cursor": null
+  "next_cursor": null,
+  "sort_by": "last_seen_at,id",
+  "sort_order": "desc"
 }
 ```
 
@@ -522,7 +563,8 @@ Request:
   "filename": "meeting.m4a",
   "content_type": "audio/mp4",
   "size_bytes": 10485760,
-  "checksum_sha256": "hex_sha256"
+  "checksum_sha256": "hex_sha256",
+  "part_size_bytes": 5242880
 }
 ```
 
@@ -531,16 +573,49 @@ Response `201`:
 ```json
 {
   "asset_id": "asset_rec1",
-  "upload": {
-    "method": "PUT",
-    "url": "https://object-storage.example/presigned-put",
-    "headers": {
-      "Content-Type": "audio/mp4"
+  "upload_id": "upload_123",
+  "part_size_bytes": 5242880,
+  "parts": [
+    {
+      "part_number": 1,
+      "upload_url": "https://object-storage.example/presigned-part-1",
+      "headers": { "Content-Type": "audio/mp4" },
+      "expires_at": "2026-07-14T10:15:00Z"
     },
-    "expires_at": "2026-07-14T10:15:00Z"
-  }
+    {
+      "part_number": 2,
+      "upload_url": "https://object-storage.example/presigned-part-2",
+      "headers": { "Content-Type": "audio/mp4" },
+      "expires_at": "2026-07-14T10:15:00Z"
+    }
+  ]
 }
 ```
+
+`GET /assets/{asset_id}/upload-parts`
+
+Response `200`:
+
+```json
+{
+  "asset_id": "asset_rec1",
+  "upload_id": "upload_123",
+  "part_size_bytes": 5242880,
+  "uploaded_parts": [
+    { "part_number": 1, "etag": "etag_part_1", "size_bytes": 5242880 }
+  ],
+  "missing_parts": [
+    {
+      "part_number": 2,
+      "upload_url": "https://object-storage.example/presigned-part-2",
+      "headers": { "Content-Type": "audio/mp4" },
+      "expires_at": "2026-07-14T10:15:00Z"
+    }
+  ]
+}
+```
+
+客户端断点续传时先调用该接口，跳过 `uploaded_parts`，只上传 `missing_parts`。预签名 URL 过期时也通过该接口重新获取。
 
 `POST /assets/{asset_id}/complete`
 
@@ -548,15 +623,20 @@ Request:
 
 ```json
 {
+  "upload_id": "upload_123",
   "size_bytes": 10485760,
   "checksum_sha256": "hex_sha256",
+  "parts": [
+    { "part_number": 1, "etag": "etag_part_1", "size_bytes": 5242880 },
+    { "part_number": 2, "etag": "etag_part_2", "size_bytes": 5242880 }
+  ],
   "duration_ms": 120000,
   "width": null,
   "height": null
 }
 ```
 
-Response `200`：返回完整 Asset 结构。
+Response `200`：返回完整 Asset 结构。服务端必须校验 `parts` 连续完整、总大小等于 `size_bytes`、对象存储返回的 ETag 匹配、最终文件 `checksum_sha256` 匹配。校验失败返回 `422 validation_error`，Asset 状态变为 `failed`。
 
 `GET /assets/{asset_id}`
 
@@ -584,7 +664,9 @@ Response `200`:
       "updated_at": "2026-07-14T10:03:00Z"
     }
   ],
-  "next_cursor": null
+  "next_cursor": null,
+  "sort_by": "updated_at,id",
+  "sort_order": "desc"
 }
 ```
 
@@ -605,6 +687,22 @@ Response `201`：返回完整 Manuscript 结构。
 `GET /manuscripts/{manuscript_id}`
 
 Response `200`：返回完整 Manuscript 结构，包含未删除和软删除 Block。客户端默认隐藏 `deleted: true` 的 Block。
+
+`GET /manuscripts/{manuscript_id}/blocks?limit=100&cursor=...`
+
+Response `200`:
+
+```json
+{
+  "items": [],
+  "next_cursor": null,
+  "sort_by": "order_key,id",
+  "sort_order": "asc",
+  "revision": 12
+}
+```
+
+当 Manuscript Block 数量超过 100 或响应体预计超过 1MB 时，客户端必须使用 blocks 分页接口加载，不应依赖 `GET /manuscripts/{id}` 一次性获取全部内容。
 
 `PUT /manuscripts/{manuscript_id}/blocks`
 
@@ -687,13 +785,21 @@ Response `200`:
       "title": "会议纪要",
       "owner_id": "u_123",
       "source_manuscript_ids": ["m_88392"],
+      "derived_from": {
+        "manuscript_id": "m_88392",
+        "task_id": "task_123",
+        "mode": "meeting_minutes",
+        "converted_at": "2026-07-14T10:10:00Z"
+      },
       "revision": 18,
       "permission": "owner",
       "created_at": "2026-07-14T10:05:00Z",
       "updated_at": "2026-07-14T10:10:00Z"
     }
   ],
-  "next_cursor": null
+  "next_cursor": null,
+  "sort_by": "updated_at,id",
+  "sort_order": "desc"
 }
 ```
 
@@ -706,6 +812,7 @@ Request:
   "title": "空白文档",
   "client_id": "device_desktop_001",
   "source_manuscript_ids": [],
+  "derived_from": null,
   "initial_blocks": []
 }
 ```
@@ -715,6 +822,22 @@ Response `201`：返回完整 Document 结构。
 `GET /documents/{document_id}`
 
 Response `200`：返回完整 Document 结构。
+
+`GET /documents/{document_id}/blocks?limit=100&cursor=...`
+
+Response `200`:
+
+```json
+{
+  "items": [],
+  "next_cursor": null,
+  "sort_by": "order_key,id",
+  "sort_order": "asc",
+  "revision": 18
+}
+```
+
+当 Document Block 数量超过 100 或响应体预计超过 1MB 时，客户端必须使用 blocks 分页接口加载。
 
 `PUT /documents/{document_id}/blocks`
 
@@ -738,15 +861,7 @@ Request:
         "client_id": "device_desktop_001",
         "platform": "mac",
         "deleted": false,
-        "props": { "content": "本次会议决定推进移动端优先。" },
-        "source_refs": [
-          {
-            "manuscript_id": "m_88392",
-            "block_id": "block_audio1",
-            "range": { "start_ms": 12000, "end_ms": 18000 },
-            "region": null
-          }
-        ]
+        "props": { "content": "本次会议决定推进移动端优先。" }
       },
       "block_id": null,
       "before_block_id": null,
@@ -785,7 +900,9 @@ Response `200`:
       "created_at": "2026-07-14T10:10:00Z"
     }
   ],
-  "next_cursor": null
+  "next_cursor": null,
+  "sort_by": "created_at,id",
+  "sort_order": "desc"
 }
 ```
 
@@ -830,7 +947,58 @@ Response `201`:
 
 Response `200`：返回完整 Document 结构，其中 `permission` 为分享链接授予的权限。分享链接过期返回 `403 forbidden`。
 
-#### 7. Task 与 AI API
+#### 7. 删除与级联 API
+
+`DELETE /documents/{document_id}`
+
+Response `204`：硬删除 Document。删除 Document 不会删除关联 Manuscript 和 Asset。已经生成的 export 文件保留到对象存储生命周期自动清理。
+
+`DELETE /manuscripts/{manuscript_id}`
+
+Response `200`：软删除 Manuscript，返回更新后的 Manuscript 元数据。关联 Document 保留，`source_manuscript_ids` 不删除，但客户端展示时应把已删除来源标记为 tombstone。
+
+```json
+{
+  "id": "m_88392",
+  "deleted": true,
+  "deleted_at": "2026-07-14T10:20:00Z"
+}
+```
+
+`DELETE /assets/{asset_id}`
+
+Response `204`：仅当没有任何 Block 引用该 Asset 时允许删除。仍被引用时返回 `409 resource_conflict`，`details.reason` 为 `still_referenced`。
+
+#### 8. Manuscript 到 Document 转换规则
+
+`POST /tasks/convert-manuscript` 必须遵循以下 MVP 转换规则，保证后端、电脑端和移动端对 AI 生成结果的结构理解一致。
+
+| Manuscript 输入 | Document 输出 | 顺序规则 | source_refs 规则 |
+|---|---|---|---|
+| `text.props.content` | `paragraph.props.content` | 按 Manuscript Block 顺序 | 指向原 text Block，`range` 和 `region` 为 `null` |
+| `audio.props.transcript` | 一个或多个 `paragraph` | 按 `speaker_segments.start_ms` 升序；无 speaker_segments 时按 transcript 原文顺序 | 每个 paragraph 指向对应 audio Block；有时间段时写入 `range` |
+| `handwriting.props.ai_text` | `paragraph`，如果 AI 判断为短标题可生成 `heading` | 保持原 handwriting Block 在时间线中的位置 | 指向 handwriting Block；有区域识别时写入 `region`，否则 `region: null` |
+| `image` | `image` | 保持原 image Block 在时间线中的位置 | 指向 image Block；caption 从 `image.props.caption` 或 AI 识别结果生成 |
+
+转换补充规则：
+
+*   同一 Manuscript 可以多次转换，每次转换都创建新的 Document，绝不覆盖已有 Document。
+*   `convert-manuscript` 任务成功后，Document 必须带 `source_manuscript_ids`，并写入 `derived_from` 元数据。
+*   如果原 Document 已被用户编辑，重新转换不会合并到该 Document；“覆盖原 Document”属于 P1+ 能力。
+*   LLM 只能输出符合 `DocumentBlock.type` 和 `props` 枚举的结构；无法可靠识别的内容降级为 `paragraph` 纯文本。
+
+`derived_from` 结构：
+
+```json
+{
+  "manuscript_id": "m_88392",
+  "task_id": "task_123",
+  "mode": "meeting_minutes",
+  "converted_at": "2026-07-14T10:10:00Z"
+}
+```
+
+#### 9. Task 与 AI API
 
 `POST /tasks/convert-manuscript`
 
@@ -878,6 +1046,38 @@ Response `200`：返回任务结构。
 
 Response `200`：返回取消后的任务结构。只有 `queued` 和 `processing` 状态允许取消。
 
+取消规则：
+
+*   `queued` 任务取消后不扣 AI 配额。
+*   `processing` 任务会尽力取消外部模型请求；如果外部请求已完成或不可取消，仍可能产生外部成本，但用户侧不扣未完成任务配额。
+*   取消成功后的任务状态固定为 `cancelled`，任务产物不得写入 Document。
+*   同一个 `Idempotency-Key` 在 24 小时内重新提交同一请求时仍返回原取消任务；用户要重新执行必须使用新的 `Idempotency-Key`。
+
+取消后的任务示例：
+
+```json
+{
+  "id": "task_123",
+  "type": "convert_manuscript",
+  "status": "cancelled",
+  "progress": {
+    "stage": "completed",
+    "current": 0,
+    "total": 0,
+    "message": "任务已取消"
+  },
+  "result": null,
+  "error": null,
+  "retry_count": 0,
+  "billing": {
+    "charged": false,
+    "external_request_cancelled": true
+  },
+  "created_at": "2026-07-14T10:00:00Z",
+  "updated_at": "2026-07-14T10:01:00Z"
+}
+```
+
 `POST /ai/agent/chat`
 
 Request:
@@ -895,15 +1095,20 @@ Request:
 Response `200`，`Content-Type: text/event-stream`。SSE 事件格式：
 
 ```text
+id: 1
 event: delta
 data: {"text":"本次"}
 
+id: 2
 event: delta
 data: {"text":"会议"}
 
+id: 3
 event: done
 data: {"message_id":"msg_123","usage":{"input_tokens":1200,"output_tokens":300}}
 ```
+
+SSE 连接规则：服务端每 15 秒发送一次 `: heartbeat\n\n`；单连接最长 30 分钟，到时服务端正常关闭，客户端可自动重连。客户端断线重连时携带 `Last-Event-ID`，服务端在任务结果仍可用时从该事件之后继续发送；如果结果缓存已过期，返回 `400 invalid_request`，客户端需要重新发起 AI 请求。
 
 错误事件：
 
@@ -949,7 +1154,7 @@ data: {"code":"ai_unavailable","message":"AI service is temporarily unavailable.
 }
 ```
 
-#### 8. Export API
+#### 10. Export API
 
 `POST /exports`
 
@@ -971,6 +1176,22 @@ Response `202`：返回任务结构。任务成功后的 `result`：
 {
   "export_id": "export_123",
   "asset_id": "asset_export1",
+  "document_id": "doc_123",
+  "document_revision": 19,
+  "format": "pdf"
+}
+```
+
+导出快照规则：提交导出任务时，服务端必须基于当前 `document_id + revision` 创建不可变快照，并在导出任务中使用该快照。导出过程中用户继续编辑 Document 不影响本次导出结果。`export_id` 必须关联创建时的 `document_revision`。
+
+Export 结果结构：
+
+```json
+{
+  "export_id": "export_123",
+  "asset_id": "asset_export1",
+  "document_id": "doc_123",
+  "document_revision": 19,
   "format": "pdf"
 }
 ```
@@ -987,6 +1208,59 @@ Response `200`:
 ```
 
 服务端必须在生成 `download_url` 前校验当前用户对 `document_id` 的访问权限。
+
+#### 11. 契约维护与并行开发流程
+
+为了支持电脑端、移动端和后端并行开发，API 契约必须以 OpenAPI 3.1 作为唯一真相源。
+
+*   **契约源文件**：后端使用 FastAPI + Pydantic 定义请求、响应和错误模型，并导出 OpenAPI 3.1 schema。
+*   **类型生成**：前端使用 `openapi-typescript` 从 OpenAPI schema 生成 TypeScript 类型，生成结果放入 `packages/shared-types/`，电脑端和移动端共用。
+*   **变更流程**：任何接口字段、枚举、错误码、状态机变更，都必须先改 OpenAPI schema，再生成 types，最后改实现。禁止前端或后端私自扩展未入 schema 的字段。
+*   **Mock 服务**：后端未完成时，前端使用 OpenAPI mock 服务（Prism 或 WireMock）开发 P0 流程；mock 必须覆盖注册登录、资产上传、手稿创建、同步、转换任务、文档读取和导出。
+*   **CI 校验**：CI 必须检查 OpenAPI schema、生成的 TypeScript 类型和文档示例是否同步；schema 漂移时阻止合并。
+*   **兼容策略**：MVP 阶段不做破坏性 API 变更。确需变更字段语义时，必须同时更新 OpenAPI、文档、mock、前端类型和后端实现。
+
+#### 12. 并行开工补充条款
+
+以下条款是三端并行开发的开工 gate，必须在 Sprint 1 第一个开发日确认，不作为后续争议项。
+
+Cursor 排序规则：
+
+| 接口 | sort_by | sort_order | cursor 说明 |
+|---|---|---|---|
+| `GET /documents` | `updated_at,id` | `desc` | opaque，服务端内部可编码 `updated_at + id` |
+| `GET /manuscripts` | `updated_at,id` | `desc` | opaque，服务端内部可编码 `updated_at + id` |
+| `GET /documents/{id}/blocks` | `order_key,id` | `asc` | opaque，服务端内部可编码 `order_key + block_id` |
+| `GET /manuscripts/{id}/blocks` | `order_key,id` | `asc` | opaque，服务端内部可编码 `order_key + block_id` |
+| `GET /documents/{id}/versions` | `created_at,id` | `desc` | opaque，服务端内部可编码 `created_at + id` |
+
+同步与离线队列：服务端按 `operations` 数组顺序原子执行。客户端某个 `base_revision` 同步成功后，可以删除该 revision 之前的本地操作日志；失败日志最多本地保留 7 天用于排障，超过后可清理。
+
+OpenAPI / Mock 开工 gate：后端必须先产出覆盖 P0 接口的 `openapi.json` 初版；前端通过 `openapi-typescript` 生成 `packages/shared-types/`；Mock 服务必须为每个 P0 接口提供至少一个 success fixture 和一个 error fixture。P0 mock 覆盖范围固定为：
+
+```text
+POST /auth/register
+POST /auth/login
+POST /auth/refresh
+POST /assets/upload
+GET /assets/{asset_id}/upload-parts
+POST /assets/{asset_id}/complete
+GET /manuscripts
+POST /manuscripts
+PUT /manuscripts/{id}/blocks
+POST /tasks/convert-manuscript
+GET /tasks/{id}
+GET /documents/{id}
+PUT /documents/{id}/blocks
+POST /exports
+GET /exports/{id}/download
+```
+
+ASR 重跑规则：MVP 不保存多版本 ASR。二次 ASR 成功后覆盖 `audio.props.transcript` 和 `audio.props.speaker_segments`，并写入 `audio.props.asr_task_id`、`audio.props.asr_generated_at`。ASR 多版本、版本切换和人工对比属于 P1。
+
+AI 消息历史：MVP 的 AI Agent 以“生成 -> 预览 -> 应用”为主，不要求保存完整消息历史。`GET /documents/{id}/ai-messages` 属于 Sprint 1 可补接口，但不阻塞 P0 mock 和三端开工。
+
+设备远程撤销：`DELETE /devices/{device_id}` 属于 Sprint 1 可补接口；P0 依赖当前设备 `logout` 和 30 分钟 access token 过期机制，不阻塞三端开工。
 
 ---
 
