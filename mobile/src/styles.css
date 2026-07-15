@@ -74,7 +74,21 @@ select {
 }
 
 .hero-card {
-  padding: 28px;
+  position: relative;
+  overflow: hidden;
+  padding: 24px 22px 22px;
+}
+
+.hero-card::after {
+  position: absolute;
+  right: -42px;
+  bottom: -48px;
+  width: 150px;
+  height: 150px;
+  border-radius: 999px;
+  background: radial-gradient(circle, rgba(183, 128, 62, 0.18), transparent 68%);
+  content: "";
+  pointer-events: none;
 }
 
 .hero-card h1,
@@ -87,14 +101,16 @@ select {
 
 .hero-card h1 {
   max-width: 680px;
-  font-size: clamp(2rem, 12vw, 4.8rem);
-  line-height: 0.92;
+  font-size: clamp(2rem, 9.6vw, 3.15rem);
+  line-height: 1.03;
 }
 
 .hero-card p:last-child {
   max-width: 38rem;
+  margin: 16px 0 0;
   color: #76624c;
-  line-height: 1.7;
+  font-size: 0.96rem;
+  line-height: 1.68;
 }
 
 .eyebrow {
@@ -115,15 +131,15 @@ select {
 .quick-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 12px;
-  margin: 18px 0 28px;
+  gap: 10px;
+  margin: 14px 0 24px;
 }
 
 .quick-card {
-  min-height: 150px;
+  min-height: 128px;
   border: 0;
-  border-radius: 28px;
-  padding: 18px;
+  border-radius: 24px;
+  padding: 16px;
   color: white;
   text-align: left;
   box-shadow: 0 16px 40px rgba(62, 46, 23, 0.18);
@@ -147,8 +163,34 @@ select {
 }
 
 .quick-card strong {
-  margin-top: 28px;
-  font-size: 1.05rem;
+  margin-top: 22px;
+  font-size: 1rem;
+  line-height: 1.32;
+}
+
+@media (max-width: 359px) {
+  .home-screen {
+    padding-right: 14px;
+    padding-left: 14px;
+  }
+
+  .hero-card {
+    padding: 22px 18px 20px;
+  }
+
+  .hero-card h1 {
+    font-size: 1.82rem;
+  }
+
+  .quick-card {
+    min-height: 116px;
+    padding: 14px;
+  }
+
+  .quick-card strong {
+    margin-top: 18px;
+    font-size: 0.94rem;
+  }
 }
 
 .home-dashboard-grid {
@@ -1240,6 +1282,7 @@ select {
 
   .hero-card h1 {
     font-size: 4.8rem;
+    line-height: 0.92;
   }
 
   .library-list {

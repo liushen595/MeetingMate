@@ -1,5 +1,6 @@
-import { useMemo, useState, type ReactNode } from "react";
-import type { DocumentSummary, ManuscriptSummary } from "../types/api";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { api, ApiError } from "../lib/api";
+import type { DocumentSummary, GroupDocumentMessage, GroupSummary, ManuscriptSummary } from "../types/api";
 import { formatRelativeTime } from "../lib/ids";
 
 type MeetingSchedule = {
@@ -20,22 +21,6 @@ type MeetingDraft = {
   startAt: string;
   endAt: string;
   notes: string;
-};
-
-type GroupSummary = {
-  id: string;
-  name: string;
-  inviteCode: string;
-  inviteCodeExpiresAt: string;
-  memberCount: number;
-};
-
-type GroupDocumentMessage = {
-  id: string;
-  groupId: string;
-  senderName: string;
-  documentTitle: string;
-  sentAt: string;
 };
 
 const MEETINGS_KEY = "meetingmate.local.meetings";
@@ -69,11 +54,66 @@ export function HomePage(props: HomePageProps) {
   const [inviteCode, setInviteCode] = useState("");
   const [selectedGroupId, setSelectedGroupId] = useState("");
   const [selectedDocumentId, setSelectedDocumentId] = useState("");
+  const [groupLoading, setGroupLoading] = useState(false);
+  const [messageLoading, setMessageLoading] = useState(false);
+  const [groupAction, setGroupAction] = useState<"create" | "join" | "send" | "download" | null>(null);
+  const [groupError, setGroupError] = useState<string | null>(null);
   const latestManuscript = props.manuscripts[0];
   const latestDocument = props.documents[0];
   const nextMeeting = useMemo(() => getNextMeeting(meetings), [meetings]);
   const activeGroup = groups.find((group) => group.id === selectedGroupId) ?? groups[0];
   const activeMessages = messages.filter((message) => message.groupId === activeGroup?.id);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadGroups() {
+      setGroupLoading(true);
+      setGroupError(null);
+      try {
+        const nextGroups = await api.listGroups();
+        if (cancelled) return;
+        setGroups(nextGroups);
+        setSelectedGroupId((current) => nextGroups.some((group) => group.id === current) ? current : nextGroups[0]?.id || "");
+      } catch (error) {
+        if (!cancelled) setGroupError(errorMessage(error, "组列表加载失败"));
+      } finally {
+        if (!cancelled) setGroupLoading(false);
+      }
+    }
+
+    void loadGroups();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!activeGroup) {
+      setMessages([]);
+      return;
+    }
+    let cancelled = false;
+
+    async function loadMessages() {
+      setMessageLoading(true);
+      setGroupError(null);
+      try {
+        const nextMessages = await api.listGroupMessages(activeGroup.id);
+        if (cancelled) return;
+        setMessages((current) => [...current.filter((message) => message.groupId !== activeGroup.id), ...nextMessages]);
+      } catch (error) {
+        if (!cancelled) setGroupError(errorMessage(error, "组消息加载失败"));
+      } finally {
+        if (!cancelled) setMessageLoading(false);
+      }
+    }
+
+    void loadMessages();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeGroup?.id]);
 
   function persistMeetings(nextMeetings: MeetingSchedule[]) {
     const sortedMeetings = [...nextMeetings].sort(sortByStartAt);
@@ -122,46 +162,69 @@ export function HomePage(props: HomePageProps) {
     await props.onCreateManuscript(nextMeeting.title);
   }
 
-  function createGroup() {
+  async function createGroup() {
     if (!groupName.trim()) return;
-    const now = Date.now();
-    const group: GroupSummary = {
-      id: `group-${crypto.randomUUID()}`,
-      name: groupName.trim(),
-      inviteCode: String(Math.floor(100000 + Math.random() * 900000)),
-      inviteCodeExpiresAt: new Date(now + 24 * 60 * 60 * 1000).toISOString(),
-      memberCount: 1,
-    };
-    setGroups((current) => [group, ...current]);
-    setSelectedGroupId(group.id);
-    setGroupName("");
-    setGroupDialog(null);
+    setGroupAction("create");
+    setGroupError(null);
+    try {
+      const group = await api.createGroup(groupName.trim());
+      setGroups((current) => [group, ...current.filter((item) => item.id !== group.id)]);
+      setSelectedGroupId(group.id);
+      setGroupName("");
+      setGroupDialog(null);
+    } catch (error) {
+      setGroupError(errorMessage(error, "创建组失败"));
+    } finally {
+      setGroupAction(null);
+    }
   }
 
-  function joinGroup() {
+  async function joinGroup() {
     if (!/^\d{6}$/.test(inviteCode)) return;
-    const group: GroupSummary = {
-      id: `group-${crypto.randomUUID()}`,
-      name: `口令组 ${inviteCode}`,
-      inviteCode,
-      inviteCodeExpiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
-      memberCount: 2,
-    };
-    setGroups((current) => [group, ...current]);
-    setSelectedGroupId(group.id);
-    setInviteCode("");
-    setGroupDialog(null);
+    setGroupAction("join");
+    setGroupError(null);
+    try {
+      const group = await api.joinGroup(inviteCode);
+      setGroups((current) => [group, ...current.filter((item) => item.id !== group.id)]);
+      setSelectedGroupId(group.id);
+      setInviteCode("");
+      setGroupDialog(null);
+    } catch (error) {
+      setGroupError(errorMessage(error, "加入组失败", { 404: "口令不存在", 403: "口令已过期" }));
+    } finally {
+      setGroupAction(null);
+    }
   }
 
-  function sendDocumentToGroup() {
-    const group = groups.find((item) => item.id === activeGroup?.id);
-    const document = props.documents.find((item) => item.id === selectedDocumentId);
-    if (!group || !document) return;
-    setMessages((current) => [
-      { id: `msg-${crypto.randomUUID()}`, groupId: group.id, senderName: "我", documentTitle: document.title, sentAt: new Date().toISOString() },
-      ...current,
-    ]);
-    setSelectedDocumentId("");
+  async function sendDocumentToGroup() {
+    if (!activeGroup || !selectedDocumentId) return;
+    setGroupAction("send");
+    setGroupError(null);
+    try {
+      const message = await api.sendDocumentToGroup(activeGroup.id, selectedDocumentId);
+      setMessages((current) => [message, ...current.filter((item) => item.id !== message.id)]);
+      setSelectedDocumentId("");
+    } catch (error) {
+      setGroupError(errorMessage(error, "发送文档失败"));
+    } finally {
+      setGroupAction(null);
+    }
+  }
+
+  async function downloadGroupDocument(message: GroupDocumentMessage) {
+    if (!activeGroup) return;
+    setGroupAction("download");
+    setGroupError(null);
+    try {
+      const blob = await api.downloadGroupDocument(activeGroup.id, message.id, "docx");
+      const objectUrl = URL.createObjectURL(blob);
+      window.open(objectUrl, "_blank");
+      window.setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
+    } catch (error) {
+      setGroupError(errorMessage(error, "下载失败", { 403: "你不是该组成员或登录已过期" }));
+    } finally {
+      setGroupAction(null);
+    }
   }
 
   return (
@@ -233,7 +296,7 @@ export function HomePage(props: HomePageProps) {
             <div>
               <p className="eyebrow">Groups</p>
               <h2>用户组</h2>
-              <p className="panel-copy">组功能先提供 UI 原型，服务器 API 待实现。</p>
+              <p className="panel-copy">创建或加入组后，可把文档快照发送给组成员。</p>
             </div>
             <div className="panel-actions">
               <button className="primary-small" onClick={() => setGroupDialog("create")} type="button">创建组</button>
@@ -241,7 +304,8 @@ export function HomePage(props: HomePageProps) {
             </div>
           </div>
 
-          {groups.length === 0 ? (
+          {groupError ? <button className="toast inline" onClick={() => setGroupError(null)} type="button">{groupError}</button> : null}
+          {groupLoading ? <div className="empty-panel groups-empty"><span>正在加载组列表...</span></div> : groups.length === 0 ? (
             <div className="empty-panel groups-empty">
               <span>还没有组。创建组会生成 6 位数字口令码，有效期一天。</span>
             </div>
@@ -264,17 +328,20 @@ export function HomePage(props: HomePageProps) {
                       <option value="">选择库中文档</option>
                       {props.documents.map((document) => <option key={document.id} value={document.id}>{document.title}</option>)}
                     </select>
-                    <button className="primary-small" disabled={!selectedDocumentId} onClick={sendDocumentToGroup} type="button">发送</button>
+                    <button className="primary-small" disabled={!selectedDocumentId || !activeGroup || groupAction === "send"} onClick={() => void sendDocumentToGroup()} type="button">
+                      {groupAction === "send" ? "发送中" : "发送"}
+                    </button>
                   </div>
                   <div className="message-stack">
-                    {activeMessages.length === 0 ? <div className="message-empty">暂无文档消息。</div> : null}
+                    {messageLoading ? <div className="message-empty">正在加载文档消息...</div> : null}
+                    {!messageLoading && activeMessages.length === 0 ? <div className="message-empty">暂无文档消息。</div> : null}
                     {activeMessages.map((message) => (
                       <div className="message-row" key={message.id}>
                         <div>
                           <strong>{message.documentTitle}</strong>
-                          <small>{message.senderName} · {formatDateTime(message.sentAt)}</small>
+                          <small>{displaySenderName(message.senderName)} · {formatDateTime(message.sentAt)}</small>
                         </div>
-                        <button className="ghost-button" type="button">下载</button>
+                        <button className="ghost-button" disabled={groupAction === "download"} onClick={() => void downloadGroupDocument(message)} type="button">下载</button>
                       </div>
                     ))}
                   </div>
@@ -327,15 +394,20 @@ export function HomePage(props: HomePageProps) {
 
       {groupDialog ? (
         <MobileDialog title={groupDialog === "create" ? "创建组" : "加入组"} onClose={() => setGroupDialog(null)}>
+          {groupError ? <p className="form-error">{groupError}</p> : null}
           {groupDialog === "create" ? (
             <>
               <input onChange={(event) => setGroupName(event.target.value)} placeholder="组名称" value={groupName} />
-              <button className="primary-button" disabled={!groupName.trim()} onClick={createGroup} type="button">创建并生成口令</button>
+              <button className="primary-button" disabled={!groupName.trim() || groupAction === "create"} onClick={() => void createGroup()} type="button">
+                {groupAction === "create" ? "创建中" : "创建并生成口令"}
+              </button>
             </>
           ) : (
             <>
               <input inputMode="numeric" maxLength={6} onChange={(event) => setInviteCode(event.target.value.replace(/\D/g, ""))} placeholder="6 位数字口令" value={inviteCode} />
-              <button className="primary-button" disabled={!/^\d{6}$/.test(inviteCode)} onClick={joinGroup} type="button">加入组</button>
+              <button className="primary-button" disabled={!/^\d{6}$/.test(inviteCode) || groupAction === "join"} onClick={() => void joinGroup()} type="button">
+                {groupAction === "join" ? "加入中" : "加入组"}
+              </button>
             </>
           )}
         </MobileDialog>
@@ -396,4 +468,13 @@ function toDatetimeLocal(value: string) {
   const date = new Date(value);
   const offset = date.getTimezoneOffset() * 60_000;
   return new Date(date.getTime() - offset).toISOString().slice(0, 16);
+}
+
+function displaySenderName(senderName: string) {
+  return senderName === api.currentSession?.user.name ? "我" : senderName;
+}
+
+function errorMessage(error: unknown, fallback: string, statusMessages: Record<number, string> = {}) {
+  if (error instanceof ApiError && statusMessages[error.status]) return statusMessages[error.status];
+  return error instanceof Error ? error.message : fallback;
 }

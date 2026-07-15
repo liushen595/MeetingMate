@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ChangeEvent, type FormEvent, type PointerEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type ChangeEvent, type PointerEvent } from "react";
 import { Haptics, ImpactStyle } from "@capacitor/haptics";
 import { api } from "../lib/api";
 import {
@@ -13,7 +13,7 @@ import {
   touchBlock,
   upsertOperation,
 } from "../lib/blocks";
-import { captureImageFromCamera, createPcmRecorder, formatDuration, normalizeRecordedAudio, readImageFile, type PcmRecorder } from "../lib/media";
+import { canUseNativeCamera, captureImageFromCamera, createPcmRecorder, formatDuration, normalizeRecordedAudio, readImageFile, type PcmRecorder } from "../lib/media";
 import { readAsrSse, readImageRecognitionSse } from "../lib/sse";
 import type { ConvertMode, Manuscript, ManuscriptBlock, ManuscriptHandwritingBlock, Stroke, StrokeTool, SyncOperation, Task } from "../types/api";
 import { AssetImage } from "../components/AssetImage";
@@ -37,12 +37,6 @@ type PendingAudio = {
   status: "uploading" | "failed";
   error?: string;
 };
-type ConvertDialogState = {
-  title: string;
-  optimizeAudio: boolean;
-  submitting: boolean;
-};
-
 const PEN_COLORS = ["#1f1b14", "#111827", "#2563eb", "#dc2626", "#16a34a", "#7c3aed"];
 const HIGHLIGHTER_COLORS = ["#fef08a", "#fde68a", "#bbf7d0", "#bfdbfe", "#fecdd3", "#ddd6fe"];
 const PEN_COLOR_KEY = "meetingmate.mobile.pen.color";
@@ -68,6 +62,7 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
   const [localAudioUrls, setLocalAudioUrls] = useState<Record<string, string>>({});
   const [localImageUrls, setLocalImageUrls] = useState<Record<string, string>>({});
   const [task, setTask] = useState<Task | null>(null);
+  const [convertTask, setConvertTask] = useState<Task | null>(null);
   const [recognizingImageAssetIds, setRecognizingImageAssetIds] = useState<string[]>([]);
   const [convertDialogOpen, setConvertDialogOpen] = useState(false);
   const [convertTitle, setConvertTitle] = useState("");
@@ -290,17 +285,26 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
   async function startRecording(afterBlockId: string | null = null) {
     setMenu(null);
     if (recording) return;
-    const startedAt = Date.now();
-    const recorder = await createPcmRecorder();
-    setRecording({ recorder, startedAt, afterBlockId });
+    try {
+      const startedAt = Date.now();
+      const recorder = await createPcmRecorder();
+      setRecording({ recorder, startedAt, afterBlockId });
+      setSyncState("录音中");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "录音启动失败，请检查麦克风权限");
+    }
   }
 
   async function stopRecording() {
     if (!recording) return;
     const current = recording;
     setRecording(null);
-    const audio = await current.recorder.stop();
-    void finishAudio(audio.blob, audio.durationMs || Date.now() - current.startedAt, current.afterBlockId);
+    try {
+      const audio = await current.recorder.stop();
+      void finishAudio(audio.blob, audio.durationMs || Date.now() - current.startedAt, current.afterBlockId);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "录音保存失败");
+    }
   }
 
   async function finishAudio(blob: Blob, durationMs: number, afterBlockId: string | null) {
@@ -373,6 +377,10 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
   async function chooseImage(afterBlockId: string | null = null) {
     imageAfterBlockIdRef.current = afterBlockId;
     setMenu(null);
+    if (!canUseNativeCamera()) {
+      fileInputRef.current?.click();
+      return;
+    }
     try {
       const image = await captureImageFromCamera();
       await uploadImage(image, afterBlockId);
@@ -418,12 +426,14 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
           setTask(nextTask);
           setSyncState("图片识别已完成，正在同步手稿");
           const refreshed = await reloadManuscript();
-          const result = nextTask.result;
-          const extractedText = result?.text ?? result?.recognized_text ?? result?.caption ?? "";
+          const extractedText = nextTask.result?.text ?? nextTask.result?.recognized_text ?? "";
           if (extractedText) {
             const block = refreshed.blocks.find((item): item is Extract<ManuscriptBlock, { type: "image" }> => item.type === "image" && item.props.asset_id === assetId);
             if (block) {
-              applyBlock(createTextBlock(userId, extractedText), block.id);
+              const textBlock = createTextBlock(userId, extractedText);
+              setBlocks(insertAfter(refreshed.blocks.filter((item) => !item.deleted), textBlock, block.id));
+              await api.syncManuscriptBlocks(refreshed.id, refreshed.revision, [upsertOperation(textBlock, userId, block.id)]);
+              await reloadManuscript();
             }
           }
           setSyncState("已保存");
@@ -525,7 +535,7 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
 
   function openConvertDialog() {
     if (!manuscript) return;
-    setConvertTitle(manuscript.title.replace(/手稿$/, "文档"));
+    setConvertTitle(defaultDocumentTitle(manuscript.title));
     setConvertDialogOpen(true);
   }
 
@@ -538,10 +548,12 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
     }
     const hasPendingAudio = visibleBlocks.some((block) => block.type === "audio" && !block.props.transcript);
     if (hasPendingAudio && !window.confirm("存在录音尚未完成转写，建议等待 ASR 完成后再转文档。仍然继续？")) return;
+    const hasUnrecognizedHandwriting = visibleBlocks.some((block) => block.type === "handwriting" && block.props.strokes.length > 0 && !block.props.ai_text?.trim());
+    if (hasUnrecognizedHandwriting && !window.confirm("当前后端尚未接入手写识别，未识别的手写块不会出现在转换后的文档中。仍然继续？")) return;
     if (recognizingImageAssetIds.length > 0 && !window.confirm("图片文字仍在提取，继续转换时后端会尝试补充提取文本。仍然继续？")) return;
     await flushOps({ throwOnError: true });
     const taskResult = await api.convertManuscript(manuscript.id, mode, title, optimizeAudio);
-    setTask(taskResult);
+    setConvertTask(taskResult);
     setConvertDialogOpen(false);
   }
 

@@ -1,4 +1,9 @@
 import { Camera, CameraResultType, CameraSource } from "@capacitor/camera";
+import { Capacitor } from "@capacitor/core";
+
+export function canUseNativeCamera() {
+  return Capacitor.isNativePlatform();
+}
 
 export async function captureImageFromCamera() {
   const photo = await Camera.getPhoto({
@@ -77,6 +82,17 @@ export interface PcmRecorder {
 }
 
 export async function createPcmRecorder(): Promise<PcmRecorder> {
+  if (!window.isSecureContext && !canUseNativeCamera()) {
+    throw new Error("手机浏览器录音需要 HTTPS 安全地址。请使用 https 地址访问，或使用原生 App。");
+  }
+  if (!navigator.mediaDevices?.getUserMedia) {
+    throw new Error("当前浏览器不支持录音权限接口，请换用支持麦克风的浏览器或原生 App。");
+  }
+  const AudioContextCtor = window.AudioContext ?? (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+  if (!AudioContextCtor) {
+    throw new Error("当前浏览器不支持音频采集处理。");
+  }
+
   const stream = await navigator.mediaDevices.getUserMedia({
     audio: {
       echoCancellation: true,
@@ -84,9 +100,17 @@ export async function createPcmRecorder(): Promise<PcmRecorder> {
       autoGainControl: true,
       channelCount: 1,
     },
+  }).catch((error) => {
+    if (error instanceof DOMException && error.name === "NotAllowedError") {
+      throw new Error("录音权限被拒绝。请在浏览器地址栏或系统设置中允许麦克风权限后重试。");
+    }
+    if (error instanceof DOMException && error.name === "NotFoundError") {
+      throw new Error("没有找到可用麦克风设备。");
+    }
+    throw new Error(error instanceof Error ? error.message : "录音权限申请失败");
   });
-  const AudioContextCtor = window.AudioContext ?? (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
   const audioContext = new AudioContextCtor();
+  if (audioContext.state === "suspended") await audioContext.resume();
   const source = audioContext.createMediaStreamSource(stream);
   const processor = audioContext.createScriptProcessor(4096, 1, 1);
   const chunks: Float32Array[] = [];
