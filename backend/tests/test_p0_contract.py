@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 from datetime import datetime, timezone
 
@@ -8,6 +9,7 @@ from fastapi.testclient import TestClient
 os.environ["CORS_ORIGIN_REGEX"] = r"^https?://(localhost|127\.0\.0\.1|10\.(?:\d{1,3}\.){2}\d{1,3})(?::\d+)?$"
 os.environ["OBJECT_STORAGE_PUBLIC_BASE_URL"] = "http://10.90.129.20:9000"
 os.environ["OBJECT_STORAGE_BUCKET"] = "bucket"
+os.environ["API_PUBLIC_BASE_URL"] = "http://testserver"
 
 import app.main as backend
 
@@ -233,6 +235,13 @@ def auth_headers(auth: dict, device_id: str = "device_test", idempotency_key: st
     return headers
 
 
+def upload_single_part(upload_response, content: bytes) -> dict:
+    part = upload_response.json()["parts"][0]
+    response = client.put(part["upload_url"], content=content, headers=part["headers"])
+    assert response.status_code == 200, response.text
+    return {"part_number": part["part_number"], "etag": response.headers["etag"], "size_bytes": len(content)}
+
+
 def test_cors_preflight_allows_localhost_and_10_private_network() -> None:
     for origin in ["http://localhost:5173", "http://127.0.0.1:5173", "http://10.90.129.105:5173"]:
         response = client.options(
@@ -250,6 +259,8 @@ def test_cors_preflight_allows_localhost_and_10_private_network() -> None:
 def test_p0_flow_register_upload_manuscript_convert_export() -> None:
     repo.reset()
     auth = register_user()
+    upload_content = b"0123456789"
+    upload_checksum = hashlib.sha256(upload_content).hexdigest()
     upload = client.post(
         "/api/v1/assets/upload",
         json={
@@ -257,22 +268,23 @@ def test_p0_flow_register_upload_manuscript_convert_export() -> None:
             "filename": "meeting.m4a",
             "content_type": "audio/mp4",
             "size_bytes": 10,
-            "checksum_sha256": "abc",
+            "checksum_sha256": upload_checksum,
             "part_size_bytes": 10,
         },
         headers=auth_headers(auth, idempotency_key="idem_upload"),
     )
     assert upload.status_code == 201, upload.text
-    assert upload.json()["parts"][0]["upload_url"].startswith("http://10.90.129.20:9000/bucket/")
+    assert upload.json()["parts"][0]["upload_url"].startswith("http://testserver/api/v1/assets/")
     assert "object-storage.local" not in upload.json()["parts"][0]["upload_url"]
+    uploaded_part = upload_single_part(upload, upload_content)
     asset_id = upload.json()["asset_id"]
     complete = client.post(
         f"/api/v1/assets/{asset_id}/complete",
         json={
             "upload_id": upload.json()["upload_id"],
             "size_bytes": 10,
-            "checksum_sha256": "abc",
-            "parts": [{"part_number": 1, "etag": "etag", "size_bytes": 10}],
+            "checksum_sha256": upload_checksum,
+            "parts": [uploaded_part],
             "duration_ms": 1000,
             "width": None,
             "height": None,
@@ -345,7 +357,7 @@ def test_p0_flow_register_upload_manuscript_convert_export() -> None:
     export_id = export.json()["result"]["export_id"]
     download = client.get(f"/api/v1/exports/{export_id}/download", headers=auth_headers(auth))
     assert download.status_code == 200, download.text
-    assert download.json()["download_url"].startswith("http://10.90.129.20:9000/bucket/")
+    assert download.json()["download_url"].startswith("http://testserver/api/v1/assets/")
 
 
 def test_idempotency_conflict_and_revision_conflict() -> None:
@@ -418,6 +430,8 @@ def test_manual_document_rejects_forged_derived_from() -> None:
 def test_asr_task_queues_without_overwriting_existing_transcript_and_cancel_is_idempotent() -> None:
     repo.reset()
     auth = register_user("asr@example.com", "device_asr")
+    upload_content = b"0123456789"
+    upload_checksum = hashlib.sha256(upload_content).hexdigest()
     upload = client.post(
         "/api/v1/assets/upload",
         json={
@@ -425,19 +439,20 @@ def test_asr_task_queues_without_overwriting_existing_transcript_and_cancel_is_i
             "filename": "meeting.m4a",
             "content_type": "audio/mp4",
             "size_bytes": 10,
-            "checksum_sha256": "abc",
+            "checksum_sha256": upload_checksum,
             "part_size_bytes": 10,
         },
         headers=auth_headers(auth, "device_asr", "idem_asr_upload"),
     )
     asset_id = upload.json()["asset_id"]
+    uploaded_part = upload_single_part(upload, upload_content)
     complete = client.post(
         f"/api/v1/assets/{asset_id}/complete",
         json={
             "upload_id": upload.json()["upload_id"],
             "size_bytes": 10,
-            "checksum_sha256": "abc",
-            "parts": [{"part_number": 1, "etag": "etag", "size_bytes": 10}],
+            "checksum_sha256": upload_checksum,
+            "parts": [uploaded_part],
             "duration_ms": 1000,
             "width": None,
             "height": None,

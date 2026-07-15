@@ -11,11 +11,11 @@ import secrets
 import uuid
 import zipfile
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Any, Literal
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 from fastapi import Depends, FastAPI, Header, Query, Request, Response, status
 from fastapi.encoders import jsonable_encoder
@@ -111,6 +111,8 @@ class AppSettings:
     allowed_hosts: list[str]
     object_storage_public_base_url: str | None
     object_storage_bucket: str | None
+    asset_upload_url_mode: str | None
+    api_public_base_url: str | None
     database: DatabaseSettings
 
 
@@ -137,6 +139,8 @@ def load_settings() -> AppSettings:
         allowed_hosts=parse_env_list("ALLOWED_HOSTS"),
         object_storage_public_base_url=os.getenv("OBJECT_STORAGE_PUBLIC_BASE_URL") or None,
         object_storage_bucket=os.getenv("OBJECT_STORAGE_BUCKET") or None,
+        asset_upload_url_mode=os.getenv("ASSET_UPLOAD_URL_MODE") or None,
+        api_public_base_url=os.getenv("API_PUBLIC_BASE_URL") or None,
         database=load_database_settings(),
     )
 
@@ -199,6 +203,33 @@ def make_object_storage_url(*path_parts: str, expires_seconds: int = 900) -> str
     expires_at = int((utcnow() + timedelta(seconds=expires_seconds)).timestamp())
     signature = hashlib.sha256(f"{object_path}:{expires_at}".encode("utf-8")).hexdigest()[:32]
     return f"{base_url}/{object_path}?expires_at={expires_at}&signature={signature}"
+
+
+def public_api_base_url(request: Request) -> str:
+    if settings.api_public_base_url:
+        return settings.api_public_base_url.rstrip("/")
+    return str(request.base_url).rstrip("/")
+
+
+def upload_part_signature(asset_id: str, upload_id: str, part_number: int, expires_at: int) -> str:
+    payload = f"{asset_id}:{upload_id}:{part_number}:{expires_at}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
+
+
+def make_api_upload_url(request: Request, asset_id: str, upload_id: str, part_number: int, expires_at: datetime) -> str:
+    expires_at_ts = int(expires_at.timestamp())
+    query = urlencode(
+        {
+            "upload_id": upload_id,
+            "expires_at": str(expires_at_ts),
+            "signature": upload_part_signature(asset_id, upload_id, part_number, expires_at_ts),
+        }
+    )
+    return f"{public_api_base_url(request)}{API_PREFIX}/assets/{quote(asset_id, safe='')}/upload-parts/{part_number}?{query}"
+
+
+def make_asset_stream_url(request: Request, asset_id: str) -> str:
+    return f"{public_api_base_url(request)}{API_PREFIX}/assets/{quote(asset_id, safe='')}/stream"
 
 
 def encode_cursor(offset: int) -> str:
@@ -874,6 +905,7 @@ class AssetRecord:
     part_size_bytes: int
     uploaded_parts: list[UploadedPart]
     content: bytes | None = None
+    part_contents: dict[int, bytes] = dataclass_field(default_factory=dict)
 
 
 @dataclass
@@ -1410,6 +1442,7 @@ def asset_record_from_row(row: Any) -> AssetRecord:
         part_size_bytes=row["part_size_bytes"],
         uploaded_parts=UploadedPartListAdapter.validate_python(parse_jsonb(row["uploaded_parts"])),
         content=row["content"],
+        part_contents={int(part_number): base64.b64decode(content) for part_number, content in (parse_jsonb(row["part_contents"]) or {}).items()},
     )
 
 
@@ -1817,18 +1850,24 @@ async def apply_document_operations(
     return changed, applied
 
 
-def make_presigned_parts(asset_id: str, upload_id: str, content_type: str, part_size_bytes: int, size_bytes: int) -> list[UploadPart]:
+def make_presigned_parts(request: Request, asset_id: str, upload_id: str, content_type: str, part_size_bytes: int, size_bytes: int) -> list[UploadPart]:
     part_count = max(1, math.ceil(size_bytes / part_size_bytes))
     expires_at = utcnow() + timedelta(minutes=15)
-    return [
-        UploadPart(
-            part_number=part_number,
-            upload_url=make_object_storage_url(asset_id, upload_id, f"part-{part_number}"),
-            headers={"Content-Type": content_type},
-            expires_at=expires_at,
+    parts: list[UploadPart] = []
+    for part_number in range(1, part_count + 1):
+        if settings.asset_upload_url_mode == "object_storage":
+            upload_url = make_object_storage_url(asset_id, upload_id, f"part-{part_number}")
+        else:
+            upload_url = make_api_upload_url(request, asset_id, upload_id, part_number, expires_at)
+        parts.append(
+            UploadPart(
+                part_number=part_number,
+                upload_url=upload_url,
+                headers={"Content-Type": content_type},
+                expires_at=expires_at,
+            )
         )
-        for part_number in range(1, part_count + 1)
-    ]
+    return parts
 
 
 def validate_complete_parts(request: AssetCompleteRequest) -> None:
@@ -2198,7 +2237,7 @@ async def create_asset_upload(
         asset_id=asset_id,
         upload_id=upload_id,
         part_size_bytes=payload.part_size_bytes,
-        parts=make_presigned_parts(asset_id, upload_id, payload.content_type, payload.part_size_bytes, payload.size_bytes),
+        parts=make_presigned_parts(request, asset_id, upload_id, payload.content_type, payload.part_size_bytes, payload.size_bytes),
     )
     return await idempotent_json_response(db, idem, response, status.HTTP_201_CREATED)
 
@@ -2206,11 +2245,12 @@ async def create_asset_upload(
 @router.get("/assets/{asset_id}/upload-parts", response_model=AssetUploadPartsResponse)
 async def get_asset_upload_parts(
     asset_id: str,
+    request: Request,
     ctx: AuthContext = Depends(auth_context),
     db: PostgresRepository = Depends(get_repository),
 ) -> AssetUploadPartsResponse:
     record = await get_asset_record(db, asset_id, ctx.user_id)
-    all_parts = make_presigned_parts(record.asset.id, record.upload_id, record.asset.content_type, record.part_size_bytes, record.asset.size_bytes)
+    all_parts = make_presigned_parts(request, record.asset.id, record.upload_id, record.asset.content_type, record.part_size_bytes, record.asset.size_bytes)
     uploaded_numbers = {part.part_number for part in record.uploaded_parts}
     missing = [part for part in all_parts if part.part_number not in uploaded_numbers]
     return AssetUploadPartsResponse(
@@ -2220,6 +2260,47 @@ async def get_asset_upload_parts(
         uploaded_parts=record.uploaded_parts,
         missing_parts=missing,
     )
+
+
+@router.put("/assets/{asset_id}/upload-parts/{part_number}")
+async def upload_asset_part(
+    asset_id: str,
+    part_number: int,
+    request: Request,
+    upload_id: str,
+    expires_at: int,
+    signature: str,
+    db: PostgresRepository = Depends(get_repository),
+) -> Response:
+    if expires_at < int(utcnow().timestamp()):
+        raise APIError(status.HTTP_400_BAD_REQUEST, "invalid_request", "Upload URL has expired.")
+    expected_signature = upload_part_signature(asset_id, upload_id, part_number, expires_at)
+    if not secrets.compare_digest(signature, expected_signature):
+        raise APIError(status.HTTP_403_FORBIDDEN, "forbidden", "Upload URL signature is invalid.")
+    record = await db.get_asset_record(asset_id)
+    if not record or record.upload_id != upload_id:
+        raise APIError(status.HTTP_404_NOT_FOUND, "not_found", "Asset upload not found.")
+    if record.asset.status not in {"pending_upload", "uploaded"}:
+        raise APIError(status.HTTP_409_CONFLICT, "resource_conflict", "Asset is not accepting uploads.")
+    expected_part_count = max(1, math.ceil(record.asset.size_bytes / record.part_size_bytes))
+    if part_number < 1 or part_number > expected_part_count:
+        raise validation_error("part_number is outside the expected upload range.")
+
+    content = await request.body()
+    max_part_size = record.part_size_bytes
+    if part_number < expected_part_count and len(content) != max_part_size:
+        raise validation_error("Non-final upload parts must match part_size_bytes.")
+    if part_number == expected_part_count and len(content) > max_part_size:
+        raise validation_error("Final upload part exceeds part_size_bytes.")
+    etag = hashlib.sha256(content).hexdigest()
+    record.part_contents[part_number] = content
+    uploaded_by_number = {part.part_number: part for part in record.uploaded_parts}
+    uploaded_by_number[part_number] = UploadedPart(part_number=part_number, etag=etag, size_bytes=len(content))
+    record.uploaded_parts = [uploaded_by_number[number] for number in sorted(uploaded_by_number)]
+    if len(record.uploaded_parts) == expected_part_count:
+        record.asset = record.asset.model_copy(update={"status": "uploaded", "updated_at": utcnow()})
+    await db.save_asset(record)
+    return Response(status_code=status.HTTP_200_OK, headers={"ETag": etag})
 
 
 @router.post("/assets/{asset_id}/complete", response_model=Asset, dependencies=IDEMPOTENT_WRITE_DEPENDENCIES)
@@ -2249,6 +2330,24 @@ async def complete_asset_upload(
         record.asset = record.asset.model_copy(update={"status": "failed", "updated_at": utcnow()})
         await db.save_asset(record)
         raise
+    uploaded_by_number = {part.part_number: part for part in record.uploaded_parts}
+    part_contents: list[bytes] = []
+    for part in sorted(payload.parts, key=lambda item: item.part_number):
+        uploaded_part = uploaded_by_number.get(part.part_number)
+        if not uploaded_part or uploaded_part.etag != part.etag or uploaded_part.size_bytes != part.size_bytes:
+            record.asset = record.asset.model_copy(update={"status": "failed", "updated_at": utcnow()})
+            await db.save_asset(record)
+            raise validation_error("Uploaded part metadata does not match the completed parts payload.")
+        content = record.part_contents.get(part.part_number)
+        if content is not None:
+            part_contents.append(content)
+    if part_contents:
+        content = b"".join(part_contents)
+        if len(content) != payload.size_bytes or hashlib.sha256(content).hexdigest() != payload.checksum_sha256:
+            record.asset = record.asset.model_copy(update={"status": "failed", "updated_at": utcnow()})
+            await db.save_asset(record)
+            raise validation_error("Uploaded content does not match size_bytes or checksum_sha256.")
+        record.content = content
     record.uploaded_parts = sorted(payload.parts, key=lambda part: part.part_number)
     record.asset = record.asset.model_copy(
         update={
@@ -2269,10 +2368,18 @@ async def get_asset(asset_id: str, ctx: AuthContext = Depends(auth_context), db:
     return record.asset.model_copy(update={"url": None})
 
 
-@router.get("/assets/{asset_id}/stream", status_code=status.HTTP_302_FOUND)
-async def stream_asset(asset_id: str, ctx: AuthContext = Depends(auth_context), db: PostgresRepository = Depends(get_repository)) -> RedirectResponse:
+@router.get("/assets/{asset_id}/stream")
+async def stream_asset(asset_id: str, ctx: AuthContext = Depends(auth_context), db: PostgresRepository = Depends(get_repository)) -> Response:
     record = await get_asset_record(db, asset_id, ctx.user_id)
-    return RedirectResponse(url=make_object_storage_url(record.asset.id, "download", expires_seconds=600), status_code=status.HTTP_302_FOUND)
+    if record.content is not None:
+        return Response(
+            content=record.content,
+            media_type=record.asset.content_type,
+            headers={"Content-Disposition": f'inline; filename="{record.asset.filename}"'},
+        )
+    if settings.asset_upload_url_mode == "object_storage":
+        return RedirectResponse(url=make_object_storage_url(record.asset.id, "download", expires_seconds=600), status_code=status.HTTP_302_FOUND)
+    raise APIError(status.HTTP_404_NOT_FOUND, "not_found", "Asset content is not available.")
 
 
 @router.delete("/assets/{asset_id}", status_code=status.HTTP_204_NO_CONTENT, dependencies=CLIENT_HEADER_DEPENDENCIES)
@@ -2753,11 +2860,16 @@ async def create_export(
 
 
 @router.get("/exports/{export_id}/download", response_model=ExportDownloadResponse)
-async def download_export(export_id: str, ctx: AuthContext = Depends(auth_context), db: PostgresRepository = Depends(get_repository)) -> ExportDownloadResponse:
+async def download_export(
+    export_id: str,
+    request: Request,
+    ctx: AuthContext = Depends(auth_context),
+    db: PostgresRepository = Depends(get_repository),
+) -> ExportDownloadResponse:
     record = await get_export_record(db, export_id, ctx.user_id)
     await get_document(db, record.document_id, ctx.user_id)
     return ExportDownloadResponse(
-        download_url=make_object_storage_url(record.asset_id, "download", expires_seconds=600),
+        download_url=make_asset_stream_url(request, record.asset_id),
         expires_at=utcnow() + timedelta(minutes=15),
     )
 

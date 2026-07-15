@@ -66,9 +66,12 @@ CREATE TABLE IF NOT EXISTS assets (
     part_size_bytes BIGINT NOT NULL CHECK (part_size_bytes > 0),
     uploaded_parts JSONB NOT NULL DEFAULT '[]'::jsonb,
     content BYTEA,
+    part_contents JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL
 );
+
+ALTER TABLE assets ADD COLUMN IF NOT EXISTS part_contents JSONB NOT NULL DEFAULT '{}'::jsonb;
 
 CREATE INDEX IF NOT EXISTS idx_assets_owner_updated_at ON assets(owner_id, updated_at DESC, id DESC);
 

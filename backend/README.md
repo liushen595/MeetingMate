@@ -22,6 +22,8 @@ CORS_ORIGIN_REGEX="^https?://(localhost|127\\.0\\.0\\.1|10\\.(?:\\d{1,3}\\.){2}\
 ALLOWED_HOSTS=[]
 OBJECT_STORAGE_PUBLIC_BASE_URL="http://10.90.129.20:9000"
 OBJECT_STORAGE_BUCKET="bucket"
+ASSET_UPLOAD_URL_MODE="api"
+API_PUBLIC_BASE_URL=""
 
 DATABASE_HOST=127.0.0.1
 DATABASE_PORT=5432
@@ -36,6 +38,8 @@ DATABASE_COMMAND_TIMEOUT_SECONDS=30
 ```
 
 `DATABASE_URL` is also supported. If it is set, it takes precedence over the component fields above.
+
+`ASSET_UPLOAD_URL_MODE="api"` makes `/assets/upload` return FastAPI upload proxy URLs. This is the recommended local/LAN development mode when MinIO/S3 is not reachable directly from the browser. Set `API_PUBLIC_BASE_URL` only when the backend is behind a proxy and `request.base_url` is not the browser-reachable API base URL.
 
 ```bash
 uvicorn app.main:app --reload
