@@ -295,7 +295,7 @@ class PcApiClient {
   }
 
   async transcribeAudio(file: SelectedFile): Promise<AudioTranscription> {
-    const assetId = await this.createReadyAsset(file);
+    const asset = await this.createReadyAsset(file);
     const task = await this.request<Task>("/tasks/asr-audio", {
       method: "POST",
       idempotent: true,
@@ -310,7 +310,7 @@ class PcApiClient {
     const transcript = extractTranscript(completedTask.result);
     if (transcript)
       return {
-        assetId,
+        assetId: asset.id,
         durationMs: 0,
         transcript,
         speakerSegments: extractSpeakerSegments(completedTask.result),
