@@ -1,10 +1,206 @@
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 
 from fastapi.testclient import TestClient
 
-from app.main import app, store
+os.environ["CORS_ORIGIN_REGEX"] = r"^https?://(localhost|127\.0\.0\.1|10\.(?:\d{1,3}\.){2}\d{1,3})(?::\d+)?$"
+os.environ["OBJECT_STORAGE_PUBLIC_BASE_URL"] = "http://10.90.129.20:9000"
+os.environ["OBJECT_STORAGE_BUCKET"] = "bucket"
+
+import app.main as backend
+
+
+class TestRepository:
+    def reset(self) -> None:
+        self.users_by_id: dict[str, backend.UserRecord] = {}
+        self.user_id_by_email: dict[str, str] = {}
+        self.devices_by_user: dict[str, dict[str, backend.Device]] = {}
+        self.access_tokens: dict[str, backend.TokenSession] = {}
+        self.refresh_tokens: dict[str, backend.TokenSession] = {}
+        self.idempotency: dict[tuple[str, str, str, str], backend.IdempotencyRecord] = {}
+        self.assets: dict[str, backend.AssetRecord] = {}
+        self.manuscripts: dict[str, backend.Manuscript] = {}
+        self.documents: dict[str, backend.Document] = {}
+        self.document_versions: dict[str, list[backend.DocumentVersionRecord]] = {}
+        self.tasks: dict[str, tuple[str, backend.Task]] = {}
+        self.exports: dict[str, backend.ExportRecord] = {}
+        self.share_links: dict[str, backend.ShareLinkRecord] = {}
+
+    async def get_user_record(self, user_id: str) -> backend.UserRecord | None:
+        return self.users_by_id.get(user_id)
+
+    async def get_user_record_by_email(self, email: str) -> backend.UserRecord | None:
+        user_id = self.user_id_by_email.get(email.lower())
+        return self.users_by_id.get(user_id) if user_id else None
+
+    async def create_user(self, user: backend.User, encoded_password: str) -> None:
+        self.users_by_id[user.id] = backend.UserRecord(user=user, password_hash=encoded_password)
+        self.user_id_by_email[str(user.email).lower()] = user.id
+
+    async def create_tokens(self, user_id: str, client_id: str) -> backend.AuthResponse:
+        user = self.users_by_id[user_id].user
+        access_token = backend.make_token("access")
+        refresh_token = backend.make_token("refresh")
+        now = backend.utcnow()
+        self.access_tokens[access_token] = backend.TokenSession(user_id, client_id, now + backend.timedelta(seconds=backend.ACCESS_TOKEN_SECONDS))
+        self.refresh_tokens[refresh_token] = backend.TokenSession(user_id, client_id, now + backend.timedelta(seconds=backend.REFRESH_TOKEN_SECONDS))
+        return backend.AuthResponse(
+            access_token=access_token,
+            access_token_expires_in=backend.ACCESS_TOKEN_SECONDS,
+            refresh_token=refresh_token,
+            refresh_token_expires_in=backend.REFRESH_TOKEN_SECONDS,
+            user=user,
+        )
+
+    async def get_token_session(self, token: str, token_type: str) -> backend.TokenSession | None:
+        source = self.access_tokens if token_type == "access" else self.refresh_tokens
+        return source.get(token)
+
+    async def delete_token(self, token: str) -> None:
+        self.access_tokens.pop(token, None)
+        self.refresh_tokens.pop(token, None)
+
+    async def delete_tokens_for_client(self, user_id: str, client_id: str) -> None:
+        for token, session in list(self.access_tokens.items()):
+            if session.user_id == user_id and session.client_id == client_id:
+                del self.access_tokens[token]
+        for token, session in list(self.refresh_tokens.items()):
+            if session.user_id == user_id and session.client_id == client_id:
+                del self.refresh_tokens[token]
+
+    async def upsert_device(self, user_id: str, device_input: backend.DeviceInput) -> backend.Device:
+        now = backend.utcnow()
+        devices = self.devices_by_user.setdefault(user_id, {})
+        existing = devices.get(device_input.client_id)
+        device = backend.Device(
+            id=device_input.client_id,
+            platform=device_input.platform,
+            app_version=device_input.app_version,
+            name=device_input.name,
+            last_seen_at=now,
+            created_at=existing.created_at if existing else now,
+        )
+        devices[device.id] = device
+        return device
+
+    async def touch_device(self, user_id: str, client_id: str) -> None:
+        device = self.devices_by_user.get(user_id, {}).get(client_id)
+        if device:
+            self.devices_by_user[user_id][client_id] = device.model_copy(update={"last_seen_at": backend.utcnow()})
+
+    async def list_devices(self, user_id: str) -> list[backend.Device]:
+        devices = list(self.devices_by_user.get(user_id, {}).values())
+        return sorted(devices, key=lambda item: (item.last_seen_at, item.id), reverse=True)
+
+    async def delete_device(self, user_id: str, client_id: str) -> bool:
+        devices = self.devices_by_user.get(user_id, {})
+        if client_id not in devices:
+            return False
+        del devices[client_id]
+        await self.delete_tokens_for_client(user_id, client_id)
+        return True
+
+    async def get_idempotency(self, scope: tuple[str, str, str, str]) -> backend.IdempotencyRecord | None:
+        return self.idempotency.get(scope)
+
+    async def save_idempotency(self, scope: tuple[str, str, str, str], record: backend.IdempotencyRecord) -> None:
+        self.idempotency[scope] = record
+
+    async def save_asset(self, record: backend.AssetRecord) -> None:
+        self.assets[record.asset.id] = record
+
+    async def get_asset_record(self, asset_id: str) -> backend.AssetRecord | None:
+        return self.assets.get(asset_id)
+
+    async def delete_asset(self, asset_id: str) -> None:
+        del self.assets[asset_id]
+
+    async def asset_is_referenced(self, owner_id: str, asset_id: str) -> bool:
+        for manuscript in self.manuscripts.values():
+            if manuscript.owner_id != owner_id:
+                continue
+            for block in manuscript.blocks:
+                if isinstance(block, (backend.ManuscriptAudioBlock, backend.ManuscriptImageBlock)) and block.props.asset_id == asset_id:
+                    return True
+                if isinstance(block, backend.ManuscriptHandwritingBlock) and block.props.image_asset_id == asset_id:
+                    return True
+        for document in self.documents.values():
+            if document.owner_id != owner_id:
+                continue
+            for block in document.blocks:
+                if isinstance(block, backend.DocumentImageBlock) and block.props.asset_id == asset_id:
+                    return True
+        return False
+
+    async def list_manuscripts(self, owner_id: str, include_deleted: bool = False) -> list[backend.Manuscript]:
+        items = [item for item in self.manuscripts.values() if item.owner_id == owner_id and (include_deleted or not item.deleted)]
+        return sorted(items, key=lambda item: (item.updated_at, item.id), reverse=True)
+
+    async def get_manuscript(self, manuscript_id: str) -> backend.Manuscript | None:
+        return self.manuscripts.get(manuscript_id)
+
+    async def save_manuscript(self, manuscript: backend.Manuscript) -> None:
+        self.manuscripts[manuscript.id] = manuscript
+
+    async def list_documents(self, owner_id: str) -> list[backend.Document]:
+        items = [item for item in self.documents.values() if item.owner_id == owner_id]
+        return sorted(items, key=lambda item: (item.updated_at, item.id), reverse=True)
+
+    async def get_document(self, document_id: str) -> backend.Document | None:
+        return self.documents.get(document_id)
+
+    async def save_document(self, document: backend.Document) -> None:
+        self.documents[document.id] = document
+
+    async def delete_document(self, document_id: str) -> None:
+        del self.documents[document_id]
+
+    async def create_document_version(self, document: backend.Document, title: str) -> None:
+        version = backend.DocumentVersion(
+            id=backend.new_id("ver"),
+            document_id=document.id,
+            revision=document.revision,
+            title=title,
+            created_by=document.owner_id,
+            created_at=backend.utcnow(),
+        )
+        self.document_versions.setdefault(document.id, []).append(backend.DocumentVersionRecord(version=version, snapshot=document.model_copy(deep=True)))
+
+    async def list_document_versions(self, document_id: str) -> list[backend.DocumentVersion]:
+        versions = [record.version for record in self.document_versions.get(document_id, [])]
+        return sorted(versions, key=lambda item: (item.created_at, item.id), reverse=True)
+
+    async def find_document_version(self, document_id: str, version_id: str) -> backend.DocumentVersionRecord | None:
+        for record in self.document_versions.get(document_id, []):
+            if record.version.id == version_id:
+                return record
+        return None
+
+    async def save_task(self, owner_id: str, task: backend.Task) -> None:
+        self.tasks[task.id] = (owner_id, task)
+
+    async def get_task_record(self, task_id: str) -> tuple[str, backend.Task] | None:
+        return self.tasks.get(task_id)
+
+    async def save_export(self, record: backend.ExportRecord) -> None:
+        self.exports[record.export_id] = record
+
+    async def get_export_record(self, export_id: str) -> backend.ExportRecord | None:
+        return self.exports.get(export_id)
+
+    async def save_share_link(self, record: backend.ShareLinkRecord) -> None:
+        self.share_links[record.link.id] = record
+
+    async def get_share_link_record(self, share_id: str) -> backend.ShareLinkRecord | None:
+        return self.share_links.get(share_id)
+
+
+repo = TestRepository()
+repo.reset()
+app = backend.app
+app.dependency_overrides[backend.get_repository] = lambda: repo
 
 
 client = TestClient(app)
@@ -37,8 +233,22 @@ def auth_headers(auth: dict, device_id: str = "device_test", idempotency_key: st
     return headers
 
 
+def test_cors_preflight_allows_localhost_and_10_private_network() -> None:
+    for origin in ["http://localhost:5173", "http://127.0.0.1:5173", "http://10.90.129.105:5173"]:
+        response = client.options(
+            "/api/v1/auth/register",
+            headers={
+                "Origin": origin,
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "content-type,x-request-id",
+            },
+        )
+        assert response.status_code == 200, response.text
+        assert response.headers["access-control-allow-origin"] == origin
+
+
 def test_p0_flow_register_upload_manuscript_convert_export() -> None:
-    store.__init__()
+    repo.reset()
     auth = register_user()
     upload = client.post(
         "/api/v1/assets/upload",
@@ -53,6 +263,8 @@ def test_p0_flow_register_upload_manuscript_convert_export() -> None:
         headers=auth_headers(auth, idempotency_key="idem_upload"),
     )
     assert upload.status_code == 201, upload.text
+    assert upload.json()["parts"][0]["upload_url"].startswith("http://10.90.129.20:9000/bucket/")
+    assert "object-storage.local" not in upload.json()["parts"][0]["upload_url"]
     asset_id = upload.json()["asset_id"]
     complete = client.post(
         f"/api/v1/assets/{asset_id}/complete",
@@ -133,11 +345,11 @@ def test_p0_flow_register_upload_manuscript_convert_export() -> None:
     export_id = export.json()["result"]["export_id"]
     download = client.get(f"/api/v1/exports/{export_id}/download", headers=auth_headers(auth))
     assert download.status_code == 200, download.text
-    assert download.json()["download_url"].startswith("https://object-storage.local/")
+    assert download.json()["download_url"].startswith("http://10.90.129.20:9000/bucket/")
 
 
 def test_idempotency_conflict_and_revision_conflict() -> None:
-    store.__init__()
+    repo.reset()
     auth = register_user("bob@example.com", "device_bob")
     headers = auth_headers(auth, "device_bob", "same_key")
     first = client.post("/api/v1/manuscripts", json={"title": "A", "client_id": "device_bob", "initial_blocks": []}, headers=headers)
@@ -168,7 +380,7 @@ def test_openapi_declares_required_auth_and_write_headers() -> None:
 
 
 def test_logout_revokes_current_access_token() -> None:
-    store.__init__()
+    repo.reset()
     auth = register_user("logout@example.com", "device_logout")
     logout = client.post(
         "/api/v1/auth/logout",
@@ -181,7 +393,7 @@ def test_logout_revokes_current_access_token() -> None:
 
 
 def test_manual_document_rejects_forged_derived_from() -> None:
-    store.__init__()
+    repo.reset()
     auth = register_user("doc@example.com", "device_doc")
     response = client.post(
         "/api/v1/documents",
@@ -204,7 +416,7 @@ def test_manual_document_rejects_forged_derived_from() -> None:
 
 
 def test_asr_task_queues_without_overwriting_existing_transcript_and_cancel_is_idempotent() -> None:
-    store.__init__()
+    repo.reset()
     auth = register_user("asr@example.com", "device_asr")
     upload = client.post(
         "/api/v1/assets/upload",
@@ -279,7 +491,7 @@ def test_asr_task_queues_without_overwriting_existing_transcript_and_cancel_is_i
 
 
 def test_document_version_restore_restores_snapshot_content() -> None:
-    store.__init__()
+    repo.reset()
     auth = register_user("versions@example.com", "device_versions")
     created_at = iso_now()
     document = client.post(
