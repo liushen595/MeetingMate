@@ -180,7 +180,7 @@ export interface HeadingBlock extends BaseDocumentBlock {
 
 export interface ListBlock extends BaseDocumentBlock {
   type: "list";
-  props: { style: "bullet" | "number"; items: string[] };
+  props: { style: "bullet" | "numbered"; items: string[] };
 }
 
 export interface QuoteBlock extends BaseDocumentBlock {
@@ -235,6 +235,28 @@ export interface Document extends DocumentSummary {
   blocks: DocumentBlock[];
 }
 
+export type GroupSummary = {
+  id: string;
+  name: string;
+  inviteCode: string;
+  inviteCodeExpiresAt: string;
+  memberCount: number;
+  role: "owner" | "member";
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type GroupDocumentMessage = {
+  id: string;
+  groupId: string;
+  senderId: string;
+  senderName: string;
+  documentId: string;
+  documentTitle: string;
+  documentRevision: number;
+  sentAt: string;
+};
+
 export type OperationType = "upsert_block" | "delete_block" | "move_block" | "restore_block";
 
 export interface SyncOperation<TBlock> {
@@ -278,6 +300,18 @@ export type TaskStage =
   | "exporting"
   | "completed";
 export type ConvertMode = "meeting_minutes" | "todo_list" | "article_draft";
+
+export interface ConvertWarning {
+  block_id: string;
+  code:
+    | "audio_transcript_missing"
+    | "audio_optimization_failed"
+    | "image_caption_failed"
+    | "handwriting_empty"
+    | "handwriting_render_failed"
+    | "handwriting_recognition_failed";
+  message: string;
+}
 
 export interface Task {
   id: string;

@@ -18,28 +18,38 @@ export function LibraryPage(props: LibraryPageProps) {
   const [tab, setTab] = useState<"all" | "manuscripts" | "documents">("all");
   const showManuscripts = tab === "all" || tab === "manuscripts";
   const showDocuments = tab === "all" || tab === "documents";
+  const totalCount = props.manuscripts.length + props.documents.length;
   return (
     <section className="screen library-screen">
-      <header className="top-bar loose">
-        <div>
-          <p className="eyebrow">库</p>
-          <h1>手稿与对应文档</h1>
-        </div>
-        <button className="icon-button" onClick={props.onRefresh} type="button">
-          {props.loading ? "同步" : "刷新"}
-        </button>
-      </header>
-      <div className="segmented-control">
-        {(["all", "manuscripts", "documents"] as const).map((item) => (
-          <button className={tab === item ? "active" : ""} key={item} onClick={() => setTab(item)} type="button">
-            {item === "all" ? "全部" : item === "manuscripts" ? "手稿" : "文档"}
+      <header className="library-hero">
+        <div className="library-hero-top">
+          <div>
+            <p className="eyebrow">库</p>
+            <h1>手稿与文档</h1>
+          </div>
+          <button className="icon-button library-refresh" disabled={props.loading} onClick={props.onRefresh} type="button">
+            {props.loading ? "同步中" : "刷新"}
           </button>
-        ))}
-      </div>
-      <div className="inline-actions">
-        <button onClick={props.onCreateManuscript} type="button">新手稿</button>
-        <button onClick={props.onCreateDocument} type="button">新文档</button>
-      </div>
+        </div>
+        <p className="library-copy">集中管理现场手稿和整理后的文档，共 {totalCount} 份内容。</p>
+        <div className="library-action-grid">
+          <button className="library-action primary" onClick={props.onCreateManuscript} type="button">
+            <span>创建新手稿</span>
+            <small>录音、拍照、手写</small>
+          </button>
+          <button className="library-action" onClick={props.onCreateDocument} type="button">
+            <span>创建新文档</span>
+            <small>直接开始编辑</small>
+          </button>
+        </div>
+        <div className="segmented-control library-tabs">
+          {(["all", "manuscripts", "documents"] as const).map((item) => (
+            <button aria-pressed={tab === item} className={tab === item ? "active" : ""} key={item} onClick={() => setTab(item)} type="button">
+              {item === "all" ? "全部" : item === "manuscripts" ? "手稿" : "文档"}
+            </button>
+          ))}
+        </div>
+      </header>
       {showManuscripts && (
         <ResourceGroup title="手稿">
           {props.manuscripts.map((item) => (

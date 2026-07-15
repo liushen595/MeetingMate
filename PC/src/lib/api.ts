@@ -25,6 +25,39 @@ type PagedResponse<T> = {
   items: T[];
 };
 
+export type ConvertMode = "meeting_minutes" | "todo_list" | "article_draft";
+
+export type ConvertWarning = {
+  block_id: string;
+  code:
+    | "audio_transcript_missing"
+    | "audio_optimization_failed"
+    | "image_caption_failed"
+    | "handwriting_empty"
+    | "handwriting_render_failed"
+    | "handwriting_recognition_failed";
+  message: string;
+};
+
+export type Task = {
+  id: string;
+  type: "convert_manuscript" | "asr_audio" | "export_document" | "ai_rewrite" | string;
+  status: "queued" | "processing" | "succeeded" | "failed" | "cancelled";
+  progress: { stage: string; current: number; total: number; message: string };
+  result: {
+    document_id?: string;
+    asset_id?: string;
+    transcript?: string;
+    speaker_segments?: unknown[];
+    export_id?: string;
+    warnings?: ConvertWarning[];
+    [key: string]: unknown;
+  } | null;
+  error?: { code?: string; message?: string; retryable?: boolean } | null;
+  created_at?: string;
+  updated_at?: string;
+};
+
 type RemoteManuscript = {
   id: string;
   title: string;
@@ -427,7 +460,7 @@ class PcApiClient {
       idempotent: true,
       body: JSON.stringify({
         manuscript_id: id,
-        mode: "meeting_minutes",
+        mode,
         title,
         client_id: this.clientId,
         optimize_audio: optimizeAudio,
@@ -684,7 +717,7 @@ class PcApiClient {
       if (current.status === "cancelled")
         throw new Error(`任务已取消（task: ${current.id}）`);
       await sleep(2000);
-      current = await this.request<Task>(`/tasks/${current.id}`);
+      current = await this.getTask(current.id);
     }
     throw new Error(
       `${timeoutMessage}（task: ${current.id}, status: ${current.status}）`,

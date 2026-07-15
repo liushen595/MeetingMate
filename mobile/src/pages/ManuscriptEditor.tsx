@@ -13,7 +13,7 @@ import {
   touchBlock,
   upsertOperation,
 } from "../lib/blocks";
-import { captureImageFromCamera, createPcmRecorder, formatDuration, normalizeRecordedAudio, readImageFile, type PcmRecorder } from "../lib/media";
+import { canUseNativeCamera, captureImageFromCamera, createPcmRecorder, formatDuration, normalizeRecordedAudio, readImageFile, type PcmRecorder } from "../lib/media";
 import { readAsrSse, readImageRecognitionSse } from "../lib/sse";
 import type { ConvertMode, Manuscript, ManuscriptBlock, ManuscriptHandwritingBlock, Stroke, StrokeTool, SyncOperation, Task } from "../types/api";
 import { AssetImage } from "../components/AssetImage";
@@ -37,7 +37,6 @@ type PendingAudio = {
   status: "uploading" | "failed";
   error?: string;
 };
-
 const PEN_COLORS = ["#1f1b14", "#111827", "#2563eb", "#dc2626", "#16a34a", "#7c3aed"];
 const HIGHLIGHTER_COLORS = ["#fef08a", "#fde68a", "#bbf7d0", "#bfdbfe", "#fecdd3", "#ddd6fe"];
 const PEN_COLOR_KEY = "meetingmate.mobile.pen.color";
@@ -63,6 +62,7 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
   const [localAudioUrls, setLocalAudioUrls] = useState<Record<string, string>>({});
   const [localImageUrls, setLocalImageUrls] = useState<Record<string, string>>({});
   const [task, setTask] = useState<Task | null>(null);
+  const [convertTask, setConvertTask] = useState<Task | null>(null);
   const [recognizingImageAssetIds, setRecognizingImageAssetIds] = useState<string[]>([]);
   const [convertDialogOpen, setConvertDialogOpen] = useState(false);
   const [convertTitle, setConvertTitle] = useState("");
@@ -74,6 +74,7 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
   const longPressTimerRef = useRef<number | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const imageAfterBlockIdRef = useRef<string | null>(null);
+  const openedDocumentTaskRef = useRef<string | null>(null);
 
   const userId = api.currentSession?.user.id ?? "";
   const visibleBlocks = useMemo(() => blocks.filter((block) => !block.deleted), [blocks]);
@@ -98,12 +99,33 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
   }
 
   useEffect(() => {
+    if (!convertTask) return;
+    if (convertTask.status === "succeeded" && convertTask.result?.document_id && openedDocumentTaskRef.current !== convertTask.id) {
+      openedDocumentTaskRef.current = convertTask.id;
+      if (convertTask.result.warnings?.length) {
+        sessionStorage.setItem(`meetingmate.convertWarnings.${convertTask.result.document_id}`, JSON.stringify(convertTask.result.warnings));
+      }
+      onOpenDocument(convertTask.result.document_id);
+      return;
+    }
+    if (convertTask.status === "failed" || convertTask.status === "cancelled" || convertTask.status === "succeeded") return;
+    const timer = window.setInterval(async () => {
+      try {
+        const next = await api.getTask(convertTask.id);
+        setConvertTask(next);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "转换任务状态刷新失败");
+      }
+    }, 1600);
+    return () => window.clearInterval(timer);
+  }, [convertTask, onOpenDocument]);
+
+  useEffect(() => {
     if (!task || task.status === "succeeded" || task.status === "failed" || task.status === "cancelled") return;
-    if (task.type === "asr_audio") return;
+    if (task.type !== "asr_audio") return;
     const timer = window.setInterval(async () => {
       const next = await api.getTask(task.id);
       setTask(next);
-      if (next.status === "succeeded" && next.result?.document_id) onOpenDocument(next.result.document_id);
       if (next.status === "succeeded" && next.result?.asset_id && typeof next.result.transcript === "string") {
         const block = blocks.find((item): item is Extract<ManuscriptBlock, { type: "audio" }> => item.type === "audio" && item.props.asset_id === next.result?.asset_id);
         if (block) {
@@ -123,7 +145,7 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
       }
     }, 1600);
     return () => window.clearInterval(timer);
-  }, [task, onOpenDocument, blocks]);
+  }, [task, blocks]);
 
   function queueOperation(op: PendingOp) {
     if (op.type === "upsert_block" && op.block) {
@@ -266,17 +288,26 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
   async function startRecording(afterBlockId: string | null = null) {
     setMenu(null);
     if (recording) return;
-    const startedAt = Date.now();
-    const recorder = await createPcmRecorder();
-    setRecording({ recorder, startedAt, afterBlockId });
+    try {
+      const startedAt = Date.now();
+      const recorder = await createPcmRecorder();
+      setRecording({ recorder, startedAt, afterBlockId });
+      setSyncState("录音中");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "录音启动失败，请检查麦克风权限");
+    }
   }
 
   async function stopRecording() {
     if (!recording) return;
     const current = recording;
     setRecording(null);
-    const audio = await current.recorder.stop();
-    void finishAudio(audio.blob, audio.durationMs || Date.now() - current.startedAt, current.afterBlockId);
+    try {
+      const audio = await current.recorder.stop();
+      void finishAudio(audio.blob, audio.durationMs || Date.now() - current.startedAt, current.afterBlockId);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "录音保存失败");
+    }
   }
 
   async function finishAudio(blob: Blob, durationMs: number, afterBlockId: string | null) {
@@ -349,6 +380,10 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
   async function chooseImage(afterBlockId: string | null = null) {
     imageAfterBlockIdRef.current = afterBlockId;
     setMenu(null);
+    if (!canUseNativeCamera()) {
+      fileInputRef.current?.click();
+      return;
+    }
     try {
       const image = await captureImageFromCamera();
       await uploadImage(image, afterBlockId);
@@ -394,12 +429,14 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
           setTask(nextTask);
           setSyncState("图片识别已完成，正在同步手稿");
           const refreshed = await reloadManuscript();
-          const result = nextTask.result;
-          const extractedText = result?.text ?? result?.recognized_text ?? result?.caption ?? "";
+          const extractedText = nextTask.result?.text ?? nextTask.result?.recognized_text ?? "";
           if (extractedText) {
             const block = refreshed.blocks.find((item): item is Extract<ManuscriptBlock, { type: "image" }> => item.type === "image" && item.props.asset_id === assetId);
             if (block) {
-              applyBlock(createTextBlock(userId, extractedText), block.id);
+              const textBlock = createTextBlock(userId, extractedText);
+              setBlocks(insertAfter(refreshed.blocks.filter((item) => !item.deleted), textBlock, block.id));
+              await api.syncManuscriptBlocks(refreshed.id, refreshed.revision, [upsertOperation(textBlock, userId, block.id)]);
+              await reloadManuscript();
             }
           }
           setSyncState("已保存");
@@ -501,7 +538,7 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
 
   function openConvertDialog() {
     if (!manuscript) return;
-    setConvertTitle(manuscript.title.replace(/手稿$/, "文档"));
+    setConvertTitle(defaultDocumentTitle(manuscript.title));
     setConvertDialogOpen(true);
   }
 
@@ -517,7 +554,7 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
     if (recognizingImageAssetIds.length > 0 && !window.confirm("图片文字仍在提取，继续转换时后端会尝试补充提取文本。仍然继续？")) return;
     await flushOps({ throwOnError: true });
     const taskResult = await api.convertManuscript(manuscript.id, mode, title, optimizeAudio);
-    setTask(taskResult);
+    setConvertTask(taskResult);
     setConvertDialogOpen(false);
   }
 
@@ -536,6 +573,7 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
         <button className="primary-small" onClick={openConvertDialog} type="button">转文档</button>
       </header>
 
+      {convertTask && <TaskBanner task={convertTask} />}
       {task && <TaskBanner task={task} />}
       {error && <button className="toast inline" onClick={() => setError(null)} type="button">{error}</button>}
 
@@ -674,13 +712,31 @@ function PendingAudioBlock({ audio }: { audio: PendingAudio }) {
 }
 
 function TaskBanner({ task }: { task: Task }) {
+  const total = Math.max(1, task.progress.total || 1);
+  const current = Math.max(0, Math.min(task.progress.current || 0, total));
+  const percent = Math.round((current / total) * 100);
   return (
     <div className="task-banner">
       <span>{task.status}</span>
       <strong>{task.progress.message || task.type}</strong>
-      <small>{task.progress.stage} · {task.progress.current}/{task.progress.total}</small>
+      <div className="task-progress" aria-label="任务进度" aria-valuemax={total} aria-valuemin={0} aria-valuenow={current} role="progressbar">
+        <i style={{ width: `${percent}%` }} />
+      </div>
+      <small>{task.progress.stage} · {current}/{total}</small>
+      {task.result?.warnings?.length ? <small>部分内容已降级处理：{task.result.warnings.length} 项</small> : null}
+      {task.error?.message ? <small>{task.error.message}</small> : null}
     </div>
   );
+}
+
+function defaultDocumentTitle(manuscriptTitle: string) {
+  const trimmed = manuscriptTitle.trim();
+  if (!trimmed) return "未命名文档";
+  return trimmed.endsWith("手稿") ? trimmed.replace(/手稿$/, "文档") : `${trimmed} 文档`;
+}
+
+function isConvertTaskRunning(task: Task | null) {
+  return Boolean(task && task.type === "convert_manuscript" && task.status !== "succeeded" && task.status !== "failed" && task.status !== "cancelled");
 }
 
 function EditorMessage({ title, message, onBack }: { title: string; message: string; onBack: () => void }) {

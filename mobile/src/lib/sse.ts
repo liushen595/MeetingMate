@@ -1,4 +1,5 @@
 import type { Task } from "../types/api";
+import type { DocumentAgentResult } from "./documentAgent";
 
 export async function readSseText(response: Response, onDelta: (text: string) => void) {
   if (!response.body) throw new Error("AI 响应没有可读取的数据流");
@@ -81,6 +82,36 @@ export async function readImageRecognitionSse(
     }
     if (event === "error") {
       const parsed = JSON.parse(data) as { code: string; message: string };
+      throw new Error(parsed.message || parsed.code);
+    }
+  });
+}
+
+export async function readAgentEditSse(
+  response: Response,
+  handlers: {
+    onStatus?: (message: string) => void;
+    onDelta?: (text: string) => void;
+    onResult?: (result: DocumentAgentResult) => void;
+  },
+) {
+  await readSse(response, (event, data) => {
+    if (event === "status") {
+      const parsed = JSON.parse(data) as { message?: string };
+      if (parsed.message) handlers.onStatus?.(parsed.message);
+      return;
+    }
+    if (event === "delta") {
+      const parsed = JSON.parse(data) as { text?: string };
+      if (parsed.text) handlers.onDelta?.(parsed.text);
+      return;
+    }
+    if (event === "result") {
+      handlers.onResult?.(JSON.parse(data) as DocumentAgentResult);
+      return;
+    }
+    if (event === "error") {
+      const parsed = JSON.parse(data) as { code: string; message?: string };
       throw new Error(parsed.message || parsed.code);
     }
   });

@@ -5,7 +5,7 @@ export function makeId(prefix: string) {
 }
 
 export function makeIdempotencyKey() {
-  return crypto.randomUUID?.() ?? makeId("idem");
+  return globalThis.crypto?.randomUUID?.() ?? makeId("idem");
 }
 
 export function nowIso() {
