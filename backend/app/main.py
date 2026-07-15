@@ -14,10 +14,10 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field as dataclass_field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, AsyncIterator, Literal
 from urllib.parse import quote, urlencode
 
-from fastapi import Depends, FastAPI, Header, Query, Request, Response, status
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, Query, Request, Response, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
@@ -31,6 +31,7 @@ from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.requests import HTTPConnection
 
+from app.asr import AsrProvider, AsrProviderError, AsrResult, provider_from_environment, result_from_text, stream_delta
 from app.database import DatabaseSettings, DatabaseState, check_database, close_database, connect_database, load_database_settings
 
 
@@ -113,6 +114,7 @@ class AppSettings:
     object_storage_bucket: str | None
     asset_upload_url_mode: str | None
     api_public_base_url: str | None
+    asr_provider: str
     database: DatabaseSettings
 
 
@@ -132,7 +134,8 @@ def parse_env_list(name: str) -> list[str]:
 
 
 def load_settings() -> AppSettings:
-    load_dotenv(BACKEND_ROOT / ".env")
+    if os.getenv("MEETINGMATE_SKIP_DOTENV") != "1":
+        load_dotenv(BACKEND_ROOT / ".env")
     return AppSettings(
         cors_origins=parse_env_list("CORS_ORIGINS"),
         cors_origin_regex=os.getenv("CORS_ORIGIN_REGEX") or None,
@@ -141,6 +144,7 @@ def load_settings() -> AppSettings:
         object_storage_bucket=os.getenv("OBJECT_STORAGE_BUCKET") or None,
         asset_upload_url_mode=os.getenv("ASSET_UPLOAD_URL_MODE") or None,
         api_public_base_url=os.getenv("API_PUBLIC_BASE_URL") or None,
+        asr_provider=os.getenv("ASR_PROVIDER") or "dashscope",
         database=load_database_settings(),
     )
 
@@ -152,6 +156,7 @@ settings = load_settings()
 async def lifespan(app: FastAPI):
     app.state.database = await connect_database(settings.database)
     app.state.repository = PostgresRepository(app.state.database)
+    app.state.asr_provider = build_asr_provider()
     try:
         yield
     finally:
@@ -168,6 +173,18 @@ def new_id(prefix: str) -> str:
 
 def make_token(prefix: str) -> str:
     return f"{prefix}_{secrets.token_urlsafe(32)}"
+
+
+def build_asr_provider() -> AsrProvider:
+    return provider_from_environment(settings.asr_provider)
+
+
+def get_asr_provider(request: Request) -> AsrProvider:
+    provider = getattr(request.app.state, "asr_provider", None)
+    if provider is None:
+        provider = build_asr_provider()
+        request.app.state.asr_provider = provider
+    return provider
 
 
 def password_hash(password: str) -> str:
@@ -1326,13 +1343,14 @@ class PostgresRepository:
         )
         return document_version_record_from_row(row) if row else None
 
-    async def save_task(self, owner_id: str, task: Task) -> None:
+    async def save_task(self, owner_id: str, task: Task, task_input: dict[str, Any] | None = None) -> None:
         await self.pool.execute(
             """
-            INSERT INTO tasks(id, owner_id, type, status, progress, result, error, retry_count, billing, created_at, updated_at)
-            VALUES($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7::jsonb, $8, $9::jsonb, $10, $11)
+            INSERT INTO tasks(id, owner_id, type, status, input, progress, result, error, retry_count, billing, created_at, updated_at)
+            VALUES($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7::jsonb, $8::jsonb, $9, $10::jsonb, $11, $12)
             ON CONFLICT (id) DO UPDATE SET
                 status = EXCLUDED.status,
+                input = COALESCE(EXCLUDED.input, tasks.input),
                 progress = EXCLUDED.progress,
                 result = EXCLUDED.result,
                 error = EXCLUDED.error,
@@ -1344,6 +1362,7 @@ class PostgresRepository:
             owner_id,
             task.type,
             task.status,
+            jsonb(task_input) if task_input is not None else None,
             jsonb(task.progress),
             jsonb(task.result) if task.result is not None else None,
             jsonb(task.error) if task.error is not None else None,
@@ -2059,6 +2078,194 @@ def render_export_content(document: Document, export_format: Literal["pdf", "doc
     return buffer.getvalue()
 
 
+def speaker_segments_from_asr(result: AsrResult) -> list[SpeakerSegment]:
+    return [
+        SpeakerSegment(
+            speaker_id=segment.speaker_id,
+            start_ms=segment.start_ms,
+            end_ms=segment.end_ms,
+            text=segment.text,
+            confidence=segment.confidence,
+        )
+        for segment in result.speaker_segments
+    ]
+
+
+async def apply_asr_result_to_manuscripts(
+    db: PostgresRepository,
+    owner_id: str,
+    asset_id: str,
+    task_id: str,
+    result: AsrResult,
+    generated_at: datetime,
+) -> None:
+    segments = speaker_segments_from_asr(result)
+    manuscripts = await db.list_manuscripts(owner_id, include_deleted=True)
+    for manuscript in manuscripts:
+        changed = False
+        updated_blocks: list[ManuscriptBlock] = []
+        for block in manuscript.blocks:
+            if isinstance(block, ManuscriptAudioBlock) and block.props.asset_id == asset_id:
+                props = block.props.model_copy(
+                    update={
+                        "transcript": result.transcript,
+                        "speaker_segments": segments,
+                        "asr_task_id": task_id,
+                        "asr_generated_at": generated_at,
+                    }
+                )
+                updated_blocks.append(block.model_copy(update={"props": props, "revision": block.revision + 1, "updated_at": generated_at}))
+                changed = True
+            else:
+                updated_blocks.append(block)
+        if changed:
+            manuscript.blocks = updated_blocks
+            manuscript.revision += 1
+            manuscript.updated_at = generated_at
+            await db.save_manuscript(manuscript)
+
+
+async def save_failed_asr_task(db: PostgresRepository, owner_id: str, task: Task, message: str, retryable: bool) -> None:
+    failed = task.model_copy(
+        update={
+            "status": "failed",
+            "progress": TaskProgress(stage="completed", current=0, total=1, message="ASR task failed."),
+            "error": TaskError(code="ai_unavailable" if retryable else "validation_error", message=message, retryable=retryable),
+            "updated_at": utcnow(),
+        }
+    )
+    await db.save_task(owner_id, failed)
+
+
+def asr_task_error_code(retryable: bool) -> str:
+    return "ai_unavailable" if retryable else "validation_error"
+
+
+def sse_event(event: str, data: dict[str, Any]) -> str:
+    return f"event: {event}\ndata: {json.dumps(jsonable_encoder(data), ensure_ascii=False)}\n\n"
+
+
+async def process_asr_task(
+    db: PostgresRepository,
+    owner_id: str,
+    task_id: str,
+    payload: AsrAudioRequest,
+    provider: AsrProvider,
+) -> None:
+    task = await get_task(db, task_id, owner_id)
+    if task.status == "cancelled":
+        return
+
+    processing = task.model_copy(
+        update={
+            "status": "processing",
+            "progress": TaskProgress(stage="asr", current=0, total=1, message="ASR task processing."),
+            "updated_at": utcnow(),
+        }
+    )
+    await db.save_task(owner_id, processing)
+
+    try:
+        asset_record = await get_asset_record(db, payload.asset_id, owner_id)
+        if asset_record.asset.kind != "audio" or asset_record.asset.status != "ready":
+            raise validation_error("ASR requires a ready audio asset.")
+        content = asset_record.content or b""
+        result = await provider.transcribe(
+            filename=asset_record.asset.filename,
+            content_type=asset_record.asset.content_type,
+            content=content,
+            duration_ms=asset_record.asset.duration_ms,
+            language=payload.language,
+            enable_diarization=payload.enable_diarization,
+        )
+        generated_at = utcnow()
+        await apply_asr_result_to_manuscripts(db, owner_id, payload.asset_id, task_id, result, generated_at)
+        completed = processing.model_copy(
+            update={
+                "status": "succeeded",
+                "progress": TaskProgress(stage="completed", current=1, total=1, message="ASR task completed."),
+                "result": {
+                    "asset_id": payload.asset_id,
+                    "transcript": result.transcript,
+                    "speaker_segments": [segment.model_dump(mode="json") for segment in speaker_segments_from_asr(result)],
+                },
+                "error": None,
+                "updated_at": generated_at,
+            }
+        )
+        await db.save_task(owner_id, completed)
+    except APIError as exc:
+        await save_failed_asr_task(db, owner_id, processing, exc.message, retryable=False)
+    except AsrProviderError as exc:
+        await save_failed_asr_task(db, owner_id, processing, exc.message, retryable=exc.retryable)
+    except Exception:
+        await save_failed_asr_task(db, owner_id, processing, "ASR service is temporarily unavailable.", retryable=True)
+
+
+async def stream_asr_task_events(
+    db: PostgresRepository,
+    owner_id: str,
+    task: Task,
+    payload: AsrAudioRequest,
+    provider: AsrProvider,
+) -> AsyncIterator[str]:
+    yield sse_event("task", {"task": task})
+    processing = task.model_copy(
+        update={
+            "status": "processing",
+            "progress": TaskProgress(stage="asr", current=0, total=1, message="ASR task processing."),
+            "updated_at": utcnow(),
+        }
+    )
+    await db.save_task(owner_id, processing)
+    yield sse_event("task", {"task": processing})
+    try:
+        asset_record = await get_asset_record(db, payload.asset_id, owner_id)
+        if asset_record.asset.kind != "audio" or asset_record.asset.status != "ready":
+            raise validation_error("ASR requires a ready audio asset.")
+        current_text = ""
+        async for chunk in provider.stream_transcribe(
+            filename=asset_record.asset.filename,
+            content_type=asset_record.asset.content_type,
+            content=asset_record.content or b"",
+            duration_ms=asset_record.asset.duration_ms,
+            language=payload.language,
+            enable_diarization=payload.enable_diarization,
+        ):
+            current_text, delta = stream_delta(current_text, chunk)
+            if delta:
+                yield sse_event("delta", {"task_id": task.id, "text": delta, "transcript": current_text})
+
+        result = result_from_text(current_text, asset_record.asset.duration_ms, payload.enable_diarization)
+        generated_at = utcnow()
+        await apply_asr_result_to_manuscripts(db, owner_id, payload.asset_id, task.id, result, generated_at)
+        completed = processing.model_copy(
+            update={
+                "status": "succeeded",
+                "progress": TaskProgress(stage="completed", current=1, total=1, message="ASR task completed."),
+                "result": {
+                    "asset_id": payload.asset_id,
+                    "transcript": result.transcript,
+                    "speaker_segments": [segment.model_dump(mode="json") for segment in speaker_segments_from_asr(result)],
+                },
+                "error": None,
+                "updated_at": generated_at,
+            }
+        )
+        await db.save_task(owner_id, completed)
+        yield sse_event("done", {"task": completed})
+    except APIError as exc:
+        await save_failed_asr_task(db, owner_id, processing, exc.message, retryable=False)
+        yield sse_event("error", {"code": "validation_error", "message": exc.message})
+    except AsrProviderError as exc:
+        await save_failed_asr_task(db, owner_id, processing, exc.message, retryable=exc.retryable)
+        yield sse_event("error", {"code": asr_task_error_code(exc.retryable), "message": exc.message})
+    except Exception:
+        message = "ASR service is temporarily unavailable."
+        await save_failed_asr_task(db, owner_id, processing, message, retryable=True)
+        yield sse_event("error", {"code": "ai_unavailable", "message": message})
+
+
 app = FastAPI(
     title="MeetingMate Backend",
     version="0.1.0",
@@ -2741,6 +2948,7 @@ async def convert_manuscript(
 @router.post("/tasks/asr-audio", response_model=Task, status_code=status.HTTP_202_ACCEPTED, dependencies=IDEMPOTENT_WRITE_DEPENDENCIES)
 async def asr_audio(
     request: Request,
+    background_tasks: BackgroundTasks,
     payload: AsrAudioRequest,
     ctx: AuthContext = Depends(auth_context),
     db: PostgresRepository = Depends(get_repository),
@@ -2762,8 +2970,39 @@ async def asr_audio(
         created_at=now,
         updated_at=now,
     )
-    await db.save_task(ctx.user_id, task)
+    task_input = payload.model_dump(mode="json")
+    await db.save_task(ctx.user_id, task, task_input=task_input)
+    background_tasks.add_task(process_asr_task, db, ctx.user_id, task.id, payload, get_asr_provider(request))
     return await idempotent_json_response(db, idem, task, status.HTTP_202_ACCEPTED)
+
+
+@router.post("/tasks/asr-audio/stream", dependencies=IDEMPOTENT_WRITE_DEPENDENCIES)
+async def asr_audio_stream(
+    request: Request,
+    payload: AsrAudioRequest,
+    ctx: AuthContext = Depends(auth_context),
+    db: PostgresRepository = Depends(get_repository),
+) -> StreamingResponse:
+    require_client_header(request, ctx, payload.client_id)
+    require_idempotency_header(request)
+    asset_record = await get_asset_record(db, payload.asset_id, ctx.user_id)
+    if asset_record.asset.kind != "audio" or asset_record.asset.status != "ready":
+        raise validation_error("ASR requires a ready audio asset.")
+    now = utcnow()
+    task = Task(
+        id=new_id("task"),
+        type="asr_audio",
+        status="queued",
+        progress=TaskProgress(stage="queued", current=0, total=1, message="ASR task queued."),
+        result=None,
+        created_at=now,
+        updated_at=now,
+    )
+    await db.save_task(ctx.user_id, task, task_input=payload.model_dump(mode="json"))
+    return StreamingResponse(
+        stream_asr_task_events(db, ctx.user_id, task, payload, get_asr_provider(request)),
+        media_type="text/event-stream",
+    )
 
 
 @router.get("/tasks/{task_id}", response_model=Task)

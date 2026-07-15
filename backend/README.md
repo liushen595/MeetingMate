@@ -25,6 +25,16 @@ OBJECT_STORAGE_BUCKET="bucket"
 ASSET_UPLOAD_URL_MODE="api"
 API_PUBLIC_BASE_URL=""
 
+ASR_PROVIDER="dashscope"
+DASHSCOPE_API_URL="https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api/v1"
+DASHSCOPE_API_KEY=""
+DASHSCOPE_MODEL="qwen3-asr-flash"
+
+# Optional fallback provider kept for future use.
+AZURE_SPEECH_ENDPOINT=""
+AZURE_SPEECH_KEY=""
+AZURE_SPEECH_API_VERSION="2025-10-15"
+
 DATABASE_HOST=127.0.0.1
 DATABASE_PORT=5432
 DATABASE_NAME=MeetingMate
@@ -40,6 +50,8 @@ DATABASE_COMMAND_TIMEOUT_SECONDS=30
 `DATABASE_URL` is also supported. If it is set, it takes precedence over the component fields above.
 
 `ASSET_UPLOAD_URL_MODE="api"` makes `/assets/upload` return FastAPI upload proxy URLs. This is the recommended local/LAN development mode when MinIO/S3 is not reachable directly from the browser. Set `API_PUBLIC_BASE_URL` only when the backend is behind a proxy and `request.base_url` is not the browser-reachable API base URL.
+
+`ASR_PROVIDER="dashscope"` uses Alibaba Cloud Model Studio DashScope ASR. The backend sends uploaded audio as a Base64 data URI and rejects input whose Base64 payload exceeds 10MB. `AZURE_SPEECH_*` is retained as a fallback provider configuration for future Azure Speech support.
 
 ```bash
 uvicorn app.main:app --reload

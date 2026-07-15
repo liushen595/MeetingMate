@@ -10,8 +10,39 @@ os.environ["CORS_ORIGIN_REGEX"] = r"^https?://(localhost|127\.0\.0\.1|10\.(?:\d{
 os.environ["OBJECT_STORAGE_PUBLIC_BASE_URL"] = "http://10.90.129.20:9000"
 os.environ["OBJECT_STORAGE_BUCKET"] = "bucket"
 os.environ["API_PUBLIC_BASE_URL"] = "http://testserver"
+os.environ["MEETINGMATE_SKIP_DOTENV"] = "1"
 
 import app.main as backend
+from app.asr import AsrProvider, AsrResult, AsrSegment
+
+
+class TestAsrProvider(AsrProvider):
+    async def transcribe(
+        self,
+        *,
+        filename: str,
+        content_type: str,
+        content: bytes,
+        duration_ms: int | None,
+        language: str,
+        enable_diarization: bool,
+    ) -> AsrResult:
+        text = "你好，我是谁"
+        segments = [AsrSegment(speaker_id="speaker_1", start_ms=0, end_ms=max(duration_ms or 0, 1), text=text, confidence=1.0)]
+        return AsrResult(transcript=text, speaker_segments=segments if enable_diarization else [])
+
+    async def stream_transcribe(
+        self,
+        *,
+        filename: str,
+        content_type: str,
+        content: bytes,
+        duration_ms: int | None,
+        language: str,
+        enable_diarization: bool,
+    ):
+        yield "你好，"
+        yield "你好，我是谁"
 
 
 class TestRepository:
@@ -180,7 +211,7 @@ class TestRepository:
                 return record
         return None
 
-    async def save_task(self, owner_id: str, task: backend.Task) -> None:
+    async def save_task(self, owner_id: str, task: backend.Task, task_input: dict | None = None) -> None:
         self.tasks[task.id] = (owner_id, task)
 
     async def get_task_record(self, task_id: str) -> tuple[str, backend.Task] | None:
@@ -203,6 +234,7 @@ repo = TestRepository()
 repo.reset()
 app = backend.app
 app.dependency_overrides[backend.get_repository] = lambda: repo
+app.state.asr_provider = TestAsrProvider()
 
 
 client = TestClient(app)
@@ -427,7 +459,7 @@ def test_manual_document_rejects_forged_derived_from() -> None:
     assert response.json()["error"]["code"] == "validation_error"
 
 
-def test_asr_task_queues_without_overwriting_existing_transcript_and_cancel_is_idempotent() -> None:
+def test_asr_task_succeeds_and_updates_audio_block() -> None:
     repo.reset()
     auth = register_user("asr@example.com", "device_asr")
     upload_content = b"0123456789"
@@ -492,17 +524,32 @@ def test_asr_task_queues_without_overwriting_existing_transcript_and_cancel_is_i
     )
     assert asr.status_code == 202, asr.text
     assert asr.json()["status"] == "queued"
-    fetched = client.get(f"/api/v1/manuscripts/{manuscript.json()['id']}", headers=auth_headers(auth, "device_asr"))
-    assert fetched.json()["blocks"][0]["props"]["transcript"] == "existing transcript"
-
     task_id = asr.json()["id"]
+    task = client.get(f"/api/v1/tasks/{task_id}", headers=auth_headers(auth, "device_asr"))
+    assert task.status_code == 200, task.text
+    assert task.json()["status"] == "succeeded"
+    assert task.json()["result"]["asset_id"] == asset_id
+    assert task.json()["result"]["transcript"] == "你好，我是谁"
+    fetched = client.get(f"/api/v1/manuscripts/{manuscript.json()['id']}", headers=auth_headers(auth, "device_asr"))
+    audio_props = fetched.json()["blocks"][0]["props"]
+    assert audio_props["transcript"] == "你好，我是谁"
+    assert audio_props["speaker_segments"][0]["speaker_id"] == "speaker_1"
+    assert audio_props["asr_task_id"] == task_id
+    assert audio_props["asr_generated_at"] is not None
+
     cancel_headers = auth_headers(auth, "device_asr", "idem_cancel_asr")
     cancel = client.post(f"/api/v1/tasks/{task_id}/cancel", headers=cancel_headers)
-    assert cancel.status_code == 200, cancel.text
-    assert cancel.json()["status"] == "cancelled"
-    replay = client.post(f"/api/v1/tasks/{task_id}/cancel", headers=cancel_headers)
-    assert replay.status_code == 200, replay.text
-    assert replay.json()["status"] == "cancelled"
+    assert cancel.status_code == 409, cancel.text
+
+    streamed = client.post(
+        "/api/v1/tasks/asr-audio/stream",
+        json={"asset_id": asset_id, "language": "zh-CN", "enable_diarization": True, "client_id": "device_asr"},
+        headers=auth_headers(auth, "device_asr", "idem_stream_asr_task"),
+    )
+    assert streamed.status_code == 200, streamed.text
+    assert "event: delta" in streamed.text
+    assert "你好，我是谁" in streamed.text
+    assert "event: done" in streamed.text
 
 
 def test_document_version_restore_restores_snapshot_content() -> None:

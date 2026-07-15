@@ -123,16 +123,24 @@ CREATE TABLE IF NOT EXISTS tasks (
     owner_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     type TEXT NOT NULL,
     status TEXT NOT NULL,
+    input JSONB,
     progress JSONB NOT NULL,
     result JSONB,
     error JSONB,
     retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
     billing JSONB,
+    locked_at TIMESTAMPTZ,
+    locked_by TEXT,
     created_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL
 );
 
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS input JSONB;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS locked_at TIMESTAMPTZ;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS locked_by TEXT;
+
 CREATE INDEX IF NOT EXISTS idx_tasks_owner_updated_at ON tasks(owner_id, updated_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_tasks_queue ON tasks(type, status, created_at ASC, id ASC);
 
 CREATE TABLE IF NOT EXISTS exports (
     id TEXT PRIMARY KEY,
