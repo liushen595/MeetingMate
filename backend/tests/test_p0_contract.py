@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+import base64
 import hashlib
+import json
 import os
 from datetime import datetime, timezone
 
@@ -27,6 +30,7 @@ class TestAsrProvider(AsrProvider):
         language: str,
         enable_diarization: bool,
     ) -> AsrResult:
+        assert content
         text = "你好，我是谁"
         segments = [AsrSegment(speaker_id="speaker_1", start_ms=0, end_ms=max(duration_ms or 0, 1), text=text, confidence=1.0)]
         return AsrResult(transcript=text, speaker_segments=segments if enable_diarization else [])
@@ -41,6 +45,7 @@ class TestAsrProvider(AsrProvider):
         language: str,
         enable_diarization: bool,
     ):
+        assert content
         yield "你好，"
         yield "你好，我是谁"
 
@@ -271,7 +276,21 @@ def upload_single_part(upload_response, content: bytes) -> dict:
     part = upload_response.json()["parts"][0]
     response = client.put(part["upload_url"], content=content, headers=part["headers"])
     assert response.status_code == 200, response.text
-    return {"part_number": part["part_number"], "etag": response.headers["etag"], "size_bytes": len(content)}
+    metadata = response.json()
+    assert metadata == {"part_number": part["part_number"], "etag": response.headers["etag"], "size_bytes": len(content)}
+    return metadata
+
+
+def sse_events(text: str, event_name: str) -> list[dict]:
+    payloads: list[dict] = []
+    for chunk in text.strip().split("\n\n"):
+        lines = chunk.splitlines()
+        if f"event: {event_name}" not in lines:
+            continue
+        for line in lines:
+            if line.startswith("data: "):
+                payloads.append(json.loads(line.removeprefix("data: ")))
+    return payloads
 
 
 def test_cors_preflight_allows_localhost_and_10_private_network() -> None:
@@ -281,11 +300,56 @@ def test_cors_preflight_allows_localhost_and_10_private_network() -> None:
             headers={
                 "Origin": origin,
                 "Access-Control-Request-Method": "POST",
-                "Access-Control-Request-Headers": "content-type,x-request-id",
+                "Access-Control-Request-Headers": "authorization,content-type,x-client-id,x-request-id,idempotency-key,last-event-id",
             },
         )
         assert response.status_code == 200, response.text
         assert response.headers["access-control-allow-origin"] == origin
+        assert "authorization" in response.headers["access-control-allow-headers"].lower()
+        assert "last-event-id" in response.headers["access-control-allow-headers"].lower()
+
+
+def test_postgres_asset_save_persists_part_contents_as_base64_jsonb() -> None:
+    class FakePool:
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def execute(self, query: str, *args):
+            self.calls.append((query, args))
+
+    now = backend.utcnow()
+    fake_pool = FakePool()
+    postgres = backend.PostgresRepository.__new__(backend.PostgresRepository)
+    postgres.pool = fake_pool
+    content = b"0123456789"
+    record = backend.AssetRecord(
+        owner_id="u_test",
+        asset=backend.Asset(
+            id="asset_test",
+            kind="audio",
+            filename="meeting.m4a",
+            content_type="audio/mp4",
+            size_bytes=len(content),
+            checksum_sha256=hashlib.sha256(content).hexdigest(),
+            duration_ms=None,
+            width=None,
+            height=None,
+            status="uploaded",
+            url=None,
+            created_at=now,
+            updated_at=now,
+        ),
+        upload_id="upload_test",
+        part_size_bytes=len(content),
+        uploaded_parts=[backend.UploadedPart(part_number=1, etag=hashlib.sha256(content).hexdigest(), size_bytes=len(content))],
+        part_contents={1: content},
+    )
+
+    asyncio.run(postgres.save_asset(record))
+
+    query, args = fake_pool.calls[0]
+    assert "part_contents" in query
+    assert json.loads(args[15]) == {"1": base64.b64encode(content).decode("ascii")}
 
 
 def test_p0_flow_register_upload_manuscript_convert_export() -> None:
@@ -310,6 +374,10 @@ def test_p0_flow_register_upload_manuscript_convert_export() -> None:
     assert "object-storage.local" not in upload.json()["parts"][0]["upload_url"]
     uploaded_part = upload_single_part(upload, upload_content)
     asset_id = upload.json()["asset_id"]
+    upload_parts = client.get(f"/api/v1/assets/{asset_id}/upload-parts", headers=auth_headers(auth))
+    assert upload_parts.status_code == 200, upload_parts.text
+    assert upload_parts.json()["uploaded_parts"] == [uploaded_part]
+    assert upload_parts.json()["missing_parts"] == []
     complete = client.post(
         f"/api/v1/assets/{asset_id}/complete",
         json={
@@ -325,6 +393,17 @@ def test_p0_flow_register_upload_manuscript_convert_export() -> None:
     )
     assert complete.status_code == 200, complete.text
     assert complete.json()["status"] == "ready"
+    stream_headers = auth_headers(auth)
+    stream_headers["Origin"] = "http://10.90.129.105:5173"
+    stream = client.get(f"/api/v1/assets/{asset_id}/stream", headers=stream_headers)
+    assert stream.status_code == 200, stream.text
+    assert stream.content == upload_content
+    assert stream.headers["content-type"] == "audio/mp4"
+    assert stream.headers["content-length"] == str(len(upload_content))
+    assert stream.headers["accept-ranges"] == "bytes"
+    assert "inline" in stream.headers["content-disposition"]
+    assert "etag" in stream.headers["access-control-expose-headers"].lower()
+    assert "content-disposition" in stream.headers["access-control-expose-headers"].lower()
 
     created_at = iso_now()
     manuscript = client.post(
@@ -390,6 +469,43 @@ def test_p0_flow_register_upload_manuscript_convert_export() -> None:
     download = client.get(f"/api/v1/exports/{export_id}/download", headers=auth_headers(auth))
     assert download.status_code == 200, download.text
     assert download.json()["download_url"].startswith("http://testserver/api/v1/assets/")
+
+
+def test_asset_stream_can_fallback_to_stored_part_contents() -> None:
+    repo.reset()
+    auth = register_user("parts-stream@example.com", "device_parts_stream")
+    content = b"part-content"
+    checksum = hashlib.sha256(content).hexdigest()
+    now = backend.utcnow()
+    asset = backend.Asset(
+        id="asset_parts_stream",
+        kind="audio",
+        filename="recording.webm",
+        content_type="audio/webm",
+        size_bytes=len(content),
+        checksum_sha256=checksum,
+        duration_ms=1000,
+        width=None,
+        height=None,
+        status="ready",
+        url=None,
+        created_at=now,
+        updated_at=now,
+    )
+    repo.assets[asset.id] = backend.AssetRecord(
+        owner_id=auth["user"]["id"],
+        asset=asset,
+        upload_id="upload_parts_stream",
+        part_size_bytes=len(content),
+        uploaded_parts=[backend.UploadedPart(part_number=1, etag=checksum, size_bytes=len(content))],
+        content=None,
+        part_contents={1: content},
+    )
+
+    stream = client.get(f"/api/v1/assets/{asset.id}/stream", headers=auth_headers(auth, "device_parts_stream"))
+    assert stream.status_code == 200, stream.text
+    assert stream.content == content
+    assert stream.headers["content-type"] == "audio/webm"
 
 
 def test_idempotency_conflict_and_revision_conflict() -> None:
@@ -550,6 +666,14 @@ def test_asr_task_succeeds_and_updates_audio_block() -> None:
     assert "event: delta" in streamed.text
     assert "你好，我是谁" in streamed.text
     assert "event: done" in streamed.text
+    done_task = sse_events(streamed.text, "done")[0]["task"]
+    assert done_task["result"]["asset_id"] == asset_id
+    assert done_task["result"]["transcript"] == "你好，我是谁"
+    fetched_after_stream = client.get(f"/api/v1/manuscripts/{manuscript.json()['id']}", headers=auth_headers(auth, "device_asr"))
+    audio_props_after_stream = fetched_after_stream.json()["blocks"][0]["props"]
+    assert audio_props_after_stream["transcript"] == "你好，我是谁"
+    assert audio_props_after_stream["asr_task_id"] == done_task["id"]
+    assert audio_props_after_stream["asr_generated_at"] is not None
 
 
 def test_document_version_restore_restores_snapshot_content() -> None:
