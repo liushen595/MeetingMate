@@ -47,11 +47,14 @@ MAX_OPERATIONS = 100
 MAX_BLOCK_BYTES = 256 * 1024
 MAX_HANDWRITING_POINTS = 5000
 MAX_CLIENT_TIME_SKEW_SECONDS = 24 * 60 * 60
+GROUP_INVITE_CODE_SECONDS = 24 * 60 * 60
+MAX_INVITE_CODE_ATTEMPTS = 10
 DEFAULT_CORS_ORIGIN_REGEX = r"^https?://(localhost|127\.0\.0\.1|10\.(?:\d{1,3}\.){2}\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3})(?::\d+)?$"
 
 
 Platform = Literal["ios", "android", "mac", "windows", "web"]
 Permission = Literal["owner", "editor", "viewer"]
+GroupRole = Literal["owner", "member"]
 AssetKind = Literal["audio", "image", "export", "attachment"]
 AssetStatus = Literal["pending_upload", "uploaded", "ready", "failed"]
 TaskType = Literal["convert_manuscript", "asr_audio", "recognize_image", "export_document", "ai_rewrite"]
@@ -174,6 +177,10 @@ def new_id(prefix: str) -> str:
 
 def make_token(prefix: str) -> str:
     return f"{prefix}_{secrets.token_urlsafe(32)}"
+
+
+def make_invite_code() -> str:
+    return f"{secrets.randbelow(900000) + 100000:06d}"
 
 
 def build_asr_provider() -> AsrProvider:
@@ -690,6 +697,57 @@ class DocumentCreateRequest(StrictModel):
     initial_blocks: list[DocumentBlock] = Field(default_factory=list)
 
 
+class GroupCreateRequest(StrictModel):
+    name: str = Field(min_length=1, max_length=80)
+    client_id: str
+
+
+class GroupJoinRequest(StrictModel):
+    invite_code: str = Field(pattern=r"^\d{6}$")
+    client_id: str
+
+
+class GroupSummary(StrictModel):
+    id: str
+    name: str
+    invite_code: str
+    invite_code_expires_at: datetime
+    member_count: int = Field(ge=0)
+    role: GroupRole
+    created_at: datetime
+    updated_at: datetime
+
+
+class GroupListResponse(StrictModel):
+    items: list[GroupSummary]
+    next_cursor: str | None
+    sort_by: Literal["updated_at,id"] = "updated_at,id"
+    sort_order: Literal["desc"] = "desc"
+
+
+class GroupDocumentSendRequest(StrictModel):
+    document_id: str
+    client_id: str
+
+
+class GroupDocumentMessage(StrictModel):
+    id: str
+    group_id: str
+    sender_id: str
+    sender_name: str
+    document_id: str
+    document_title: str
+    document_revision: int
+    sent_at: datetime
+
+
+class GroupMessageListResponse(StrictModel):
+    items: list[GroupDocumentMessage]
+    next_cursor: str | None
+    sort_by: Literal["sent_at,id"] = "sent_at,id"
+    sort_order: Literal["desc"] = "desc"
+
+
 class SyncOperationBase(StrictModel):
     op_id: str
     type: Literal["upsert_block", "delete_block", "move_block", "restore_block"]
@@ -953,6 +1011,23 @@ class ShareLinkRecord:
     link: ShareLink
     token: str
     document_id: str
+
+
+@dataclass
+class GroupRecord:
+    id: str
+    name: str
+    invite_code: str
+    invite_code_expires_at: datetime
+    created_by: str
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass
+class GroupDocumentMessageRecord:
+    message: GroupDocumentMessage
+    document_snapshot: Document
 
 
 @dataclass
@@ -1312,6 +1387,177 @@ class PostgresRepository:
     async def delete_document(self, document_id: str) -> None:
         await self.pool.execute("DELETE FROM documents WHERE id = $1", document_id)
 
+    async def create_group(self, group: GroupRecord) -> bool:
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                row = await connection.fetchrow(
+                    """
+                    INSERT INTO groups(id, name, invite_code, invite_code_expires_at, created_by, created_at, updated_at)
+                    VALUES($1, $2, $3, $4, $5, $6, $7)
+                    ON CONFLICT (invite_code) DO NOTHING
+                    RETURNING id
+                    """,
+                    group.id,
+                    group.name,
+                    group.invite_code,
+                    group.invite_code_expires_at,
+                    group.created_by,
+                    group.created_at,
+                    group.updated_at,
+                )
+                if not row:
+                    return False
+                await connection.execute(
+                    """
+                    INSERT INTO group_members(group_id, user_id, role, joined_at)
+                    VALUES($1, $2, $3, $4)
+                    """,
+                    group.id,
+                    group.created_by,
+                    "owner",
+                    group.created_at,
+                )
+        return True
+
+    async def get_group_record(self, group_id: str) -> GroupRecord | None:
+        row = await self.pool.fetchrow("SELECT * FROM groups WHERE id = $1", group_id)
+        return group_record_from_row(row) if row else None
+
+    async def get_group_record_by_invite_code(self, invite_code: str) -> GroupRecord | None:
+        row = await self.pool.fetchrow("SELECT * FROM groups WHERE invite_code = $1", invite_code)
+        return group_record_from_row(row) if row else None
+
+    async def get_group_member_role(self, group_id: str, user_id: str) -> GroupRole | None:
+        row = await self.pool.fetchrow(
+            "SELECT role FROM group_members WHERE group_id = $1 AND user_id = $2",
+            group_id,
+            user_id,
+        )
+        return row["role"] if row else None
+
+    async def add_group_member(self, group_id: str, user_id: str, role: GroupRole, joined_at: datetime) -> bool:
+        result = await self.pool.execute(
+            """
+            INSERT INTO group_members(group_id, user_id, role, joined_at)
+            VALUES($1, $2, $3, $4)
+            ON CONFLICT (group_id, user_id) DO NOTHING
+            """,
+            group_id,
+            user_id,
+            role,
+            joined_at,
+        )
+        inserted = result.endswith("1")
+        if inserted:
+            await self.pool.execute("UPDATE groups SET updated_at = $1 WHERE id = $2", joined_at, group_id)
+        return inserted
+
+    async def list_groups_for_user(self, user_id: str) -> list[GroupSummary]:
+        rows = await self.pool.fetch(
+            """
+            SELECT
+                g.id,
+                g.name,
+                g.invite_code,
+                g.invite_code_expires_at,
+                g.created_at,
+                g.updated_at,
+                gm.role,
+                (SELECT COUNT(*) FROM group_members members WHERE members.group_id = g.id)::int AS member_count
+            FROM groups g
+            JOIN group_members gm ON gm.group_id = g.id AND gm.user_id = $1
+            ORDER BY g.updated_at DESC, g.id DESC
+            """,
+            user_id,
+        )
+        return [group_summary_from_row(row) for row in rows]
+
+    async def get_group_summary_for_user(self, group_id: str, user_id: str) -> GroupSummary | None:
+        row = await self.pool.fetchrow(
+            """
+            SELECT
+                g.id,
+                g.name,
+                g.invite_code,
+                g.invite_code_expires_at,
+                g.created_at,
+                g.updated_at,
+                gm.role,
+                (SELECT COUNT(*) FROM group_members members WHERE members.group_id = g.id)::int AS member_count
+            FROM groups g
+            JOIN group_members gm ON gm.group_id = g.id AND gm.user_id = $2
+            WHERE g.id = $1
+            """,
+            group_id,
+            user_id,
+        )
+        return group_summary_from_row(row) if row else None
+
+    async def save_group_document_message(self, record: GroupDocumentMessageRecord) -> None:
+        message = record.message
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    """
+                    INSERT INTO group_document_messages(
+                        id, group_id, sender_id, document_id, document_title, document_revision, document_snapshot, sent_at
+                    )
+                    VALUES($1, $2, $3, $4, $5, $6, $7::jsonb, $8)
+                    """,
+                    message.id,
+                    message.group_id,
+                    message.sender_id,
+                    message.document_id,
+                    message.document_title,
+                    message.document_revision,
+                    jsonb(record.document_snapshot),
+                    message.sent_at,
+                )
+                await connection.execute("UPDATE groups SET updated_at = $1 WHERE id = $2", message.sent_at, message.group_id)
+
+    async def list_group_document_messages(self, group_id: str) -> list[GroupDocumentMessage]:
+        rows = await self.pool.fetch(
+            """
+            SELECT
+                messages.id,
+                messages.group_id,
+                messages.sender_id,
+                users.name AS sender_name,
+                messages.document_id,
+                messages.document_title,
+                messages.document_revision,
+                messages.sent_at
+            FROM group_document_messages messages
+            JOIN users ON users.id = messages.sender_id
+            WHERE messages.group_id = $1
+            ORDER BY messages.sent_at DESC, messages.id DESC
+            """,
+            group_id,
+        )
+        return [group_document_message_from_row(row) for row in rows]
+
+    async def get_group_document_message_record(self, group_id: str, message_id: str) -> GroupDocumentMessageRecord | None:
+        row = await self.pool.fetchrow(
+            """
+            SELECT
+                messages.id,
+                messages.group_id,
+                messages.sender_id,
+                users.name AS sender_name,
+                messages.document_id,
+                messages.document_title,
+                messages.document_revision,
+                messages.document_snapshot,
+                messages.sent_at
+            FROM group_document_messages messages
+            JOIN users ON users.id = messages.sender_id
+            WHERE messages.group_id = $1 AND messages.id = $2
+            """,
+            group_id,
+            message_id,
+        )
+        return group_document_message_record_from_row(row) if row else None
+
     async def create_document_version(self, document: Document, title: str) -> None:
         version = DocumentVersion(
             id=new_id("ver"),
@@ -1504,6 +1750,51 @@ def document_from_row(row: Any) -> Document:
         permission=row["permission"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+    )
+
+
+def group_record_from_row(row: Any) -> GroupRecord:
+    return GroupRecord(
+        id=row["id"],
+        name=row["name"],
+        invite_code=row["invite_code"],
+        invite_code_expires_at=row["invite_code_expires_at"],
+        created_by=row["created_by"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def group_summary_from_row(row: Any) -> GroupSummary:
+    return GroupSummary(
+        id=row["id"],
+        name=row["name"],
+        invite_code=row["invite_code"],
+        invite_code_expires_at=row["invite_code_expires_at"],
+        member_count=row["member_count"],
+        role=row["role"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def group_document_message_from_row(row: Any) -> GroupDocumentMessage:
+    return GroupDocumentMessage(
+        id=row["id"],
+        group_id=row["group_id"],
+        sender_id=row["sender_id"],
+        sender_name=row["sender_name"],
+        document_id=row["document_id"],
+        document_title=row["document_title"],
+        document_revision=row["document_revision"],
+        sent_at=row["sent_at"],
+    )
+
+
+def group_document_message_record_from_row(row: Any) -> GroupDocumentMessageRecord:
+    return GroupDocumentMessageRecord(
+        message=group_document_message_from_row(row),
+        document_snapshot=Document.model_validate(parse_jsonb(row["document_snapshot"])),
     )
 
 
@@ -1704,6 +1995,21 @@ async def get_document(db: PostgresRepository, document_id: str, user_id: str) -
         raise APIError(status.HTTP_404_NOT_FOUND, "not_found", "Document not found.")
     assert_owner(user_id, document.owner_id)
     return document
+
+
+async def get_group_record(db: PostgresRepository, group_id: str) -> GroupRecord:
+    group = await db.get_group_record(group_id)
+    if not group:
+        raise APIError(status.HTTP_404_NOT_FOUND, "not_found", "Group not found.")
+    return group
+
+
+async def require_group_member(db: PostgresRepository, group_id: str, user_id: str) -> GroupRole:
+    await get_group_record(db, group_id)
+    role = await db.get_group_member_role(group_id, user_id)
+    if not role:
+        raise APIError(status.HTTP_403_FORBIDDEN, "forbidden", "You are not a member of this group.")
+    return role
 
 
 async def get_task(db: PostgresRepository, task_id: str, user_id: str) -> Task:
@@ -1942,6 +2248,11 @@ def require_asset_content(record: AssetRecord) -> bytes:
 def content_disposition_filename(filename: str) -> str:
     fallback = filename.replace("\\", "_").replace("/", "_").replace('"', "_").strip() or "asset"
     return f"inline; filename=\"{fallback}\"; filename*=UTF-8''{quote(filename, safe='')}"
+
+
+def attachment_disposition_filename(filename: str) -> str:
+    fallback = "".join(char if 32 <= ord(char) < 127 and char not in {'\\', '/', '"'} else "_" for char in filename).strip() or "document"
+    return f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{quote(filename, safe='')}"
 
 
 def document_summary(document: Document) -> DocumentSummary:
@@ -3110,6 +3421,149 @@ async def delete_document(
     document = await get_document(db, document_id, ctx.user_id)
     await db.delete_document(document.id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post("/groups", response_model=GroupSummary, status_code=status.HTTP_201_CREATED, dependencies=IDEMPOTENT_WRITE_DEPENDENCIES)
+async def create_group(
+    request: Request,
+    payload: GroupCreateRequest,
+    ctx: AuthContext = Depends(auth_context),
+    db: PostgresRepository = Depends(get_repository),
+) -> JSONResponse:
+    require_client_header(request, ctx, payload.client_id)
+    idem = await require_idempotency(request, ctx, db)
+    if idem[2]:
+        return await idempotent_json_response(db, idem, None, status.HTTP_201_CREATED)
+    name = payload.name.strip()
+    if not name:
+        raise validation_error("Group name must not be empty.")
+    now = utcnow()
+    group: GroupRecord | None = None
+    for _ in range(MAX_INVITE_CODE_ATTEMPTS):
+        candidate = GroupRecord(
+            id=new_id("group"),
+            name=name,
+            invite_code=make_invite_code(),
+            invite_code_expires_at=now + timedelta(seconds=GROUP_INVITE_CODE_SECONDS),
+            created_by=ctx.user_id,
+            created_at=now,
+            updated_at=now,
+        )
+        if await db.create_group(candidate):
+            group = candidate
+            break
+    if not group:
+        raise APIError(status.HTTP_409_CONFLICT, "resource_conflict", "Could not allocate a unique invite code. Please retry.")
+    summary = await db.get_group_summary_for_user(group.id, ctx.user_id)
+    if not summary:
+        raise APIError(status.HTTP_500_INTERNAL_SERVER_ERROR, "internal_error", "Created group membership is missing.")
+    return await idempotent_json_response(db, idem, summary, status.HTTP_201_CREATED)
+
+
+@router.post("/groups/join", response_model=GroupSummary, dependencies=IDEMPOTENT_WRITE_DEPENDENCIES)
+async def join_group(
+    request: Request,
+    payload: GroupJoinRequest,
+    ctx: AuthContext = Depends(auth_context),
+    db: PostgresRepository = Depends(get_repository),
+) -> JSONResponse:
+    require_client_header(request, ctx, payload.client_id)
+    idem = await require_idempotency(request, ctx, db)
+    if idem[2]:
+        return await idempotent_json_response(db, idem, None, status.HTTP_200_OK)
+    group = await db.get_group_record_by_invite_code(payload.invite_code)
+    if not group:
+        raise APIError(status.HTTP_404_NOT_FOUND, "not_found", "Invite code not found.")
+    summary = await db.get_group_summary_for_user(group.id, ctx.user_id)
+    if summary:
+        return await idempotent_json_response(db, idem, summary, status.HTTP_200_OK)
+    if group.invite_code_expires_at <= utcnow():
+        raise APIError(status.HTTP_403_FORBIDDEN, "forbidden", "Invite code has expired.")
+    await db.add_group_member(group.id, ctx.user_id, "member", utcnow())
+    summary = await db.get_group_summary_for_user(group.id, ctx.user_id)
+    if not summary:
+        raise APIError(status.HTTP_500_INTERNAL_SERVER_ERROR, "internal_error", "Joined group membership is missing.")
+    return await idempotent_json_response(db, idem, summary, status.HTTP_200_OK)
+
+
+@router.get("/groups", response_model=GroupListResponse)
+async def list_groups(
+    limit: Annotated[int, Query(ge=1, le=MAX_LIMIT)] = DEFAULT_LIMIT,
+    cursor: str | None = None,
+    ctx: AuthContext = Depends(auth_context),
+    db: PostgresRepository = Depends(get_repository),
+) -> GroupListResponse:
+    groups = await db.list_groups_for_user(ctx.user_id)
+    page, next_cursor = paginate(groups, limit, cursor)
+    return GroupListResponse(items=page, next_cursor=next_cursor)
+
+
+@router.get("/groups/{group_id}/messages", response_model=GroupMessageListResponse)
+async def list_group_messages(
+    group_id: str,
+    limit: Annotated[int, Query(ge=1, le=MAX_LIMIT)] = DEFAULT_LIMIT,
+    cursor: str | None = None,
+    ctx: AuthContext = Depends(auth_context),
+    db: PostgresRepository = Depends(get_repository),
+) -> GroupMessageListResponse:
+    await require_group_member(db, group_id, ctx.user_id)
+    messages = await db.list_group_document_messages(group_id)
+    page, next_cursor = paginate(messages, limit, cursor)
+    return GroupMessageListResponse(items=page, next_cursor=next_cursor)
+
+
+@router.post("/groups/{group_id}/documents", response_model=GroupDocumentMessage, status_code=status.HTTP_201_CREATED, dependencies=IDEMPOTENT_WRITE_DEPENDENCIES)
+async def send_document_to_group(
+    group_id: str,
+    request: Request,
+    payload: GroupDocumentSendRequest,
+    ctx: AuthContext = Depends(auth_context),
+    db: PostgresRepository = Depends(get_repository),
+) -> JSONResponse:
+    require_client_header(request, ctx, payload.client_id)
+    idem = await require_idempotency(request, ctx, db)
+    if idem[2]:
+        return await idempotent_json_response(db, idem, None, status.HTTP_201_CREATED)
+    await require_group_member(db, group_id, ctx.user_id)
+    document = await get_document(db, payload.document_id, ctx.user_id)
+    now = utcnow()
+    message = GroupDocumentMessage(
+        id=new_id("gmsg"),
+        group_id=group_id,
+        sender_id=ctx.user_id,
+        sender_name=ctx.user.name,
+        document_id=document.id,
+        document_title=document.title,
+        document_revision=document.revision,
+        sent_at=now,
+    )
+    await db.save_group_document_message(GroupDocumentMessageRecord(message=message, document_snapshot=document.model_copy(deep=True)))
+    return await idempotent_json_response(db, idem, message, status.HTTP_201_CREATED)
+
+
+@router.get("/groups/{group_id}/documents/{message_id}/download")
+async def download_group_document(
+    group_id: str,
+    message_id: str,
+    export_format: Annotated[Literal["pdf", "docx"], Query(alias="format")] = "docx",
+    ctx: AuthContext = Depends(auth_context),
+    db: PostgresRepository = Depends(get_repository),
+) -> Response:
+    await require_group_member(db, group_id, ctx.user_id)
+    record = await db.get_group_document_message_record(group_id, message_id)
+    if not record:
+        raise APIError(status.HTTP_404_NOT_FOUND, "not_found", "Group document message not found.")
+    content = render_export_content(record.document_snapshot, export_format)
+    filename = f"{record.message.document_title}.{export_format}"
+    content_type = "application/pdf" if export_format == "pdf" else "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    return Response(
+        content=content,
+        media_type=content_type,
+        headers={
+            "Content-Length": str(len(content)),
+            "Content-Disposition": attachment_disposition_filename(filename),
+        },
+    )
 
 
 @router.post("/tasks/convert-manuscript", response_model=Task, status_code=status.HTTP_202_ACCEPTED, dependencies=IDEMPOTENT_WRITE_DEPENDENCIES)
