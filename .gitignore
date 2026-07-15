@@ -144,3 +144,11 @@ vite.config.ts.timestamp-*
 
 # MeetingMate local desktop data
 PC/data/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+backend/.venv/
