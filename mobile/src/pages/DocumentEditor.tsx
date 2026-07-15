@@ -115,7 +115,7 @@ export function DocumentEditor({ id, onBack }: DocumentEditorProps) {
       const exists = current.some((item) => item.id === block.id);
       return exists ? replaceBlock(current, block) : insertAfter(current, block, afterBlockId);
     });
-    queueOperation(upsertOperation(block, afterBlockId));
+    queueOperation(upsertOperation(block, userId, afterBlockId));
   }
 
   function insertBlock(kind: "paragraph" | "heading" | "list" | "quote") {

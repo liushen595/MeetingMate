@@ -3,6 +3,7 @@ import { Haptics, ImpactStyle } from "@capacitor/haptics";
 import { api } from "../lib/api";
 import {
   createAudioBlock,
+  deleteOperation,
   createHandwritingBlock,
   createImageBlock,
   createTextBlock,
@@ -12,7 +13,8 @@ import {
   touchBlock,
   upsertOperation,
 } from "../lib/blocks";
-import { captureImageFromCamera, formatDuration, readImageFile } from "../lib/media";
+import { captureImageFromCamera, formatDuration, normalizeRecordedAudio, readImageFile } from "../lib/media";
+import { readAsrSse } from "../lib/sse";
 import type { ConvertMode, Manuscript, ManuscriptBlock, ManuscriptHandwritingBlock, Stroke, StrokeTool, SyncOperation, Task } from "../types/api";
 import { AssetImage } from "../components/AssetImage";
 import { AudioAsset } from "../components/AudioAsset";
@@ -49,6 +51,7 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
   const [syncState, setSyncState] = useState("未同步");
   const [recording, setRecording] = useState<{ recorder: MediaRecorder; startedAt: number; afterBlockId: string | null } | null>(null);
   const [pendingAudios, setPendingAudios] = useState<PendingAudio[]>([]);
+  const [localAudioUrls, setLocalAudioUrls] = useState<Record<string, string>>({});
   const [task, setTask] = useState<Task | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [blockHeights, setBlockHeights] = useState<Record<string, number>>({});
@@ -62,24 +65,22 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
   const visibleBlocks = useMemo(() => blocks.filter((block) => !block.deleted), [blocks]);
 
   useEffect(() => {
-    let active = true;
     setError(null);
-    api
-      .getManuscript(id)
-      .then((data) => {
-        if (!active) return;
-        setManuscript(data);
-        setRevision(data.revision);
-        setBlocks(data.blocks.filter((block) => !block.deleted));
-      })
+    reloadManuscript()
+      .then(() => undefined)
       .catch((err) => setError(err instanceof Error ? err.message : "手稿加载失败"));
-    return () => {
-      active = false;
-    };
   }, [id]);
+
+  async function reloadManuscript() {
+    const data = await api.getManuscript(id);
+    setManuscript(data);
+    setRevision(data.revision);
+    setBlocks(data.blocks.filter((block) => !block.deleted));
+  }
 
   useEffect(() => {
     if (!task || task.status === "succeeded" || task.status === "failed" || task.status === "cancelled") return;
+    if (task.type === "asr_audio") return;
     const timer = window.setInterval(async () => {
       const next = await api.getTask(task.id);
       setTask(next);
@@ -142,11 +143,65 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
   }
 
   function applyBlock(block: ManuscriptBlock, afterBlockId: string | null = null) {
+    const exists = blocks.some((item) => item.id === block.id);
+    const position = exists ? blockPosition(block.id) : { afterBlockId, beforeBlockId: null };
     setBlocks((current) => {
-      const exists = current.some((item) => item.id === block.id);
       return exists ? replaceBlock(current, block) : insertAfter(current, block, afterBlockId);
     });
-    queueOperation(upsertOperation(block, afterBlockId));
+    queueOperation(upsertOperation(block, userId, position.afterBlockId, position.beforeBlockId));
+  }
+
+  function blockPosition(blockId: string) {
+    const index = blocks.findIndex((block) => block.id === blockId);
+    return {
+      afterBlockId: index > 0 ? blocks[index - 1]?.id ?? null : null,
+      beforeBlockId: index === 0 ? blocks[index + 1]?.id ?? null : null,
+    };
+  }
+
+  function queueDeleteBlock(blockId: string) {
+    queueOperation(deleteOperation<ManuscriptBlock>(blockId));
+  }
+
+  function deleteManuscriptBlock(blockId: string) {
+    if (!userId) return;
+    const index = visibleBlocks.findIndex((block) => block.id === blockId);
+    if (index === -1) return;
+    const previous = visibleBlocks[index - 1];
+    const next = visibleBlocks[index + 1];
+
+    if (previous?.type === "handwriting" && next?.type === "handwriting") {
+      const previousHeight = blockHeights[previous.id] ?? estimateStrokeHeight(previous.props.strokes);
+      const nextHeight = blockHeights[next.id] ?? estimateStrokeHeight(next.props.strokes);
+      const mergedStrokes = appendStrokesAtOffset(previous.props.strokes, next.props.strokes, previousHeight);
+      const mergedBlock = touchBlock({ ...previous, props: { ...previous.props, strokes: mergedStrokes } });
+      const position = blockPosition(previous.id);
+      const mergedHeight = Math.max(previousHeight + nextHeight, estimateStrokeHeight(mergedStrokes));
+
+      setBlocks((current) => current.filter((block) => block.id !== blockId && block.id !== next.id).map((block) => (block.id === previous.id ? mergedBlock : block)));
+      setBlockHeights((current) => {
+        const heights = { ...current, [previous.id]: mergedHeight };
+        delete heights[blockId];
+        delete heights[next.id];
+        return heights;
+      });
+      queueOperation(upsertOperation(mergedBlock, userId, position.afterBlockId, position.beforeBlockId));
+      queueDeleteBlock(blockId);
+      queueDeleteBlock(next.id);
+      setActiveBlockId(previous.id);
+    } else {
+      setBlocks((current) => current.filter((block) => block.id !== blockId));
+      setBlockHeights((current) => {
+        const heights = { ...current };
+        delete heights[blockId];
+        return heights;
+      });
+      queueDeleteBlock(blockId);
+      if (activeBlockId === blockId) setActiveBlockId(null);
+    }
+
+    if (selected?.blockId === blockId || selected?.blockId === next?.id) setSelected(null);
+    setMenu(null);
   }
 
   function insertBlockRespectingSelection(block: ManuscriptBlock, afterBlockId: string | null) {
@@ -156,11 +211,12 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
       return;
     }
 
+    const sourcePosition = blockPosition(split.updatedSource.id);
     setBlockHeights((current) => ({ ...current, [split.continuation.id]: Math.max(120, estimateStrokeHeight(split.continuation.props.strokes)) }));
     setBlocks((current) => insertAfter(insertAfter(replaceBlock(current, split.updatedSource), block, split.source.id), split.continuation, block.id));
-    queueOperation(upsertOperation(split.updatedSource));
-    queueOperation(upsertOperation(block, split.source.id));
-    queueOperation(upsertOperation(split.continuation, block.id));
+    queueOperation(upsertOperation(split.updatedSource, userId, sourcePosition.afterBlockId, sourcePosition.beforeBlockId));
+    queueOperation(upsertOperation(block, userId, split.source.id));
+    queueOperation(upsertOperation(split.continuation, userId, block.id));
     setSelected(null);
   }
 
@@ -213,25 +269,67 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
   async function finishAudio(blob: Blob, durationMs: number, afterBlockId: string | null) {
     if (!userId) return;
     const pendingId = crypto.randomUUID?.() ?? `pending-${Date.now()}`;
-    const objectUrl = URL.createObjectURL(blob);
-    setPendingAudios((current) => [...current, { id: pendingId, afterBlockId, durationMs, objectUrl, status: "uploading" }]);
+    const normalized = await normalizeRecordedAudio(blob, durationMs);
+    const objectUrl = URL.createObjectURL(normalized.blob);
+    setPendingAudios((current) => [...current, { id: pendingId, afterBlockId, durationMs: normalized.durationMs, objectUrl, status: "uploading" }]);
     setSyncState("上传录音");
     try {
-      const asset = await api.uploadAsset(blob, { kind: "audio", filename: `recording-${Date.now()}.webm`, contentType: blob.type || "audio/webm", durationMs });
-      const block = createAudioBlock(userId, asset.id, durationMs);
+      const asset = await api.uploadAsset(normalized.blob, { kind: "audio", filename: `recording-${Date.now()}.${normalized.extension}`, contentType: normalized.contentType, durationMs: normalized.durationMs });
+      const block = createAudioBlock(userId, asset.id, normalized.durationMs);
       setPendingAudios((current) => {
-        const target = current.find((item) => item.id === pendingId);
-        if (target) URL.revokeObjectURL(target.objectUrl);
         return current.filter((item) => item.id !== pendingId);
       });
+      setLocalAudioUrls((current) => ({ ...current, [asset.id]: objectUrl }));
       insertBlockRespectingSelection(block, afterBlockId);
-      const asrTask = await api.asrAudio(asset.id);
-      setTask(asrTask);
+      await flushOps();
+      await startAsrStream(asset.id);
     } catch (err) {
       const message = err instanceof Error ? err.message : "录音上传失败";
       setPendingAudios((current) => current.map((item) => (item.id === pendingId ? { ...item, status: "failed", error: message } : item)));
       setError(message);
     }
+  }
+
+  async function startAsrStream(assetId: string) {
+    setSyncState("ASR 转写中");
+    const response = await api.streamAsrAudio(assetId);
+    await readAsrSse(response, {
+      onTask: (nextTask) => setTask(nextTask),
+      onDelta: (payload) => {
+        setBlocks((current) =>
+          current.map((item) =>
+            item.type === "audio" && item.props.asset_id === assetId
+              ? { ...item, props: { ...item.props, transcript: payload.transcript } }
+              : item,
+          ),
+        );
+      },
+      onDone: async (nextTask) => {
+        setTask(nextTask);
+        setSyncState("ASR 已完成，正在同步手稿");
+        await reloadManuscript();
+        const result = nextTask.result;
+        if (result?.asset_id === assetId && typeof result.transcript === "string") {
+          setBlocks((current) =>
+            current.map((item) =>
+              item.type === "audio" && item.props.asset_id === assetId
+                ? {
+                    ...item,
+                    props: {
+                      ...item.props,
+                      transcript: result.transcript ?? "",
+                      speaker_segments: result.speaker_segments ?? [],
+                      asr_task_id: nextTask.id,
+                      asr_generated_at: nextTask.updated_at,
+                    },
+                  }
+                : item,
+            ),
+          );
+        }
+        setSyncState("已保存");
+      },
+    });
   }
 
   async function chooseImage(afterBlockId: string | null = null) {
@@ -265,6 +363,17 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
 
   function commitBlankHandwriting(strokes: Stroke[], height: number) {
     if (!userId) return;
+    const lastBlock = visibleBlocks.at(-1);
+    if (lastBlock?.type === "handwriting") {
+      const currentHeight = blockHeights[lastBlock.id] ?? estimateStrokeHeight(lastBlock.props.strokes);
+      const nextStrokes = appendStrokesAtOffset(lastBlock.props.strokes, strokes, currentHeight);
+      const block = touchBlock({ ...lastBlock, props: { ...lastBlock.props, strokes: nextStrokes } });
+      setBlockHeights((current) => ({ ...current, [block.id]: Math.max(currentHeight + height, estimateStrokeHeight(nextStrokes)) }));
+      applyBlock(block);
+      setActiveBlockId(block.id);
+      return;
+    }
+
     const block = createHandwritingBlock(userId, strokes);
     setBlockHeights((current) => ({ ...current, [block.id]: height }));
     applyBlock(block, visibleBlocks.at(-1)?.id ?? null);
@@ -280,6 +389,11 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
   }
 
   function handleTextInput(block: Extract<ManuscriptBlock, { type: "text" }>, content: string) {
+    if (content.length === 0) {
+      deleteManuscriptBlock(block.id);
+      return;
+    }
+
     applyBlock(touchBlock({ ...block, props: { content } }));
   }
 
@@ -302,10 +416,11 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
   function splitSelectedAsNextLine() {
     const split = buildSelectedContinuation(selected?.blockId ?? null);
     if (!split) return;
+    const sourcePosition = blockPosition(split.updatedSource.id);
     setBlockHeights((current) => ({ ...current, [split.continuation.id]: Math.max(120, estimateStrokeHeight(split.continuation.props.strokes)) }));
     setBlocks((current) => insertAfter(replaceBlock(current, split.updatedSource), split.continuation, split.source.id));
-    queueOperation(upsertOperation(split.updatedSource));
-    queueOperation(upsertOperation(split.continuation, split.source.id));
+    queueOperation(upsertOperation(split.updatedSource, userId, sourcePosition.afterBlockId, sourcePosition.beforeBlockId));
+    queueOperation(upsertOperation(split.continuation, userId, split.source.id));
     setSelected(null);
     setMenu(null);
   }
@@ -335,19 +450,13 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
       {task && <TaskBanner task={task} />}
       {error && <button className="toast inline" onClick={() => setError(null)} type="button">{error}</button>}
 
-      <div className="paper-toolbar">
+      <div className="paper-toolbar manuscript-floating-toolbar">
         <button className={tool === "pen" ? "active" : ""} onClick={() => setTool("pen")} type="button">笔</button>
         <button className={tool === "highlighter" ? "active" : ""} onClick={() => setTool("highlighter")} type="button">荧光</button>
         <button className={tool === "eraser" ? "active" : ""} onClick={() => setTool("eraser")} type="button">橡皮</button>
         <button className={tool === "lasso" ? "active" : ""} onClick={() => setTool("lasso")} type="button">套索</button>
         <input aria-label="画笔颜色" onChange={(event) => setColor(event.target.value)} type="color" value={color} />
         <input aria-label="画笔粗细" max="9" min="1" onChange={(event) => setBrushWidth(Number(event.target.value))} type="range" value={brushWidth} />
-      </div>
-
-      <div className="capture-toolbar">
-        <button onClick={() => (recording ? stopRecording() : startRecording(null))} type="button">{recording ? "停止录音" : "录音追加"}</button>
-        <button onClick={() => chooseImage(null)} type="button">图片追加</button>
-        <button onClick={() => insertText(null)} type="button">文字追加</button>
       </div>
 
       <article className="waterfall-paper" onPointerCancel={cancelLongPress} onPointerLeave={cancelLongPress} onPointerUp={cancelLongPress}>
@@ -361,7 +470,7 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
               {block.type === "text" && <textarea onChange={(event) => handleTextInput(block, event.target.value)} placeholder="输入文字" value={block.props.content} />}
               {block.type === "audio" && (
                 <div className="audio-block">
-                  <AudioAsset assetId={block.props.asset_id} />
+                  <AudioAsset assetId={block.props.asset_id} fallbackSrc={localAudioUrls[block.props.asset_id]} />
                   <div>
                     <span>{formatDuration(block.props.duration_ms)}</span>
                     <p>{block.props.transcript || "录音已保存，ASR 完成后会写回转写文本。"}</p>
@@ -399,12 +508,19 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
         </div>
       </article>
 
+      <div className="capture-toolbar manuscript-insert-toolbar">
+        <button onClick={() => (recording ? stopRecording() : startRecording(null))} type="button">{recording ? "停止录音" : "录音追加"}</button>
+        <button onClick={() => chooseImage(null)} type="button">图片追加</button>
+        <button onClick={() => insertText(null)} type="button">文字追加</button>
+      </div>
+
       {menu && (
         <div className="context-menu" style={{ left: menu.x, top: menu.y }}>
           <button onClick={() => startRecording(menu.blockId)} type="button">开始录制</button>
           <button onClick={() => chooseImage(menu.blockId)} type="button">插入图片</button>
           <button onClick={() => insertText(menu.blockId)} type="button">插入文字</button>
           {menu.selectedStrokeIds.length > 0 && <button onClick={splitSelectedAsNextLine} type="button">选区作为下一行</button>}
+          {menu.blockId && <button className="danger-menu-button" onClick={() => menu.blockId && deleteManuscriptBlock(menu.blockId)} type="button">删除该块</button>}
           <button onClick={() => setMenu(null)} type="button">关闭</button>
         </div>
       )}
@@ -459,4 +575,8 @@ function estimateStrokeHeight(strokes: Stroke[]) {
 function normalizeStrokesToTop(strokes: Stroke[]) {
   const minY = Math.min(...strokes.flatMap((stroke) => stroke.points.map((point) => point.y)));
   return strokes.map((stroke) => ({ ...stroke, points: stroke.points.map((point) => ({ ...point, y: Math.max(0, point.y - minY + 14) })) }));
+}
+
+function appendStrokesAtOffset(existing: Stroke[], incoming: Stroke[], offsetY: number) {
+  return [...existing, ...incoming.map((stroke) => ({ ...stroke, points: stroke.points.map((point) => ({ ...point, y: point.y + offsetY })) }))];
 }
