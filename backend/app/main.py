@@ -52,6 +52,19 @@ MAX_CLIENT_TIME_SKEW_SECONDS = 24 * 60 * 60
 GROUP_INVITE_CODE_SECONDS = 24 * 60 * 60
 MAX_INVITE_CODE_ATTEMPTS = 10
 DEFAULT_CORS_ORIGIN_REGEX = r"^https?://(localhost|127\.0\.0\.1|10\.(?:\d{1,3}\.){2}\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3})(?::\d+)?$"
+HANDWRITING_BITMAP_CONTENT_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/bmp"}
+HANDWRITING_RENDER_SCALE = 2
+HANDWRITING_RECOGNITION_PROMPT = """
+请识别这张手写手稿图片。
+只输出 JSON，不要输出 Markdown，不要输出解释。
+recognized_text 是图中可读手写正文，尽量按原始换行返回。
+has_keepable_drawing 表示图片中是否有值得在正式文档中保留的手绘图、示意图、流程图、结构图或草图。
+如果只有手写文字，没有图示，has_keepable_drawing 必须为 false。
+drawing_caption 是可保留手绘图的一句话说明；没有可保留绘图时返回空字符串。
+confidence 是 0 到 1 的识别置信度。
+不要编造看不见的信息。
+返回格式：{"recognized_text":"","has_keepable_drawing":false,"drawing_caption":"","confidence":0}
+""".strip()
 
 
 Platform = Literal["ios", "android", "mac", "windows", "web"]
@@ -2360,36 +2373,54 @@ def stroke_bounds(strokes: list[Stroke]) -> tuple[int, int]:
     return width, height
 
 
-def safe_svg_color(value: str) -> str:
+def safe_hex_color(value: str) -> str:
     return value if re.fullmatch(r"#[0-9A-Fa-f]{3}(?:[0-9A-Fa-f]{3})?", value) else "#111111"
 
 
-def render_handwriting_svg(strokes: list[Stroke]) -> tuple[bytes, int, int]:
+def is_supported_handwriting_bitmap(content_type: str) -> bool:
+    return content_type.split(";", 1)[0].strip().lower() in HANDWRITING_BITMAP_CONTENT_TYPES
+
+
+def render_handwriting_png(strokes: list[Stroke]) -> tuple[bytes, int, int]:
+    try:
+        from PIL import Image, ImageDraw
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("Pillow is required to render handwriting strokes.") from exc
+
     width, height = stroke_bounds(strokes)
-    lines = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
-        '<rect width="100%" height="100%" fill="#ffffff"/>',
-    ]
+    scale = HANDWRITING_RENDER_SCALE
+    image = Image.new("RGB", (width * scale, height * scale), "#ffffff")
+    draw = ImageDraw.Draw(image)
     for stroke in strokes:
         if not stroke.points:
             continue
-        color = safe_svg_color(stroke.color)
-        stroke_width = max(1, stroke.width)
-        points = " ".join(f"{point.x:.2f},{point.y:.2f}" for point in stroke.points)
-        lines.append(f'<polyline points="{points}" fill="none" stroke="{color}" stroke-width="{stroke_width:.2f}" stroke-linecap="round" stroke-linejoin="round"/>')
-    lines.append("</svg>")
-    return "\n".join(lines).encode("utf-8"), width, height
+        color = "#ffffff" if stroke.tool == "eraser" else safe_hex_color(stroke.color)
+        stroke_width = max(1, round(stroke.width * scale))
+        points = [(point.x * scale, point.y * scale) for point in stroke.points]
+        if len(points) == 1:
+            x, y = points[0]
+            radius = stroke_width / 2
+            draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=color)
+        else:
+            draw.line(points, fill=color, width=stroke_width, joint="curve")
+
+    resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+    if scale != 1:
+        image = image.resize((width, height), resampling)
+    output = io.BytesIO()
+    image.save(output, format="PNG")
+    return output.getvalue(), width, height
 
 
 async def save_handwriting_render_asset(db: PostgresRepository, owner_id: str, block_id: str, strokes: list[Stroke]) -> AssetRecord:
-    content, width, height = render_handwriting_svg(strokes)
+    content, width, height = render_handwriting_png(strokes)
     now = utcnow()
     checksum = hashlib.sha256(content).hexdigest()
     asset = Asset(
         id=new_id("asset"),
         kind="image",
-        filename=f"{block_id}.svg",
-        content_type="image/svg+xml",
+        filename=f"{block_id}.png",
+        content_type="image/png",
         size_bytes=len(content),
         checksum_sha256=checksum,
         duration_ms=None,
@@ -2408,27 +2439,65 @@ async def save_handwriting_render_asset(db: PostgresRepository, owner_id: str, b
 async def handwriting_image_record(db: PostgresRepository, owner_id: str, block: ManuscriptHandwritingBlock) -> AssetRecord | None:
     if block.props.image_asset_id:
         record = await get_asset_record(db, block.props.image_asset_id, owner_id)
-        if record.asset.kind == "image" and record.asset.status == "ready":
+        if record.asset.kind == "image" and record.asset.status == "ready" and is_supported_handwriting_bitmap(record.asset.content_type):
             return record
+        if not block.props.strokes:
+            raise validation_error("Handwriting recognition requires a ready bitmap image asset or strokes that can be rendered.")
     if not block.props.strokes:
         return None
     return await save_handwriting_render_asset(db, owner_id, block.id, block.props.strokes)
 
 
+def strip_json_fence(text: str) -> str:
+    stripped = text.strip()
+    if not stripped.startswith("```"):
+        return stripped
+    lines = stripped.splitlines()
+    if len(lines) >= 2 and lines[0].startswith("```") and lines[-1].strip() == "```":
+        return "\n".join(lines[1:-1]).strip()
+    return stripped
+
+
+def extract_json_object(text: str) -> str | None:
+    stripped = strip_json_fence(text)
+    if stripped.startswith("{") and stripped.endswith("}"):
+        return stripped
+    start = stripped.find("{")
+    end = stripped.rfind("}")
+    if start != -1 and end > start:
+        return stripped[start : end + 1]
+    return None
+
+
+def parse_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes", "y"}
+    return bool(value)
+
+
 def parse_handwriting_result(text: str) -> dict[str, Any]:
     raw = text.strip()
     if not raw:
-        return {"recognized_text": "", "has_keepable_drawing": False, "drawing_caption": ""}
+        return {"recognized_text": "", "has_keepable_drawing": False, "drawing_caption": "", "confidence": None}
+    json_object = extract_json_object(raw)
+    if json_object is None:
+        return {"recognized_text": raw, "has_keepable_drawing": False, "drawing_caption": "", "confidence": None}
     try:
-        payload = json.loads(raw)
+        payload = json.loads(json_object)
     except json.JSONDecodeError:
-        return {"recognized_text": raw, "has_keepable_drawing": False, "drawing_caption": ""}
+        return {"recognized_text": raw, "has_keepable_drawing": False, "drawing_caption": "", "confidence": None}
     if not isinstance(payload, dict):
-        return {"recognized_text": raw, "has_keepable_drawing": False, "drawing_caption": ""}
+        return {"recognized_text": raw, "has_keepable_drawing": False, "drawing_caption": "", "confidence": None}
+    confidence = payload.get("confidence")
+    if not isinstance(confidence, (int, float)):
+        confidence = None
     return {
         "recognized_text": str(payload.get("recognized_text") or "").strip(),
-        "has_keepable_drawing": bool(payload.get("has_keepable_drawing")),
+        "has_keepable_drawing": parse_bool(payload.get("has_keepable_drawing")),
         "drawing_caption": str(payload.get("drawing_caption") or "").strip(),
+        "confidence": confidence,
     }
 
 
@@ -2545,6 +2614,7 @@ async def build_document_blocks_from_manuscript(
                             width=image_record.asset.width,
                             height=image_record.asset.height,
                             language="zh-CN",
+                            prompt=HANDWRITING_RECOGNITION_PROMPT,
                         )
                         parsed = parse_handwriting_result(result.text)
                         content = str(parsed.get("recognized_text") or content).strip()

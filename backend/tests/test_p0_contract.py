@@ -51,6 +51,12 @@ class TestAsrProvider(AsrProvider):
 
 
 class TestVisionProvider(VisionProvider):
+    calls: list[dict[str, object]] = []
+
+    @classmethod
+    def reset_calls(cls) -> None:
+        cls.calls = []
+
     async def recognize(
         self,
         *,
@@ -60,21 +66,28 @@ class TestVisionProvider(VisionProvider):
         width: int | None,
         height: int | None,
         language: str,
+        prompt: str | None = None,
     ) -> VisionResult:
         assert filename
         assert content_type.startswith("image/")
         assert content
-        if content_type == "image/svg+xml":
+        self.calls.append({"filename": filename, "content_type": content_type, "content": content, "prompt": prompt})
+        if prompt and "手写手稿" in prompt:
+            assert content_type == "image/png"
+            assert content.startswith(b"\x89PNG\r\n\x1a\n")
             return VisionResult(
                 caption="手写流程图",
-                text=json.dumps(
+                text="```json\n"
+                + json.dumps(
                     {
                         "recognized_text": "移动端优先推进",
                         "has_keepable_drawing": True,
                         "drawing_caption": "手写流程图",
+                        "confidence": 0.86,
                     },
                     ensure_ascii=False,
-                ),
+                )
+                + "\n```",
             )
         return VisionResult(caption="白板架构图", text="白板架构图\n移动端、PC 端和后端 API 协作。")
 
@@ -87,6 +100,7 @@ class TestVisionProvider(VisionProvider):
         width: int | None,
         height: int | None,
         language: str,
+        prompt: str | None = None,
     ):
         assert content
         yield "白板架构图\n"
@@ -1036,6 +1050,7 @@ def test_image_recognition_does_not_overwrite_existing_caption() -> None:
 
 def test_convert_manuscript_async_builds_mixed_blocks_and_warnings() -> None:
     repo.reset()
+    TestVisionProvider.reset_calls()
     auth = register_user("convert-mixed@example.com", "device_convert")
     asset_id = upload_ready_image(auth, "device_convert", "idem_convert_image")
     now = backend.utcnow()
@@ -1178,6 +1193,82 @@ def test_convert_manuscript_async_builds_mixed_blocks_and_warnings() -> None:
     assert blocks[4]["type"] == "heading"
     assert blocks[4]["props"]["content"] == "移动端优先推进"
     assert {block["source_refs"][0]["block_id"] for block in blocks if block["source_refs"]} >= {"block_text_convert", "block_audio_convert", "block_image_convert", "block_hw_convert"}
+    rendered = next(record for record in repo.assets.values() if record.asset.filename == "block_hw_convert.png")
+    assert rendered.asset.content_type == "image/png"
+    assert rendered.asset.width >= 320
+    assert rendered.asset.height >= 120
+    assert rendered.content and rendered.content.startswith(b"\x89PNG\r\n\x1a\n")
+    handwriting_calls = [call for call in TestVisionProvider.calls if call.get("prompt")]
+    assert len(handwriting_calls) == 1
+    assert handwriting_calls[0]["content_type"] == "image/png"
+
+
+def test_handwriting_convert_does_not_send_svg_to_vision() -> None:
+    repo.reset()
+    TestVisionProvider.reset_calls()
+    auth = register_user("convert-svg@example.com", "device_convert_svg")
+    now = backend.utcnow()
+    svg_content = b'<svg xmlns="http://www.w3.org/2000/svg"><text>SVG</text></svg>'
+    svg_asset_id = "asset_hw_svg"
+    repo.assets[svg_asset_id] = backend.AssetRecord(
+        owner_id=auth["user"]["id"],
+        asset=backend.Asset(
+            id=svg_asset_id,
+            kind="image",
+            filename="handwriting.svg",
+            content_type="image/svg+xml",
+            size_bytes=len(svg_content),
+            checksum_sha256=hashlib.sha256(svg_content).hexdigest(),
+            duration_ms=None,
+            width=320,
+            height=120,
+            status="ready",
+            url=None,
+            created_at=now,
+            updated_at=now,
+        ),
+        upload_id="upload_hw_svg",
+        part_size_bytes=len(svg_content),
+        uploaded_parts=[],
+        content=svg_content,
+    )
+    created_at = iso_now()
+    manuscript = client.post(
+        "/api/v1/manuscripts",
+        json={
+            "title": "SVG Handwriting",
+            "client_id": "device_convert_svg",
+            "initial_blocks": [
+                {
+                    "id": "block_hw_svg",
+                    "type": "handwriting",
+                    "revision": 1,
+                    "created_at": created_at,
+                    "updated_at": created_at,
+                    "author_id": auth["user"]["id"],
+                    "client_id": "device_convert_svg",
+                    "platform": "web",
+                    "deleted": False,
+                    "props": {"strokes": [], "image_asset_id": svg_asset_id, "ai_text": ""},
+                }
+            ],
+        },
+        headers=auth_headers(auth, "device_convert_svg", "idem_svg_manuscript"),
+    )
+    assert manuscript.status_code == 201, manuscript.text
+
+    convert = client.post(
+        "/api/v1/tasks/convert-manuscript",
+        json={"manuscript_id": manuscript.json()["id"], "mode": "meeting_minutes", "title": "SVG Doc", "client_id": "device_convert_svg", "optimize_audio": False},
+        headers=auth_headers(auth, "device_convert_svg", "idem_svg_convert"),
+    )
+    assert convert.status_code == 202, convert.text
+    task = client.get(f"/api/v1/tasks/{convert.json()['id']}", headers=auth_headers(auth, "device_convert_svg"))
+    assert task.status_code == 200, task.text
+    assert task.json()["status"] == "succeeded"
+    warning_codes = {warning["code"] for warning in task.json()["result"].get("warnings", [])}
+    assert "handwriting_render_failed" in warning_codes
+    assert TestVisionProvider.calls == []
 
 
 def test_idempotency_conflict_and_revision_conflict() -> None:
