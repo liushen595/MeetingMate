@@ -155,14 +155,14 @@ function Element({ attributes, children, element }: RenderElementProps): React.J
   }
 
   if (element.type === "image") {
-    const caption = element.children.map((child) => child.text).join("");
+    const extractedText = element.children.map((child) => child.text).join("");
     const assetId = typeof element.props?.asset_id === "string" ? element.props.asset_id : "";
     return (
       <figure className="my-5 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm" {...attributes}>
-        <div contentEditable={false} className="rounded-xl border border-dashed border-slate-200 bg-slate-50 px-4 py-8 text-center text-sm text-slate-500">
-          图片{assetId ? `：${assetId}` : ""}
+        <div contentEditable={false}>
+          <DocumentAssetImage assetId={assetId} />
         </div>
-        <figcaption className="mt-3 text-sm leading-7 text-slate-600">{children || caption}</figcaption>
+        <figcaption className="mt-3 whitespace-pre-wrap text-sm leading-7 text-slate-600">{children || extractedText}</figcaption>
       </figure>
     );
   }
@@ -172,6 +172,35 @@ function Element({ attributes, children, element }: RenderElementProps): React.J
       {children}
     </p>
   );
+}
+
+function DocumentAssetImage({ assetId }: { assetId: string }): React.JSX.Element {
+  const [src, setSrc] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!assetId) return;
+    let active = true;
+    let objectUrl: string | null = null;
+    setSrc(null);
+    setError(null);
+    pcApi
+      .getAssetObjectUrl(assetId)
+      .then((url) => {
+        objectUrl = url;
+        if (active) setSrc(url);
+      })
+      .catch((err) => {
+        if (active) setError(err instanceof Error ? err.message : "图片加载失败");
+      });
+    return () => {
+      active = false;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [assetId]);
+
+  if (src) return <img alt="文档图片原图" className="max-h-[460px] w-full rounded-xl object-contain" src={src} />;
+  return <div className="rounded-xl border border-dashed border-slate-200 bg-slate-50 px-4 py-8 text-center text-sm text-slate-500">{error ?? "图片加载中"}</div>;
 }
 
 function blocksToSlateValue(blocks: DocumentBlock[]): Descendant[] {

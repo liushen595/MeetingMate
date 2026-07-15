@@ -291,7 +291,7 @@ function DocumentBlockEditor({ block, selected, onSelect, onChange }: { block: D
       {block.type === "image" && (
         <figure className="image-block">
           <AssetImage alt={block.props.caption || "文档图片"} assetId={block.props.asset_id} />
-          <input onChange={(event) => onChange({ ...block, props: { ...block.props, caption: event.target.value } })} placeholder="图片说明" value={block.props.caption} />
+          <input onChange={(event) => onChange({ ...block, props: { ...block.props, caption: event.target.value } })} placeholder="图片提取文本" value={block.props.caption ?? ""} />
         </figure>
       )}
       {block.type === "table" && (

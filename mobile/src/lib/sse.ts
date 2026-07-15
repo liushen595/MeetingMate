@@ -56,6 +56,36 @@ export async function readAsrSse(
   });
 }
 
+export async function readImageRecognitionSse(
+  response: Response,
+  handlers: {
+    onTask?: (task: Task) => void;
+    onDelta?: (payload: { task_id: string; text?: string; caption?: string; recognized_text?: string }) => void;
+    onDone?: (task: Task) => void;
+  },
+) {
+  await readSse(response, (event, data) => {
+    if (event === "task") {
+      const parsed = JSON.parse(data) as { task: Task };
+      handlers.onTask?.(parsed.task);
+      return;
+    }
+    if (event === "delta") {
+      handlers.onDelta?.(JSON.parse(data) as { task_id: string; text?: string; caption?: string; recognized_text?: string });
+      return;
+    }
+    if (event === "done") {
+      const parsed = JSON.parse(data) as { task: Task };
+      handlers.onDone?.(parsed.task);
+      return;
+    }
+    if (event === "error") {
+      const parsed = JSON.parse(data) as { code: string; message: string };
+      throw new Error(parsed.message || parsed.code);
+    }
+  });
+}
+
 async function readSse(response: Response, onEvent: (event: string, data: string) => void) {
   if (!response.body) throw new Error("SSE 响应没有可读取的数据流");
   const reader = response.body.getReader();

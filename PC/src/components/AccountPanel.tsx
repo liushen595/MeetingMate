@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
 import { pcApi } from "../lib/api";
 import { useWorkspaceStore } from "../stores/workspaceStore";
 
@@ -12,6 +12,16 @@ const LAST_EMAIL_KEY = "meetingmate.auth.last_email";
 const REMEMBER_ACCOUNT_KEY = "meetingmate.auth.remember_account";
 const REMEMBER_PASSWORD_KEY = "meetingmate.auth.remember_password";
 const SAVED_PASSWORD_KEY = "meetingmate.auth.saved_password";
+
+type Profile = {
+  name: string;
+  company: string;
+  address: string;
+  department: string;
+  position: string;
+  phone: string;
+  avatarDataUrl: string;
+};
 
 export function AccountPanel({ authOnly = false, onAuthenticated, onLogout }: AccountPanelProps): React.JSX.Element {
   const hydrateWorkspace = useWorkspaceStore((state) => state.hydrateWorkspace);
@@ -28,6 +38,14 @@ export function AccountPanel({ authOnly = false, onAuthenticated, onLogout }: Ac
   const [status, setStatus] = useState("");
   const [isBusy, setIsBusy] = useState(false);
   const session = pcApi.currentSession;
+  const profileKey = useMemo(() => (session ? `meetingmate.profile.${session.user.id || session.user.email}` : ""), [session]);
+  const [profile, setProfile] = useState<Profile>(() => readProfile("", pcApi.currentSession?.user.name ?? ""));
+  const avatarInputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    if (!session) return;
+    setProfile(readProfile(profileKey, session.user.name || ""));
+  }, [profileKey, session]);
 
   useEffect(() => {
     if (mode !== "login") return;
@@ -93,6 +111,24 @@ export function AccountPanel({ authOnly = false, onAuthenticated, onLogout }: Ac
     onLogout?.();
   }
 
+  function updateProfile(next: Profile): void {
+    setProfile(next);
+    if (profileKey) localStorage.setItem(profileKey, JSON.stringify(next));
+  }
+
+  function updateProfileField(field: keyof Omit<Profile, "avatarDataUrl">, value: string): void {
+    updateProfile({ ...profile, [field]: value });
+  }
+
+  function uploadAvatar(event: ChangeEvent<HTMLInputElement>): void {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => updateProfile({ ...profile, avatarDataUrl: typeof reader.result === "string" ? reader.result : "" });
+    reader.readAsDataURL(file);
+  }
+
   if (!authOnly && session) {
     return (
       <section className="min-h-0 flex-1 overflow-auto bg-slate-50 p-8">
@@ -100,13 +136,15 @@ export function AccountPanel({ authOnly = false, onAuthenticated, onLogout }: Ac
           <div className="rounded-3xl border border-slate-200 bg-white p-8 shadow-sm">
             <div className="flex flex-col gap-6 sm:flex-row sm:items-center sm:justify-between">
               <div className="flex items-center gap-5">
-                <div className="flex h-20 w-20 items-center justify-center rounded-full bg-blue-600 text-3xl font-semibold text-white">
-                  {getInitial(session.user.name || session.user.email)}
-                </div>
+                <input accept="image/*" className="hidden" onChange={uploadAvatar} ref={avatarInputRef} type="file" />
+                <button className="flex h-20 w-20 overflow-hidden rounded-full bg-blue-600 text-3xl font-semibold text-white ring-4 ring-blue-50" onClick={() => avatarInputRef.current?.click()} title="点击上传头像" type="button">
+                  {profile.avatarDataUrl ? <img alt="头像" className="h-full w-full object-cover" src={profile.avatarDataUrl} /> : <span className="m-auto">{getInitial(profile.name || session.user.email)}</span>}
+                </button>
                 <div>
                   <div className="text-xs uppercase tracking-[0.2em] text-blue-500">Account</div>
-                  <h2 className="mt-2 text-2xl font-bold text-slate-950">{session.user.name || "未设置昵称"}</h2>
+                  <h2 className="mt-2 text-2xl font-bold text-slate-950">{profile.name || "未设置姓名"}</h2>
                   <p className="mt-1 text-sm text-slate-500">{session.user.email}</p>
+                  <p className="mt-1 text-xs text-slate-400">点击头像可上传新图片</p>
                 </div>
               </div>
               <div className="flex flex-wrap gap-2">
@@ -121,7 +159,12 @@ export function AccountPanel({ authOnly = false, onAuthenticated, onLogout }: Ac
           </div>
 
           <div className="grid gap-4 md:grid-cols-2">
-            <InfoCard label="账号昵称" value={session.user.name || "未设置"} />
+            <ProfileInput label="姓名" onChange={(value) => updateProfileField("name", value)} value={profile.name} />
+            <ProfileInput label="公司" onChange={(value) => updateProfileField("company", value)} value={profile.company} />
+            <ProfileInput label="地址" onChange={(value) => updateProfileField("address", value)} value={profile.address} />
+            <ProfileInput label="部门" onChange={(value) => updateProfileField("department", value)} value={profile.department} />
+            <ProfileInput label="职位" onChange={(value) => updateProfileField("position", value)} value={profile.position} />
+            <ProfileInput label="电话" onChange={(value) => updateProfileField("phone", value)} value={profile.phone} />
             <InfoCard label="邮箱" value={session.user.email} />
             <InfoCard label="服务器" value={pcApi.baseUrl} />
             <InfoCard label="客户端 ID" value={pcApi.clientId} />
@@ -190,6 +233,25 @@ function InfoCard({ label, value }: { label: string; value: string }): React.JSX
       <div className="mt-2 break-all text-sm font-medium text-slate-900">{value}</div>
     </div>
   );
+}
+
+function ProfileInput({ label, onChange, value }: { label: string; onChange: (value: string) => void; value: string }): React.JSX.Element {
+  return (
+    <label className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+      <div className="text-xs font-medium uppercase tracking-[0.16em] text-slate-400">{label}</div>
+      <input className="mt-2 w-full border-0 p-0 text-sm font-medium text-slate-900 outline-none placeholder:text-slate-300" onChange={(event) => onChange(event.target.value)} placeholder={`填写${label}`} value={value} />
+    </label>
+  );
+}
+
+function readProfile(key: string, fallbackName: string): Profile {
+  const fallback: Profile = { name: fallbackName, company: "", address: "", department: "", position: "", phone: "", avatarDataUrl: "" };
+  if (!key) return fallback;
+  try {
+    return { ...fallback, ...JSON.parse(localStorage.getItem(key) || "{}") };
+  } catch {
+    return fallback;
+  }
 }
 
 function getInitial(value: string): string {

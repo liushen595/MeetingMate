@@ -144,6 +144,22 @@ export class ApiClient {
     }, true);
   }
 
+  recognizeImage(assetId: string) {
+    return this.request<Task>("/tasks/recognize-image", {
+      method: "POST",
+      idempotent: true,
+      body: JSON.stringify({ asset_id: assetId, language: "zh-CN", client_id: this.clientId }),
+    });
+  }
+
+  streamRecognizeImage(assetId: string) {
+    return this.request<Response>("/tasks/recognize-image/stream", {
+      method: "POST",
+      idempotent: true,
+      body: JSON.stringify({ asset_id: assetId, language: "zh-CN", client_id: this.clientId }),
+    }, true);
+  }
+
   getTask(id: string) {
     return this.request<Task>(`/tasks/${id}`);
   }

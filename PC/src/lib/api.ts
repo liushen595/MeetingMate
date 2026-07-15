@@ -85,10 +85,11 @@ type Asset = {
 
 export type ImageRecognitionResult = {
   assetId: string;
+  caption: string;
   text: string;
   width: number | null;
   height: number | null;
-  taskId: string;
+  taskId: string | null;
   generatedAt: string | null;
 };
 
@@ -99,6 +100,9 @@ export type SelectedFile = {
   contentType: string;
   sizeBytes: number;
   checksumSha256: string;
+  dataUrl?: string | null;
+  width?: number | null;
+  height?: number | null;
 };
 
 export type AudioTranscription = {
@@ -282,13 +286,8 @@ class PcApiClient {
     await this.request<void>(`/manuscripts/${id}`, { method: "DELETE" });
   }
 
-  async convertManuscript(
-    id: string,
-    title: string,
-    optimizeAudio: boolean,
-    mode: ConvertMode = "meeting_minutes",
-  ): Promise<Task> {
-    return this.request<Task>("/tasks/convert-manuscript", {
+  async convertManuscript(id: string, title: string, optimizeAudio: boolean): Promise<Document> {
+    const task = await this.request<Task>("/tasks/convert-manuscript", {
       method: "POST",
       idempotent: true,
       body: JSON.stringify({
@@ -299,10 +298,11 @@ class PcApiClient {
         optimize_audio: optimizeAudio,
       }),
     });
-  }
-
-  async getTask(id: string): Promise<Task> {
-    return this.request<Task>(`/tasks/${id}`);
+    const completedTask = await this.waitForTask(task, "手稿转文档任务超时未返回结果");
+    const documentId = completedTask.result?.document_id;
+    if (typeof documentId !== "string")
+      throw new Error("转换任务未返回 document_id");
+    return this.getDocument(documentId);
   }
 
   async exportDocument(
@@ -368,26 +368,33 @@ class PcApiClient {
     return URL.createObjectURL(await response.blob());
   }
 
-  async recognizeImage(file: SelectedFile): Promise<ImageRecognitionResult> {
+  async uploadImageAsset(file: SelectedFile): Promise<{ assetId: string; width: number | null; height: number | null }> {
+    if (file.kind !== "image") throw new Error("请选择图片文件");
     const asset = await this.createReadyAsset(file);
+    return { assetId: asset.id, width: asset.width ?? file.width ?? null, height: asset.height ?? file.height ?? null };
+  }
+
+  async recognizeImageAsset(assetId: string): Promise<ImageRecognitionResult> {
     const task = await this.request<Task>("/tasks/recognize-image", {
       method: "POST",
       idempotent: true,
-      body: JSON.stringify({ asset_id: asset.id, client_id: this.clientId }),
+      body: JSON.stringify({ asset_id: assetId, language: "zh-CN", client_id: this.clientId }),
     });
     const completedTask = await this.waitForTask(
       task,
       "图片识别任务超时未返回文本",
     );
-    const text = extractImageText(completedTask.result);
-    if (text)
+    const caption = extractImageCaption(completedTask.result);
+    const text = extractImageText(completedTask.result) || caption;
+    if (caption || text)
       return {
-        assetId: asset.id,
+        assetId,
+        caption,
         text,
-        width: asset.width ?? null,
-        height: asset.height ?? null,
+        width: null,
+        height: null,
         taskId: completedTask.id,
-        generatedAt: completedTask.updated_at ?? null,
+        generatedAt: new Date().toISOString(),
       };
     throw new Error(
       `图片识别任务已完成，但服务器返回了空文本。（task: ${completedTask.id}, result: ${JSON.stringify(completedTask.result ?? {})}）`,
@@ -448,14 +455,6 @@ class PcApiClient {
       "PC API Smoke Document",
       false,
     );
-    const completedConvertTask = await this.waitForTask(
-      convertTask,
-      "手稿转文档任务超时未完成",
-    );
-    const documentId = completedConvertTask.result?.document_id;
-    if (typeof documentId !== "string")
-      throw new Error("转换任务未返回 document_id");
-    const document = await this.getDocument(documentId);
     lines.push(`手稿转文档：${document.id}`);
 
     const savedDocument = await this.saveDocument({
@@ -513,8 +512,8 @@ class PcApiClient {
         checksum_sha256: file.checksumSha256,
         parts: uploaded.parts,
         duration_ms: file.kind === "audio" ? 0 : null,
-        width: null,
-        height: null,
+        width: file.kind === "image" ? file.width ?? null : null,
+        height: file.kind === "image" ? file.height ?? null : null,
       }),
     });
   }
@@ -744,19 +743,11 @@ function toRemoteManuscriptBlock(
       type: "image",
       props: {
         asset_id: block.props.asset_id,
-        caption: String(
-          block.props.caption ?? block.props.ocrText ?? block.summary ?? "",
-        ),
+        caption: String(block.props.caption ?? block.summary ?? ""),
         width: nullableNumber(block.props.width),
         height: nullableNumber(block.props.height),
-        recognition_task_id:
-          typeof block.props.recognition_task_id === "string"
-            ? block.props.recognition_task_id
-            : null,
-        recognition_generated_at:
-          typeof block.props.recognition_generated_at === "string"
-            ? block.props.recognition_generated_at
-            : null,
+        recognition_task_id: typeof block.props.recognition_task_id === "string" ? block.props.recognition_task_id : null,
+        recognition_generated_at: typeof block.props.recognition_generated_at === "string" ? block.props.recognition_generated_at : null,
       },
     };
   return {
@@ -917,7 +908,6 @@ function extractTranscript(result: Record<string, unknown> | null): string {
 function extractImageText(result: Record<string, unknown> | null): string {
   if (!result) return "";
   const candidates = [
-    result.caption,
     result.text,
     result.content,
     result.ocr_text,
@@ -936,6 +926,18 @@ function extractImageText(result: Record<string, unknown> | null): string {
     (value): value is string =>
       typeof value === "string" && value.trim().length > 0,
   );
+  return direct ? direct.trim() : "";
+}
+
+function extractImageCaption(result: Record<string, unknown> | null): string {
+  if (!result) return "";
+  const candidates = [
+    result.caption,
+    isRecord(result.image) ? result.image.caption : undefined,
+    isRecord(result.data) ? result.data.caption : undefined,
+    isRecord(result.result) ? result.result.caption : undefined,
+  ];
+  const direct = candidates.find((value): value is string => typeof value === "string" && value.trim().length > 0);
   return direct ? direct.trim() : "";
 }
 

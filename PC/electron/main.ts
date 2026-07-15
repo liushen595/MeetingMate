@@ -1,4 +1,5 @@
 import { app, BrowserWindow, dialog, ipcMain, shell } from "electron";
+import { nativeImage } from "electron";
 import { readFileSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { basename, extname, join } from "node:path";
@@ -160,13 +161,17 @@ app.on("before-quit", () => {
 function getSelectedFile(filePath: string, kind: "audio" | "image") {
   const content = readFileSync(filePath);
   const extension = extname(filePath).toLowerCase();
+  const imageSize = kind === "image" ? nativeImage.createFromBuffer(content).getSize() : null;
   return {
     path: filePath,
     kind,
     filename: basename(filePath),
     contentType: getContentType(extension, kind),
     sizeBytes: statSync(filePath).size,
-    checksumSha256: createHash("sha256").update(content).digest("hex")
+    checksumSha256: createHash("sha256").update(content).digest("hex"),
+    dataUrl: kind === "image" ? `data:${getContentType(extension, kind)};base64,${content.toString("base64")}` : null,
+    width: imageSize?.width || null,
+    height: imageSize?.height || null
   };
 }
 

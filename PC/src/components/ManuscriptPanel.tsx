@@ -2,13 +2,13 @@ import {
   useEffect,
   useRef,
   useState,
-  type FormEvent,
+  type ChangeEvent,
   type MouseEvent,
   type PointerEvent as ReactPointerEvent,
 } from "react";
 import { Layer, Line, Rect, Stage } from "react-konva";
 import type { KonvaEventObject } from "konva/lib/Node";
-import { pcApi, type AudioTranscription, type ImageRecognitionResult, type Task } from "../lib/api";
+import { pcApi, type AudioTranscription, type ImageRecognitionResult } from "../lib/api";
 import { useWorkspaceStore } from "../stores/workspaceStore";
 import type { ManuscriptBlock } from "../types/block";
 import type { Manuscript } from "../types/manuscript";
@@ -120,6 +120,9 @@ export function ManuscriptPanel(): React.JSX.Element {
   const [menu, setMenu] = useState<MenuState>(null);
   const [blockHeights, setBlockHeights] = useState<Record<string, number>>({});
   const [saveStatus, setSaveStatus] = useState("未同步");
+  const [recognizingImageAssetIds, setRecognizingImageAssetIds] = useState<string[]>([]);
+  const [localImageUrls, setLocalImageUrls] = useState<Record<string, string>>({});
+  const [convertDialog, setConvertDialog] = useState<{ title: string; optimizeAudio: boolean } | null>(null);
   const [renameDialog, setRenameDialog] = useState<RenameDialogState | null>(
     null,
   );
@@ -261,49 +264,17 @@ export function ManuscriptPanel(): React.JSX.Element {
 
   const openConvertDialog = (): void => {
     if (!manuscript) return;
-    setConvertError(null);
-    setConvertDialog({
-      title: defaultDocumentTitle(manuscript.title),
-      optimizeAudio: false,
-      submitting: false,
-    });
-  };
-
-  const submitConvertDialog = async (event: FormEvent): Promise<void> => {
-    event.preventDefault();
-    if (!manuscript || !convertDialog) return;
-    const title = convertDialog.title.trim();
-    if (!title) {
-      setConvertError("文档标题不能为空");
-      return;
-    }
-    const hasAudioWithoutTranscript = blocks.some(
-      (block) =>
-        block.type === "audio" &&
-        !String(block.props.transcript ?? block.summary ?? "").trim(),
+    const title = convertDialog?.title.trim() || `${manuscript.title} 文档`;
+    if (!title) return;
+    const document = await pcApi.convertManuscript(
+      manuscript.id,
+      title,
+      convertDialog?.optimizeAudio ?? false,
     );
-    if (
-      hasAudioWithoutTranscript &&
-      !window.confirm(
-        "存在尚未完成 ASR 的录音。继续转换会跳过或降级这些录音，是否继续？",
-      )
-    )
-      return;
-    setConvertDialog({ ...convertDialog, submitting: true });
-    setConvertError(null);
-    try {
-      const savedManuscript = await persistBlocksNow();
-      const task = await pcApi.convertManuscript(
-        savedManuscript.id,
-        title,
-        convertDialog.optimizeAudio,
-      );
-      openedDocumentTaskRef.current = null;
-      setConvertTask(task);
+    if (document) {
+      addDocument(document);
+      openDocumentEditor(document.id);
       setConvertDialog(null);
-    } catch (error) {
-      setConvertError(error instanceof Error ? error.message : "转文档失败");
-      setConvertDialog({ ...convertDialog, submitting: false });
     }
   };
 
@@ -325,11 +296,11 @@ export function ManuscriptPanel(): React.JSX.Element {
   function insertBlockRespectingSelection(
     block: ManuscriptBlock,
     afterBlockId: string | null,
-  ) {
+  ): ManuscriptBlock[] {
     const split = buildSelectedContinuation(afterBlockId);
     if (!split) {
       applyBlock(block, afterBlockId);
-      return;
+      return insertAfter(blocks, block, afterBlockId);
     }
 
     setBlockHeights((current) => ({
@@ -339,19 +310,15 @@ export function ManuscriptPanel(): React.JSX.Element {
         estimateStrokeHeight(split.continuation.props.strokes ?? []),
       ),
     }));
-    setBlocks((current) =>
-      insertAfter(
-        insertAfter(
-          replaceBlock(current, split.updatedSource),
-          block,
-          split.source.id,
-        ),
-        split.continuation,
-        block.id,
-      ),
+    const nextBlocks = insertAfter(
+      insertAfter(replaceBlock(blocks, split.updatedSource), block, split.source.id),
+      split.continuation,
+      block.id,
     );
+    setBlocks(nextBlocks);
     setSelected(null);
     setSaveStatus("等待自动保存");
+    return nextBlocks;
   }
 
   function buildSelectedContinuation(afterBlockId: string | null) {
@@ -458,11 +425,36 @@ export function ManuscriptPanel(): React.JSX.Element {
 
   async function insertImage(afterBlockId: string | null = null) {
     try {
+      if (!manuscript) return;
       const file = await window.meetingMate?.selectImageFile();
       if (!file) return;
-      const result = await pcApi.recognizeImage(file);
-      insertBlockRespectingSelection(createImageBlock(result), afterBlockId);
+      const image = await pcApi.uploadImageAsset(file);
+      if (file.dataUrl) setLocalImageUrls((current) => ({ ...current, [image.assetId]: file.dataUrl ?? "" }));
+      const block = createImageBlock({ ...image, caption: "", text: "", taskId: null, generatedAt: null });
+      const nextBlocks = insertBlockRespectingSelection(block, afterBlockId);
       setMenu(null);
+      setSaveStatus("同步图片块");
+      const savedManuscript = await pcApi.saveManuscript({ ...manuscript, blocks: nextBlocks });
+      lastSavedBlocksRef.current = JSON.stringify(savedManuscript.blocks);
+      updateManuscript(savedManuscript);
+      setRecognizingImageAssetIds((current) => [...current, image.assetId]);
+      setSaveStatus("图片识别中");
+      try {
+        const result = await pcApi.recognizeImageAsset(image.assetId);
+        const refreshed = await pcApi.getManuscript(manuscript.id);
+        const imageBlock = refreshed.blocks.find((item) => item.type === "image" && item.props.asset_id === image.assetId);
+        const nextBlocks = result.text && imageBlock ? insertAfter(refreshed.blocks, createTextBlock(result.text), imageBlock.id) : refreshed.blocks;
+        const savedWithExtractedTextBlock = await pcApi.saveManuscript({ ...refreshed, blocks: nextBlocks });
+        lastSavedBlocksRef.current = JSON.stringify(savedWithExtractedTextBlock.blocks);
+        setBlocks(savedWithExtractedTextBlock.blocks);
+        updateManuscript(savedWithExtractedTextBlock);
+        setSaveStatus("已保存");
+      } catch (error) {
+        setSaveStatus("图片文字提取失败");
+        window.alert(error instanceof Error ? error.message : "图片文字提取失败，可稍后重试或手动编辑提取文本");
+      } finally {
+        setRecognizingImageAssetIds((current) => current.filter((assetId) => assetId !== image.assetId));
+      }
     } catch (error) {
       window.alert(error instanceof Error ? error.message : String(error));
     }
@@ -662,8 +654,8 @@ export function ManuscriptPanel(): React.JSX.Element {
           </div>
           <button
             className="rounded-xl bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50"
-            disabled={!manuscript || isConvertTaskRunning(convertTask)}
-            onClick={openConvertDialog}
+            disabled={!manuscript}
+            onClick={() => manuscript && setConvertDialog({ title: `${manuscript.title} 文档`, optimizeAudio: false })}
             type="button"
           >
             {isConvertTaskRunning(convertTask) ? "转换中" : "转文档"}
@@ -768,7 +760,7 @@ export function ManuscriptPanel(): React.JSX.Element {
                 onPointerMove={cancelLongPress}
               >
                 {block.type === "text" && (
-                  <textarea
+                  <AutoResizeTextarea
                     className="block min-h-24 w-full resize-none border-0 bg-transparent p-3 text-sm leading-7 text-[#2c2115] outline-none"
                     onChange={(event) =>
                       handleTextInput(block as TextBlock, event.target.value)
@@ -781,10 +773,7 @@ export function ManuscriptPanel(): React.JSX.Element {
                   <AudioCard block={block as AudioBlock} />
                 )}
                 {block.type === "image" && (
-                  <PaperCard
-                    label="Image"
-                    text={String(block.props.ocrText ?? block.summary)}
-                  />
+                  <ImageCard block={block} fallbackSrc={localImageUrls[String(block.props.asset_id)]} recognizing={recognizingImageAssetIds.includes(String(block.props.asset_id))} />
                 )}
                 {block.type === "handwriting" && (
                   <HandwritingCanvas
@@ -1002,112 +991,27 @@ export function ManuscriptPanel(): React.JSX.Element {
       )}
 
       {convertDialog && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/30 px-4"
-          onClick={() => !convertDialog.submitting && setConvertDialog(null)}
-        >
-          <form
-            className="w-full max-w-md rounded-3xl border border-slate-200 bg-white p-6 shadow-2xl"
-            onClick={(event) => event.stopPropagation()}
-            onSubmit={submitConvertDialog}
-          >
-            <div className="flex items-start justify-between gap-4">
-              <div>
-                <p className="text-xs font-semibold uppercase tracking-[0.18em] text-blue-600">
-                  Convert Manuscript
-                </p>
-                <h3 className="mt-1 text-lg font-semibold text-slate-950">
-                  转为文档
-                </h3>
-              </div>
-              <button
-                className="rounded-full bg-slate-100 px-3 py-1.5 text-sm text-slate-600 hover:bg-slate-200 disabled:opacity-50"
-                disabled={convertDialog.submitting}
-                onClick={() => setConvertDialog(null)}
-                type="button"
-              >
-                关闭
-              </button>
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/20" onClick={() => setConvertDialog(null)}>
+          <div className="w-80 rounded-2xl border border-slate-200 bg-white p-5 shadow-2xl" onClick={(event) => event.stopPropagation()}>
+            <h3 className="text-base font-semibold text-slate-950">转文档</h3>
+            <input
+              autoFocus
+              className="mt-4 w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-blue-300 focus:ring-4 focus:ring-blue-100"
+              onChange={(event) => setConvertDialog({ ...convertDialog, title: event.target.value })}
+              placeholder="文档标题"
+              value={convertDialog.title}
+            />
+            <label className="mt-4 flex items-center gap-2 text-sm text-slate-600">
+              <input checked={convertDialog.optimizeAudio} onChange={(event) => setConvertDialog({ ...convertDialog, optimizeAudio: event.target.checked })} type="checkbox" />
+              启用录音内容优化
+            </label>
+            <div className="mt-5 flex justify-end gap-2">
+              <button className="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 hover:bg-slate-50" onClick={() => setConvertDialog(null)} type="button">取消</button>
+              <button className="rounded-lg bg-blue-600 px-3 py-2 text-sm font-medium text-white hover:bg-blue-700" onClick={convertToDocument} type="button">开始转换</button>
             </div>
-            <label className="mt-5 block text-sm font-medium text-slate-700">
-              文档标题
-              <input
-                autoFocus
-                className="mt-2 w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-blue-300 focus:ring-4 focus:ring-blue-100"
-                onChange={(event) =>
-                  setConvertDialog({
-                    ...convertDialog,
-                    title: event.target.value,
-                  })
-                }
-                required
-                value={convertDialog.title}
-              />
-            </label>
-            <label className="mt-4 flex items-center justify-between gap-4 rounded-2xl bg-slate-50 p-4 text-sm text-slate-700">
-              <span>
-                <strong className="block text-slate-950">启用录音内容优化</strong>
-                <small className="mt-1 block leading-5 text-slate-500">
-                  由后端清理口水词和无意义重复，客户端只提交开关。
-                </small>
-              </span>
-              <input
-                checked={convertDialog.optimizeAudio}
-                className="h-5 w-5"
-                onChange={(event) =>
-                  setConvertDialog({
-                    ...convertDialog,
-                    optimizeAudio: event.target.checked,
-                  })
-                }
-                type="checkbox"
-              />
-            </label>
-            <button
-              className="mt-5 w-full rounded-xl bg-blue-600 px-4 py-3 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50"
-              disabled={convertDialog.submitting}
-              type="submit"
-            >
-              {convertDialog.submitting ? "正在提交" : "开始转换"}
-            </button>
-          </form>
+          </div>
         </div>
       )}
-    </div>
-  );
-}
-
-function ConvertTaskBanner({ task }: { task: Task }): React.JSX.Element {
-  const total = Math.max(1, task.progress?.total || 1);
-  const current = Math.max(0, Math.min(task.progress?.current || 0, total));
-  const percent = Math.round((current / total) * 100);
-  return (
-    <div className="mx-auto mb-4 max-w-4xl rounded-2xl bg-slate-950 px-4 py-3 text-sm text-white shadow-sm">
-      <div className="flex items-start justify-between gap-3">
-        <div>
-          <strong className="block">{task.progress?.message || "转换任务已创建"}</strong>
-          <span className="mt-1 block text-xs text-slate-300">
-            {task.status} · {task.progress?.stage || "queued"} · {current}/{total}
-          </span>
-        </div>
-        <span className="rounded-full bg-white/10 px-2 py-1 text-xs">
-          {percent}%
-        </span>
-      </div>
-      <div className="mt-3 h-2 overflow-hidden rounded-full bg-white/10">
-        <div
-          className="h-full rounded-full bg-blue-400 transition-[width]"
-          style={{ width: `${percent}%` }}
-        />
-      </div>
-      {task.result?.warnings?.length ? (
-        <p className="mt-2 text-xs text-amber-200">
-          部分内容已降级处理：{task.result.warnings.length} 项
-        </p>
-      ) : null}
-      {task.error?.message ? (
-        <p className="mt-2 text-xs text-red-200">{task.error.message}</p>
-      ) : null}
     </div>
   );
 }
@@ -1264,6 +1168,52 @@ function BlankHandwritingCanvas({
         </div>
       )}
     </div>
+  );
+}
+
+function AutoResizeTextarea({ className, onChange, placeholder, value }: { className: string; onChange: (event: ChangeEvent<HTMLTextAreaElement>) => void; placeholder: string; value: string }): React.JSX.Element {
+  const ref = useRef<HTMLTextAreaElement | null>(null);
+
+  useEffect(() => {
+    const node = ref.current;
+    if (!node) return;
+    node.style.height = "auto";
+    node.style.height = `${node.scrollHeight}px`;
+  }, [value]);
+
+  return <textarea className={className} onChange={onChange} placeholder={placeholder} ref={ref} rows={1} style={{ overflow: "hidden" }} value={value} />;
+}
+
+function ImageCard({ block, fallbackSrc, recognizing }: { block: ManuscriptBlock; fallbackSrc?: string; recognizing: boolean }): React.JSX.Element {
+  const assetId = typeof block.props.asset_id === "string" ? block.props.asset_id : "";
+  const [src, setSrc] = useState<string | null>(fallbackSrc ?? null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!assetId) return;
+    let active = true;
+    let objectUrl: string | null = null;
+    setSrc(fallbackSrc ?? null);
+    setError(null);
+    pcApi
+      .getAssetObjectUrl(assetId)
+      .then((url) => {
+        objectUrl = url;
+        if (active) setSrc(url);
+      })
+      .catch((err) => {
+        if (active && !fallbackSrc) setError(err instanceof Error ? err.message : "原图加载失败");
+      });
+    return () => {
+      active = false;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [assetId, fallbackSrc]);
+
+  return (
+    <figure className="my-2 rounded-2xl bg-white/80 p-3 shadow-sm">
+      {src ? <img alt="手稿图片原图" className="max-h-[420px] w-full rounded-xl object-contain" src={src} /> : <div className="rounded-xl border border-dashed border-[#e4d7c4] px-4 py-8 text-center text-sm text-[#7c6a55]">{error ? "原图加载失败" : recognizing ? "原图加载中，文字提取中..." : "原图加载中"}</div>}
+    </figure>
   );
 }
 
@@ -1557,10 +1507,10 @@ function createImageBlock(result: ImageRecognitionResult): ManuscriptBlock {
     type: "image",
     title: "图片",
     timestamp: "刚刚",
-    summary: result.text,
+    summary: result.caption || result.text,
     props: {
       asset_id: result.assetId,
-      caption: result.text,
+      caption: result.caption,
       width: result.width,
       height: result.height,
       recognition_task_id: result.taskId,
