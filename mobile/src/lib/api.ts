@@ -14,6 +14,7 @@ import type {
   SyncOperation,
   SyncResponse,
   Task,
+  UploadedPart,
 } from "../types/api";
 import { getClientId, getDevicePayload } from "./device";
 import { makeIdempotencyKey } from "./ids";
@@ -203,26 +204,17 @@ export class ApiClient {
     );
 
     const partSize = upload.part_size_bytes || DEFAULT_PART_SIZE;
-    const uploadedParts = [];
+    const uploadedParts: Array<Partial<UploadedPart> & { part_number: number }> = [];
+    const expectedPartSizes = new Map<number, number>();
     for (const part of upload.parts) {
       const start = (part.part_number - 1) * partSize;
       const end = Math.min(file.size, start + partSize);
-      const uploadUrl = this.resolveUploadUrl(part.upload_url);
-      let response: Response;
-      try {
-        response = await fetch(uploadUrl, {
-          method: "PUT",
-          headers: part.headers,
-          body: file.slice(start, end, params.contentType),
-        });
-      } catch (error) {
-        throw new Error(`无法直传到预签名地址：${uploadUrl}。请确认该 URL 在手机/浏览器可访问，并且对象存储允许 PUT/CORS。`);
-      }
-      if (!response.ok) throw new Error(`上传第 ${part.part_number} 片失败：${response.status} ${response.statusText}`);
-      const etag = response.headers.get("ETag")?.replaceAll('"', "") ?? response.headers.get("etag")?.replaceAll('"', "");
-      if (!etag) throw new Error("上传成功但无法读取 ETag。对象存储 CORS 需要 expose_headers 包含 ETag。");
-      uploadedParts.push({ part_number: part.part_number, etag: etag ?? "", size_bytes: end - start });
+      expectedPartSizes.set(part.part_number, end - start);
+      const proxyUpload = this.getProxyUploadParams(part.upload_url);
+      const response = await this.uploadPartViaBackend(upload.asset_id, part.part_number, upload.upload_id, proxyUpload, file.slice(start, end, params.contentType), part.headers);
+      uploadedParts.push(response);
     }
+    const completeParts = await this.resolveUploadedParts(upload.asset_id, uploadedParts, expectedPartSizes);
 
     return this.request<Asset>(`/assets/${upload.asset_id}/complete`, {
       method: "POST",
@@ -231,7 +223,7 @@ export class ApiClient {
         upload_id: upload.upload_id,
         size_bytes: file.size,
         checksum_sha256: checksum,
-        parts: uploadedParts,
+        parts: completeParts,
         duration_ms: params.durationMs ?? null,
         width: params.width ?? null,
         height: params.height ?? null,
@@ -300,9 +292,68 @@ export class ApiClient {
     return new ApiError(response.status, payload, response.statusText);
   }
 
-  private resolveUploadUrl(uploadUrl: string) {
-    return new URL(uploadUrl, `${this.baseUrl}/`).toString();
+  private getProxyUploadParams(uploadUrl: string) {
+    const url = new URL(uploadUrl, `${this.baseUrl}/`);
+    const expiresAt = url.searchParams.get("expires_at");
+    const signature = url.searchParams.get("signature");
+    if (!expiresAt || !signature) {
+      throw new Error("后端上传代理需要 upload_url 包含 expires_at 和 signature 查询参数。");
+    }
+    return { expiresAt, signature };
   }
+
+  private async uploadPartViaBackend(
+    assetId: string,
+    partNumber: number,
+    uploadId: string,
+    proxyUpload: { expiresAt: string; signature: string },
+    body: Blob,
+    sourceHeaders: Record<string, string>,
+  ) {
+    const path = `/assets/${assetId}/upload-parts/${partNumber}?upload_id=${encodeURIComponent(uploadId)}&expires_at=${encodeURIComponent(proxyUpload.expiresAt)}&signature=${encodeURIComponent(proxyUpload.signature)}`;
+    const headers = new Headers();
+    const contentType = sourceHeaders["Content-Type"] ?? sourceHeaders["content-type"] ?? body.type;
+    if (contentType) headers.set("Content-Type", contentType);
+    const response = await this.request<Response>(path, { method: "PUT", body, headers, idempotent: true }, true);
+    const metadata = await readUploadPartMetadata(response);
+    const etag = metadata.etag ?? response.headers.get("ETag")?.replaceAll('"', "") ?? response.headers.get("etag")?.replaceAll('"', "") ?? undefined;
+    const sizeBytes = metadata.size_bytes ?? body.size;
+    return { part_number: metadata.part_number ?? partNumber, etag, size_bytes: sizeBytes };
+  }
+
+  private async resolveUploadedParts(assetId: string, uploadedParts: Array<Partial<UploadedPart> & { part_number: number }>, expectedPartSizes: Map<number, number>) {
+    if (uploadedParts.every((part) => part.etag && typeof part.size_bytes === "number")) return uploadedParts as UploadedPart[];
+
+    const uploaded = await this.request<{ uploaded_parts?: UploadedPart[] }>(`/assets/${assetId}/upload-parts`);
+    const byPartNumber = new Map((uploaded.uploaded_parts ?? []).map((part) => [part.part_number, part]));
+    const completeParts = uploadedParts.map((part) => {
+      const serverPart = byPartNumber.get(part.part_number);
+      return {
+        part_number: part.part_number,
+        etag: part.etag ?? serverPart?.etag ?? "",
+        size_bytes: part.size_bytes ?? serverPart?.size_bytes ?? expectedPartSizes.get(part.part_number) ?? 0,
+      };
+    });
+
+    const missing = completeParts.filter((part) => !part.etag || part.size_bytes <= 0);
+    if (missing.length > 0) {
+      throw new Error(
+        `上传代理没有返回分片 metadata，且 GET /assets/${assetId}/upload-parts 也没有返回完整 uploaded_parts。缺失分片：${missing.map((part) => part.part_number).join(", ")}。`,
+      );
+    }
+    return completeParts;
+  }
+}
+
+async function readUploadPartMetadata(response: Response) {
+  const text = await response.text();
+  if (!text) return {} as { part_number?: number; etag?: string; size_bytes?: number };
+  const data = JSON.parse(text) as Record<string, unknown>;
+  return {
+    part_number: typeof data.part_number === "number" ? data.part_number : undefined,
+    etag: typeof data.etag === "string" ? data.etag.replaceAll('"', "") : typeof data.ETag === "string" ? data.ETag.replaceAll('"', "") : undefined,
+    size_bytes: typeof data.size_bytes === "number" ? data.size_bytes : undefined,
+  };
 }
 
 async function sha256Hex(file: Blob) {
