@@ -12,6 +12,7 @@ contextBridge.exposeInMainWorld("meetingMate", {
   saveManuscript: (input: unknown) => ipcRenderer.invoke("manuscripts:save", input),
   deleteManuscript: (id: string) => ipcRenderer.invoke("manuscripts:delete", id),
   exportManuscriptToDocument: (id: string) => ipcRenderer.invoke("manuscripts:export-document", id),
-  speechToText: () => ipcRenderer.invoke("ai:speech-to-text"),
-  imageToText: () => ipcRenderer.invoke("ai:image-to-text")
+  selectAudioFile: () => ipcRenderer.invoke("files:select-audio"),
+  selectImageFile: () => ipcRenderer.invoke("files:select-image"),
+  uploadFileParts: (input: unknown) => ipcRenderer.invoke("files:upload-parts", input)
 });

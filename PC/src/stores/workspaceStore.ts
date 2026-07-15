@@ -1,9 +1,8 @@
 import { create } from "zustand";
-import { mockDocuments, mockManuscripts } from "../data/mock";
 import type { Document } from "../types/document";
 import type { Manuscript } from "../types/manuscript";
 
-export type ActiveSection = "library" | "manuscripts" | "ai" | "exports" | "settings";
+export type ActiveSection = "home" | "library" | "account" | "manuscriptEditor" | "documentEditor";
 
 type WorkspaceState = {
   activeSection: ActiveSection;
@@ -26,6 +25,8 @@ type WorkspaceState = {
   setSaveStatus: (status: WorkspaceState["saveStatus"]) => void;
   selectDocument: (id: string) => void;
   selectManuscript: (id: string) => void;
+  openDocumentEditor: (id: string) => void;
+  openManuscriptEditor: (id: string) => void;
   runAiAction: (action: string) => void;
 };
 
@@ -36,11 +37,11 @@ const aiResponses: Record<string, string> = {
 };
 
 export const useWorkspaceStore = create<WorkspaceState>((set) => ({
-  activeSection: "library",
-  documents: mockDocuments,
-  manuscripts: mockManuscripts,
-  selectedDocumentId: mockDocuments[0]?.id ?? "",
-  selectedManuscriptId: mockManuscripts[0]?.id ?? "",
+  activeSection: "home",
+  documents: [],
+  manuscripts: [],
+  selectedDocumentId: "",
+  selectedManuscriptId: "",
   aiOutput: "选择一个 AI 动作后，这里会显示模拟输出。",
   isHydrated: false,
   saveStatus: "idle",
@@ -94,5 +95,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set) => ({
   setSaveStatus: (status) => set({ saveStatus: status }),
   selectDocument: (id) => set({ selectedDocumentId: id }),
   selectManuscript: (id) => set({ selectedManuscriptId: id }),
+  openDocumentEditor: (id) => set({ selectedDocumentId: id, activeSection: "documentEditor" }),
+  openManuscriptEditor: (id) => set({ selectedManuscriptId: id, activeSection: "manuscriptEditor" }),
   runAiAction: (action) => set({ aiOutput: aiResponses[action] ?? "AI 动作已触发。" })
 }));
