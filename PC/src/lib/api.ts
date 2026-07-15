@@ -978,6 +978,7 @@ function toDocumentBlock(block: Record<string, unknown>): DocumentBlock {
       updatedAt: String(block.updated_at ?? ""),
       content: String(props.caption ?? props.ocrText ?? props.content ?? ""),
       props,
+      sourceRefs: Array.isArray(block.source_refs) ? block.source_refs : [],
     };
   }
   const type =
@@ -996,6 +997,7 @@ function toDocumentBlock(block: Record<string, unknown>): DocumentBlock {
     updatedAt: String(block.updated_at ?? ""),
     content,
     items: Array.isArray(props.items) ? props.items.map(String) : undefined,
+    sourceRefs: Array.isArray(block.source_refs) ? block.source_refs : [],
   };
 }
 
@@ -1066,7 +1068,7 @@ function toRemoteDocumentBlock(
   const now = new Date().toISOString();
   const base = {
     ...remoteBlockBase(block, authorId, clientId, platform, now),
-    source_refs: [],
+    source_refs: block.sourceRefs ?? [],
   };
   if (block.type === "heading")
     return {

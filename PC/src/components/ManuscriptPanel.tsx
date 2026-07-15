@@ -87,6 +87,7 @@ export function ManuscriptPanel(): React.JSX.Element {
     removeManuscript,
     selectedManuscriptId,
     selectManuscript,
+    setConversionNotice,
     updateManuscript,
   } = useWorkspaceStore();
   const manuscript = manuscripts.find(
@@ -215,6 +216,7 @@ export function ManuscriptPanel(): React.JSX.Element {
       if (result.document) {
         setConvertWarnings(result.warnings);
         addDocument(result.document);
+        setConversionNotice(result.warnings.length ? { documentId: result.document.id, warnings: result.warnings } : null);
         openDocumentEditor(result.document.id);
         setConvertDialog(null);
         setSaveStatus(result.warnings.length ? "转换完成，部分手写内容已降级" : "已保存");
