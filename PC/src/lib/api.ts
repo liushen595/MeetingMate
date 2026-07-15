@@ -55,6 +55,13 @@ export type SelectedFile = {
   checksumSha256: string;
 };
 
+export type AudioTranscription = {
+  assetId: string;
+  durationMs: number;
+  transcript: string;
+  speakerSegments: unknown[];
+};
+
 const SESSION_KEY = "meetingmate.session";
 const API_BASE_URL = "http://10.90.130.14:8000/api/v1";
 
@@ -205,7 +212,7 @@ class PcApiClient {
     return download.download_url;
   }
 
-  async transcribeAudio(file: SelectedFile): Promise<string> {
+  async transcribeAudio(file: SelectedFile): Promise<AudioTranscription> {
     const assetId = await this.createReadyAsset(file);
     const task = await this.request<Task>("/tasks/asr-audio", {
       method: "POST",
@@ -214,8 +221,18 @@ class PcApiClient {
     });
     const completedTask = await this.waitForTask(task);
     const transcript = extractTranscript(completedTask.result);
-    if (transcript) return transcript;
+    if (transcript) return { assetId, durationMs: 0, transcript, speakerSegments: extractSpeakerSegments(completedTask.result) };
     throw new Error(`ASR 任务已完成，但服务器返回了空转写文本。请检查服务器 ASR 服务是否成功读取音频内容、音频格式是否受支持，以及 assets.content/part_contents 是否有实际文件内容。（task: ${completedTask.id}, result: ${JSON.stringify(completedTask.result ?? {})}）`);
+  }
+
+  async getAssetObjectUrl(assetId: string): Promise<string> {
+    if (!this.session) throw new Error("请先登录服务器");
+    const headers = new Headers();
+    headers.set("X-Client-Id", this.clientId);
+    headers.set("Authorization", `Bearer ${this.session.access_token}`);
+    const response = await fetch(`${API_BASE_URL}/assets/${assetId}/stream`, { headers });
+    if (!response.ok) throw new Error(`音频加载失败：${response.status} ${response.statusText}`);
+    return URL.createObjectURL(await response.blob());
   }
 
   async recognizeImage(file: SelectedFile): Promise<string> {
@@ -496,6 +513,12 @@ function extractTranscript(result: Record<string, unknown> | null): string {
       .join("\n");
   }
   return "";
+}
+
+function extractSpeakerSegments(result: Record<string, unknown> | null): unknown[] {
+  if (!result) return [];
+  const segments = result.speaker_segments ?? result.segments ?? (isRecord(result.asr_audio) ? result.asr_audio.speaker_segments : undefined);
+  return Array.isArray(segments) ? segments : [];
 }
 
 function sleep(ms: number): Promise<void> {
