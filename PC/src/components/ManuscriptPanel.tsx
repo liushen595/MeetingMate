@@ -157,6 +157,44 @@ export function ManuscriptPanel(): React.JSX.Element {
     return { source, updatedSource, continuation };
   }
 
+  function deleteManuscriptBlock(blockId: string) {
+    const index = visibleBlocks.findIndex((block) => block.id === blockId);
+    if (index === -1) return;
+    const previous = visibleBlocks[index - 1];
+    const next = visibleBlocks[index + 1];
+
+    if (previous?.type === "handwriting" && next?.type === "handwriting") {
+      const previousStrokes = (previous as HandwritingBlock).props.strokes ?? [];
+      const nextStrokes = (next as HandwritingBlock).props.strokes ?? [];
+      const previousHeight = blockHeights[previous.id] ?? estimateStrokeHeight(previousStrokes);
+      const nextHeight = blockHeights[next.id] ?? estimateStrokeHeight(nextStrokes);
+      const mergedStrokes = appendStrokesAtOffset(previousStrokes, nextStrokes, previousHeight);
+      const mergedBlock = touchBlock({ ...(previous as HandwritingBlock), props: { ...(previous as HandwritingBlock).props, strokes: mergedStrokes } });
+      const mergedHeight = Math.max(previousHeight + nextHeight, estimateStrokeHeight(mergedStrokes));
+
+      setBlocks((current) => current.filter((block) => block.id !== blockId && block.id !== next.id).map((block) => (block.id === previous.id ? mergedBlock : block)));
+      setBlockHeights((current) => {
+        const heights = { ...current, [previous.id]: mergedHeight };
+        delete heights[blockId];
+        delete heights[next.id];
+        return heights;
+      });
+      setActiveBlockId(previous.id);
+    } else {
+      setBlocks((current) => current.filter((block) => block.id !== blockId));
+      setBlockHeights((current) => {
+        const heights = { ...current };
+        delete heights[blockId];
+        return heights;
+      });
+      if (activeBlockId === blockId) setActiveBlockId(null);
+    }
+
+    if (selected?.blockId === blockId || selected?.blockId === next?.id) setSelected(null);
+    setMenu(null);
+    setSaveStatus("等待自动保存");
+  }
+
   function insertText(afterBlockId: string | null = null) {
     const block = createTextBlock("");
     insertBlockRespectingSelection(block, afterBlockId);
@@ -189,6 +227,18 @@ export function ManuscriptPanel(): React.JSX.Element {
   }
 
   function commitBlankHandwriting(strokes: Stroke[], height: number) {
+    const lastBlock = visibleBlocks[visibleBlocks.length - 1];
+    if (lastBlock?.type === "handwriting") {
+      const lastStrokes = (lastBlock as HandwritingBlock).props.strokes ?? [];
+      const currentHeight = blockHeights[lastBlock.id] ?? estimateStrokeHeight(lastStrokes);
+      const nextStrokes = appendStrokesAtOffset(lastStrokes, strokes, currentHeight);
+      const block = touchBlock({ ...(lastBlock as HandwritingBlock), props: { ...(lastBlock as HandwritingBlock).props, strokes: nextStrokes } });
+      setBlockHeights((current) => ({ ...current, [block.id]: Math.max(currentHeight + height, estimateStrokeHeight(nextStrokes)) }));
+      applyBlock(block);
+      setActiveBlockId(block.id);
+      return;
+    }
+
     const block = createHandwritingBlock(strokes);
     setBlockHeights((current) => ({ ...current, [block.id]: height }));
     applyBlock(block, visibleBlocks[visibleBlocks.length - 1]?.id ?? null);
@@ -367,6 +417,7 @@ export function ManuscriptPanel(): React.JSX.Element {
             <button className="block w-full px-3 py-2 text-left hover:bg-slate-50" onClick={() => insertImage(menu.blockId)} type="button">插入图片</button>
             <button className="block w-full px-3 py-2 text-left hover:bg-slate-50" onClick={() => insertText(menu.blockId)} type="button">插入文字</button>
             {menu.selectedStrokeIds.length > 0 && <button className="block w-full px-3 py-2 text-left hover:bg-slate-50" onClick={splitSelectedAsNextLine} type="button">选区作为下一行</button>}
+            {menu.blockId && <button className="block w-full px-3 py-2 text-left text-red-600 hover:bg-red-50" onClick={() => menu.blockId && deleteManuscriptBlock(menu.blockId)} type="button">删除该块</button>}
             <button className="block w-full px-3 py-2 text-left text-slate-500 hover:bg-slate-50" onClick={() => setMenu(null)} type="button">关闭</button>
           </div>
         )}
@@ -587,6 +638,7 @@ function pointInPolygon(point: StrokePoint, polygon: StrokePoint[]) { let inside
 function getStrokeBounds(strokes: Stroke[]) { if (strokes.length === 0) return null; const points = strokes.flatMap((stroke) => stroke.points); return { x: Math.min(...points.map((point) => point.x)), y: Math.min(...points.map((point) => point.y)), maxX: Math.max(...points.map((point) => point.x)), maxY: Math.max(...points.map((point) => point.y)) }; }
 function estimateStrokeHeight(strokes: Stroke[]) { if (strokes.length === 0) return 220; return Math.max(120, Math.ceil(Math.max(...strokes.flatMap((stroke) => stroke.points.map((point) => point.y))) + 44)); }
 function normalizeStrokesToTop(strokes: Stroke[]) { const minY = Math.min(...strokes.flatMap((stroke) => stroke.points.map((point) => point.y))); return strokes.map((stroke) => ({ ...stroke, points: stroke.points.map((point) => ({ ...point, y: Math.max(0, point.y - minY + 14) })) })); }
+function appendStrokesAtOffset(existing: Stroke[], incoming: Stroke[], offsetY: number) { return [...existing, ...incoming.map((stroke) => ({ ...stroke, points: stroke.points.map((point) => ({ ...point, y: point.y + offsetY })) }))]; }
 function distance(a: StrokePoint, b: StrokePoint) { return Math.hypot(a.x - b.x, a.y - b.y); }
 function clamp(value: number, min: number, max: number) { return Math.min(max, Math.max(min, value)); }
 function makeId(prefix: string) { return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`; }

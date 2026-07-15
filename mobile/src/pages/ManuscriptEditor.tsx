@@ -13,7 +13,7 @@ import {
   touchBlock,
   upsertOperation,
 } from "../lib/blocks";
-import { captureImageFromCamera, formatDuration, readImageFile } from "../lib/media";
+import { captureImageFromCamera, formatDuration, normalizeRecordedAudio, readImageFile } from "../lib/media";
 import { readAsrSse } from "../lib/sse";
 import type { ConvertMode, Manuscript, ManuscriptBlock, ManuscriptHandwritingBlock, Stroke, StrokeTool, SyncOperation, Task } from "../types/api";
 import { AssetImage } from "../components/AssetImage";
@@ -269,12 +269,13 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
   async function finishAudio(blob: Blob, durationMs: number, afterBlockId: string | null) {
     if (!userId) return;
     const pendingId = crypto.randomUUID?.() ?? `pending-${Date.now()}`;
-    const objectUrl = URL.createObjectURL(blob);
-    setPendingAudios((current) => [...current, { id: pendingId, afterBlockId, durationMs, objectUrl, status: "uploading" }]);
+    const normalized = await normalizeRecordedAudio(blob, durationMs);
+    const objectUrl = URL.createObjectURL(normalized.blob);
+    setPendingAudios((current) => [...current, { id: pendingId, afterBlockId, durationMs: normalized.durationMs, objectUrl, status: "uploading" }]);
     setSyncState("上传录音");
     try {
-      const asset = await api.uploadAsset(blob, { kind: "audio", filename: `recording-${Date.now()}.webm`, contentType: blob.type || "audio/webm", durationMs });
-      const block = createAudioBlock(userId, asset.id, durationMs);
+      const asset = await api.uploadAsset(normalized.blob, { kind: "audio", filename: `recording-${Date.now()}.${normalized.extension}`, contentType: normalized.contentType, durationMs: normalized.durationMs });
+      const block = createAudioBlock(userId, asset.id, normalized.durationMs);
       setPendingAudios((current) => {
         return current.filter((item) => item.id !== pendingId);
       });
@@ -449,19 +450,13 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
       {task && <TaskBanner task={task} />}
       {error && <button className="toast inline" onClick={() => setError(null)} type="button">{error}</button>}
 
-      <div className="paper-toolbar">
+      <div className="paper-toolbar manuscript-floating-toolbar">
         <button className={tool === "pen" ? "active" : ""} onClick={() => setTool("pen")} type="button">笔</button>
         <button className={tool === "highlighter" ? "active" : ""} onClick={() => setTool("highlighter")} type="button">荧光</button>
         <button className={tool === "eraser" ? "active" : ""} onClick={() => setTool("eraser")} type="button">橡皮</button>
         <button className={tool === "lasso" ? "active" : ""} onClick={() => setTool("lasso")} type="button">套索</button>
         <input aria-label="画笔颜色" onChange={(event) => setColor(event.target.value)} type="color" value={color} />
         <input aria-label="画笔粗细" max="9" min="1" onChange={(event) => setBrushWidth(Number(event.target.value))} type="range" value={brushWidth} />
-      </div>
-
-      <div className="capture-toolbar">
-        <button onClick={() => (recording ? stopRecording() : startRecording(null))} type="button">{recording ? "停止录音" : "录音追加"}</button>
-        <button onClick={() => chooseImage(null)} type="button">图片追加</button>
-        <button onClick={() => insertText(null)} type="button">文字追加</button>
       </div>
 
       <article className="waterfall-paper" onPointerCancel={cancelLongPress} onPointerLeave={cancelLongPress} onPointerUp={cancelLongPress}>
@@ -512,6 +507,12 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
           <BlankHandwritingCanvas brushWidth={brushWidth} color={color} onCommit={commitBlankHandwriting} tool={tool} />
         </div>
       </article>
+
+      <div className="capture-toolbar manuscript-insert-toolbar">
+        <button onClick={() => (recording ? stopRecording() : startRecording(null))} type="button">{recording ? "停止录音" : "录音追加"}</button>
+        <button onClick={() => chooseImage(null)} type="button">图片追加</button>
+        <button onClick={() => insertText(null)} type="button">文字追加</button>
+      </div>
 
       {menu && (
         <div className="context-menu" style={{ left: menu.x, top: menu.y }}>
