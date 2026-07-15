@@ -33,6 +33,7 @@ class VisionProvider:
         width: int | None,
         height: int | None,
         language: str,
+        prompt: str | None = None,
     ) -> VisionResult:
         text = ""
         async for chunk in self.stream_recognize(
@@ -42,6 +43,7 @@ class VisionProvider:
             width=width,
             height=height,
             language=language,
+            prompt=prompt,
         ):
             text = append_stream_text(text, chunk)
         return result_from_text(text)
@@ -55,6 +57,7 @@ class VisionProvider:
         width: int | None,
         height: int | None,
         language: str,
+        prompt: str | None = None,
     ) -> AsyncIterator[str]:
         result = await self.recognize(
             filename=filename,
@@ -63,6 +66,7 @@ class VisionProvider:
             width=width,
             height=height,
             language=language,
+            prompt=prompt,
         )
         if result.text:
             yield result.text
@@ -124,6 +128,7 @@ class DashscopeVisionProvider(VisionProvider):
         width: int | None,
         height: int | None,
         language: str,
+        prompt: str | None = None,
     ) -> AsyncIterator[str]:
         if not self.api_key:
             raise VisionProviderError("DASHSCOPE_API_KEY is not configured.", retryable=False)
@@ -140,15 +145,15 @@ class DashscopeVisionProvider(VisionProvider):
 
         dashscope.base_http_api_url = self.api_url
         data_uri = f"data:{content_type};base64,{encoded.decode('ascii')}"
-        prompt = (
+        request_prompt = prompt or (
             "请识别这张图片，使用中文输出。第一行给出一句简洁图片说明；"
             "随后提取图片中的可读文字、白板要点、图表关系和待办事项。"
         )
         if language:
-            prompt += f" 用户语言偏好：{language}。"
+            request_prompt += f" 用户语言偏好：{language}。"
         if width and height:
-            prompt += f" 图片尺寸：{width}x{height}。"
-        messages = [{"role": "user", "content": [{"image": data_uri}, {"text": prompt}]}]
+            request_prompt += f" 图片尺寸：{width}x{height}。"
+        messages = [{"role": "user", "content": [{"image": data_uri}, {"text": request_prompt}]}]
         result_queue: queue.Queue[str | BaseException | None] = queue.Queue()
 
         def worker() -> None:
