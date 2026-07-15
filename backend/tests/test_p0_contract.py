@@ -97,6 +97,9 @@ class TestRepository:
         self.tasks: dict[str, tuple[str, backend.Task]] = {}
         self.exports: dict[str, backend.ExportRecord] = {}
         self.share_links: dict[str, backend.ShareLinkRecord] = {}
+        self.groups: dict[str, backend.GroupRecord] = {}
+        self.group_members: dict[tuple[str, str], tuple[backend.GroupRole, datetime]] = {}
+        self.group_messages: dict[str, backend.GroupDocumentMessageRecord] = {}
 
     async def get_user_record(self, user_id: str) -> backend.UserRecord | None:
         return self.users_by_id.get(user_id)
@@ -265,6 +268,87 @@ class TestRepository:
 
     async def get_share_link_record(self, share_id: str) -> backend.ShareLinkRecord | None:
         return self.share_links.get(share_id)
+
+    async def create_group(self, group: backend.GroupRecord) -> bool:
+        if any(existing.invite_code == group.invite_code for existing in self.groups.values()):
+            return False
+        self.groups[group.id] = group
+        self.group_members[(group.id, group.created_by)] = ("owner", group.created_at)
+        return True
+
+    async def get_group_record(self, group_id: str) -> backend.GroupRecord | None:
+        return self.groups.get(group_id)
+
+    async def get_group_record_by_invite_code(self, invite_code: str) -> backend.GroupRecord | None:
+        for group in self.groups.values():
+            if group.invite_code == invite_code:
+                return group
+        return None
+
+    async def get_group_member_role(self, group_id: str, user_id: str) -> backend.GroupRole | None:
+        member = self.group_members.get((group_id, user_id))
+        return member[0] if member else None
+
+    async def add_group_member(self, group_id: str, user_id: str, role: backend.GroupRole, joined_at: datetime) -> bool:
+        key = (group_id, user_id)
+        if key in self.group_members:
+            return False
+        self.group_members[key] = (role, joined_at)
+        group = self.groups[group_id]
+        self.groups[group_id] = backend.GroupRecord(
+            id=group.id,
+            name=group.name,
+            invite_code=group.invite_code,
+            invite_code_expires_at=group.invite_code_expires_at,
+            created_by=group.created_by,
+            created_at=group.created_at,
+            updated_at=joined_at,
+        )
+        return True
+
+    async def list_groups_for_user(self, user_id: str) -> list[backend.GroupSummary]:
+        summaries = [await self.get_group_summary_for_user(group_id, user_id) for group_id, member_user_id in self.group_members if member_user_id == user_id]
+        return sorted([summary for summary in summaries if summary], key=lambda item: (item.updated_at, item.id), reverse=True)
+
+    async def get_group_summary_for_user(self, group_id: str, user_id: str) -> backend.GroupSummary | None:
+        member = self.group_members.get((group_id, user_id))
+        group = self.groups.get(group_id)
+        if not group or not member:
+            return None
+        member_count = sum(1 for current_group_id, _ in self.group_members if current_group_id == group_id)
+        return backend.GroupSummary(
+            id=group.id,
+            name=group.name,
+            invite_code=group.invite_code,
+            invite_code_expires_at=group.invite_code_expires_at,
+            member_count=member_count,
+            role=member[0],
+            created_at=group.created_at,
+            updated_at=group.updated_at,
+        )
+
+    async def save_group_document_message(self, record: backend.GroupDocumentMessageRecord) -> None:
+        self.group_messages[record.message.id] = record
+        group = self.groups[record.message.group_id]
+        self.groups[group.id] = backend.GroupRecord(
+            id=group.id,
+            name=group.name,
+            invite_code=group.invite_code,
+            invite_code_expires_at=group.invite_code_expires_at,
+            created_by=group.created_by,
+            created_at=group.created_at,
+            updated_at=record.message.sent_at,
+        )
+
+    async def list_group_document_messages(self, group_id: str) -> list[backend.GroupDocumentMessage]:
+        messages = [record.message for record in self.group_messages.values() if record.message.group_id == group_id]
+        return sorted(messages, key=lambda item: (item.sent_at, item.id), reverse=True)
+
+    async def get_group_document_message_record(self, group_id: str, message_id: str) -> backend.GroupDocumentMessageRecord | None:
+        record = self.group_messages.get(message_id)
+        if record and record.message.group_id == group_id:
+            return record
+        return None
 
 
 repo = TestRepository()
@@ -540,6 +624,112 @@ def test_asset_stream_can_fallback_to_stored_part_contents() -> None:
     assert stream.status_code == 200, stream.text
     assert stream.content == content
     assert stream.headers["content-type"] == "audio/webm"
+
+
+def test_group_flow_create_join_send_and_download_document_snapshot() -> None:
+    repo.reset()
+    alice = register_user("group-alice@example.com", "device_group_alice")
+    bob = register_user("group-bob@example.com", "device_group_bob")
+    outsider = register_user("group-outsider@example.com", "device_group_outsider")
+
+    create = client.post(
+        "/api/v1/groups",
+        json={"name": "Project Team", "client_id": "device_group_alice"},
+        headers=auth_headers(alice, "device_group_alice", "idem_group_create"),
+    )
+    assert create.status_code == 201, create.text
+    group = create.json()
+    assert group["name"] == "Project Team"
+    assert group["invite_code"].isdigit()
+    assert len(group["invite_code"]) == 6
+    assert group["member_count"] == 1
+    assert group["role"] == "owner"
+
+    replay = client.post(
+        "/api/v1/groups",
+        json={"name": "Project Team", "client_id": "device_group_alice"},
+        headers=auth_headers(alice, "device_group_alice", "idem_group_create"),
+    )
+    assert replay.status_code == 201, replay.text
+    assert replay.json()["id"] == group["id"]
+
+    alice_groups = client.get("/api/v1/groups", headers=auth_headers(alice, "device_group_alice"))
+    assert alice_groups.status_code == 200, alice_groups.text
+    assert alice_groups.json()["items"][0]["id"] == group["id"]
+
+    join = client.post(
+        "/api/v1/groups/join",
+        json={"invite_code": group["invite_code"], "client_id": "device_group_bob"},
+        headers=auth_headers(bob, "device_group_bob", "idem_group_join"),
+    )
+    assert join.status_code == 200, join.text
+    assert join.json()["id"] == group["id"]
+    assert join.json()["member_count"] == 2
+    assert join.json()["role"] == "member"
+
+    repo.groups[group["id"]] = backend.GroupRecord(
+        id=group["id"],
+        name=group["name"],
+        invite_code=group["invite_code"],
+        invite_code_expires_at=backend.utcnow() - backend.timedelta(seconds=1),
+        created_by=alice["user"]["id"],
+        created_at=datetime.fromisoformat(group["created_at"]),
+        updated_at=datetime.fromisoformat(group["updated_at"]),
+    )
+    rejoin = client.post(
+        "/api/v1/groups/join",
+        json={"invite_code": group["invite_code"], "client_id": "device_group_bob"},
+        headers=auth_headers(bob, "device_group_bob", "idem_group_rejoin_expired"),
+    )
+    assert rejoin.status_code == 200, rejoin.text
+    expired_join = client.post(
+        "/api/v1/groups/join",
+        json={"invite_code": group["invite_code"], "client_id": "device_group_outsider"},
+        headers=auth_headers(outsider, "device_group_outsider", "idem_group_expired_join"),
+    )
+    assert expired_join.status_code == 403
+
+    document = client.post(
+        "/api/v1/documents",
+        json={"title": "Group Minutes", "client_id": "device_group_alice", "source_manuscript_ids": [], "derived_from": None, "initial_blocks": []},
+        headers=auth_headers(alice, "device_group_alice", "idem_group_document"),
+    )
+    assert document.status_code == 201, document.text
+    document_id = document.json()["id"]
+
+    forbidden_send = client.post(
+        f"/api/v1/groups/{group['id']}/documents",
+        json={"document_id": document_id, "client_id": "device_group_bob"},
+        headers=auth_headers(bob, "device_group_bob", "idem_group_forbidden_send"),
+    )
+    assert forbidden_send.status_code == 403
+
+    send = client.post(
+        f"/api/v1/groups/{group['id']}/documents",
+        json={"document_id": document_id, "client_id": "device_group_alice"},
+        headers=auth_headers(alice, "device_group_alice", "idem_group_send"),
+    )
+    assert send.status_code == 201, send.text
+    message = send.json()
+    assert message["group_id"] == group["id"]
+    assert message["sender_id"] == alice["user"]["id"]
+    assert message["document_title"] == "Group Minutes"
+
+    messages = client.get(f"/api/v1/groups/{group['id']}/messages", headers=auth_headers(bob, "device_group_bob"))
+    assert messages.status_code == 200, messages.text
+    assert messages.json()["items"][0]["id"] == message["id"]
+
+    download = client.get(
+        f"/api/v1/groups/{group['id']}/documents/{message['id']}/download?format=pdf",
+        headers=auth_headers(bob, "device_group_bob"),
+    )
+    assert download.status_code == 200, download.text
+    assert download.content.startswith(b"%PDF")
+    assert "attachment" in download.headers["content-disposition"]
+    assert "Group%20Minutes.pdf" in download.headers["content-disposition"]
+
+    outsider_messages = client.get(f"/api/v1/groups/{group['id']}/messages", headers=auth_headers(outsider, "device_group_outsider"))
+    assert outsider_messages.status_code == 403
 
 
 def test_image_recognition_task_updates_image_block_and_convert_keeps_source_ref() -> None:
