@@ -152,3 +152,5 @@ __pycache__/
 .ruff_cache/
 .mypy_cache/
 backend/.venv/
+
+*.m4a

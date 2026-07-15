@@ -1177,7 +1177,9 @@
             "description": "Successful Response",
             "content": {
               "application/json; charset=utf-8": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/UploadedPart"
+                }
               }
             }
           },

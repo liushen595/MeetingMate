@@ -46,6 +46,7 @@ MAX_OPERATIONS = 100
 MAX_BLOCK_BYTES = 256 * 1024
 MAX_HANDWRITING_POINTS = 5000
 MAX_CLIENT_TIME_SKEW_SECONDS = 24 * 60 * 60
+DEFAULT_CORS_ORIGIN_REGEX = r"^https?://(localhost|127\.0\.0\.1|10\.(?:\d{1,3}\.){2}\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3})(?::\d+)?$"
 
 
 Platform = Literal["ios", "android", "mac", "windows", "web"]
@@ -138,7 +139,7 @@ def load_settings() -> AppSettings:
         load_dotenv(BACKEND_ROOT / ".env")
     return AppSettings(
         cors_origins=parse_env_list("CORS_ORIGINS"),
-        cors_origin_regex=os.getenv("CORS_ORIGIN_REGEX") or None,
+        cors_origin_regex=os.getenv("CORS_ORIGIN_REGEX") or DEFAULT_CORS_ORIGIN_REGEX,
         allowed_hosts=parse_env_list("ALLOWED_HOSTS"),
         object_storage_public_base_url=os.getenv("OBJECT_STORAGE_PUBLIC_BASE_URL") or None,
         object_storage_bucket=os.getenv("OBJECT_STORAGE_BUCKET") or None,
@@ -968,6 +969,11 @@ def jsonb(value: Any) -> str:
     return json.dumps(jsonable_encoder(value), ensure_ascii=False, separators=(",", ":"))
 
 
+def jsonb_part_contents(part_contents: dict[int, bytes]) -> str:
+    encoded = {str(part_number): base64.b64encode(content).decode("ascii") for part_number, content in part_contents.items()}
+    return json.dumps(encoded, ensure_ascii=False, separators=(",", ":"))
+
+
 def parse_jsonb(value: Any) -> Any:
     if value is None:
         return None
@@ -1157,9 +1163,9 @@ class PostgresRepository:
             INSERT INTO assets(
                 id, owner_id, kind, filename, content_type, size_bytes, checksum_sha256,
                 duration_ms, width, height, status, upload_id, part_size_bytes,
-                uploaded_parts, content, created_at, updated_at
+                uploaded_parts, content, part_contents, created_at, updated_at
             )
-            VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::jsonb, $15, $16, $17)
+            VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::jsonb, $15, $16::jsonb, $17, $18)
             ON CONFLICT (id) DO UPDATE SET
                 kind = EXCLUDED.kind,
                 filename = EXCLUDED.filename,
@@ -1174,6 +1180,7 @@ class PostgresRepository:
                 part_size_bytes = EXCLUDED.part_size_bytes,
                 uploaded_parts = EXCLUDED.uploaded_parts,
                 content = EXCLUDED.content,
+                part_contents = EXCLUDED.part_contents,
                 updated_at = EXCLUDED.updated_at
             """,
             asset.id,
@@ -1191,6 +1198,7 @@ class PostgresRepository:
             record.part_size_bytes,
             jsonb(record.uploaded_parts),
             record.content,
+            jsonb_part_contents(record.part_contents),
             asset.created_at,
             asset.updated_at,
         )
@@ -1905,6 +1913,37 @@ def validate_complete_parts(request: AssetCompleteRequest) -> None:
         raise validation_error("sum(parts.size_bytes) must equal size_bytes.")
 
 
+def collect_part_contents(record: AssetRecord, parts: list[UploadedPart] | None = None) -> bytes | None:
+    selected_parts = sorted(parts if parts is not None else record.uploaded_parts, key=lambda item: item.part_number)
+    if not selected_parts:
+        return None
+    contents: list[bytes] = []
+    for part in selected_parts:
+        content = record.part_contents.get(part.part_number)
+        if content is None or len(content) != part.size_bytes or hashlib.sha256(content).hexdigest() != part.etag:
+            return None
+        contents.append(content)
+    return b"".join(contents)
+
+
+def asset_content_bytes(record: AssetRecord) -> bytes | None:
+    if record.content is not None:
+        return record.content
+    return collect_part_contents(record)
+
+
+def require_asset_content(record: AssetRecord) -> bytes:
+    content = asset_content_bytes(record)
+    if content is None:
+        raise validation_error("Asset content is not available in database storage.")
+    return content
+
+
+def content_disposition_filename(filename: str) -> str:
+    fallback = filename.replace("\\", "_").replace("/", "_").replace('"', "_").strip() or "asset"
+    return f"inline; filename=\"{fallback}\"; filename*=UTF-8''{quote(filename, safe='')}"
+
+
 def document_summary(document: Document) -> DocumentSummary:
     return DocumentSummary(
         id=document.id,
@@ -2169,7 +2208,7 @@ async def process_asr_task(
         asset_record = await get_asset_record(db, payload.asset_id, owner_id)
         if asset_record.asset.kind != "audio" or asset_record.asset.status != "ready":
             raise validation_error("ASR requires a ready audio asset.")
-        content = asset_record.content or b""
+        content = require_asset_content(asset_record)
         result = await provider.transcribe(
             filename=asset_record.asset.filename,
             content_type=asset_record.asset.content_type,
@@ -2223,11 +2262,12 @@ async def stream_asr_task_events(
         asset_record = await get_asset_record(db, payload.asset_id, owner_id)
         if asset_record.asset.kind != "audio" or asset_record.asset.status != "ready":
             raise validation_error("ASR requires a ready audio asset.")
+        content = require_asset_content(asset_record)
         current_text = ""
         async for chunk in provider.stream_transcribe(
             filename=asset_record.asset.filename,
             content_type=asset_record.asset.content_type,
-            content=asset_record.content or b"",
+            content=content,
             duration_ms=asset_record.asset.duration_ms,
             language=payload.language,
             enable_diarization=payload.enable_diarization,
@@ -2281,7 +2321,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["X-Request-Id"],
+    expose_headers=["X-Request-Id", "ETag", "Content-Length", "Content-Disposition", "Accept-Ranges"],
 )
 if settings.allowed_hosts:
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.allowed_hosts)
@@ -2469,7 +2509,7 @@ async def get_asset_upload_parts(
     )
 
 
-@router.put("/assets/{asset_id}/upload-parts/{part_number}")
+@router.put("/assets/{asset_id}/upload-parts/{part_number}", response_model=UploadedPart)
 async def upload_asset_part(
     asset_id: str,
     part_number: int,
@@ -2478,7 +2518,7 @@ async def upload_asset_part(
     expires_at: int,
     signature: str,
     db: PostgresRepository = Depends(get_repository),
-) -> Response:
+) -> JSONResponse:
     if expires_at < int(utcnow().timestamp()):
         raise APIError(status.HTTP_400_BAD_REQUEST, "invalid_request", "Upload URL has expired.")
     expected_signature = upload_part_signature(asset_id, upload_id, part_number, expires_at)
@@ -2502,12 +2542,13 @@ async def upload_asset_part(
     etag = hashlib.sha256(content).hexdigest()
     record.part_contents[part_number] = content
     uploaded_by_number = {part.part_number: part for part in record.uploaded_parts}
-    uploaded_by_number[part_number] = UploadedPart(part_number=part_number, etag=etag, size_bytes=len(content))
+    uploaded_part = UploadedPart(part_number=part_number, etag=etag, size_bytes=len(content))
+    uploaded_by_number[part_number] = uploaded_part
     record.uploaded_parts = [uploaded_by_number[number] for number in sorted(uploaded_by_number)]
     if len(record.uploaded_parts) == expected_part_count:
         record.asset = record.asset.model_copy(update={"status": "uploaded", "updated_at": utcnow()})
     await db.save_asset(record)
-    return Response(status_code=status.HTTP_200_OK, headers={"ETag": etag})
+    return ContractJSONResponse(content=jsonable_encoder(uploaded_part), status_code=status.HTTP_200_OK, headers={"ETag": etag})
 
 
 @router.post("/assets/{asset_id}/complete", response_model=Asset, dependencies=IDEMPOTENT_WRITE_DEPENDENCIES)
@@ -2538,23 +2579,25 @@ async def complete_asset_upload(
         await db.save_asset(record)
         raise
     uploaded_by_number = {part.part_number: part for part in record.uploaded_parts}
-    part_contents: list[bytes] = []
-    for part in sorted(payload.parts, key=lambda item: item.part_number):
+    sorted_parts = sorted(payload.parts, key=lambda item: item.part_number)
+    for part in sorted_parts:
         uploaded_part = uploaded_by_number.get(part.part_number)
         if not uploaded_part or uploaded_part.etag != part.etag or uploaded_part.size_bytes != part.size_bytes:
             record.asset = record.asset.model_copy(update={"status": "failed", "updated_at": utcnow()})
             await db.save_asset(record)
             raise validation_error("Uploaded part metadata does not match the completed parts payload.")
-        content = record.part_contents.get(part.part_number)
-        if content is not None:
-            part_contents.append(content)
-    if part_contents:
-        content = b"".join(part_contents)
+
+    content = collect_part_contents(record, sorted_parts)
+    if content is not None:
         if len(content) != payload.size_bytes or hashlib.sha256(content).hexdigest() != payload.checksum_sha256:
             record.asset = record.asset.model_copy(update={"status": "failed", "updated_at": utcnow()})
             await db.save_asset(record)
             raise validation_error("Uploaded content does not match size_bytes or checksum_sha256.")
         record.content = content
+    elif settings.asset_upload_url_mode != "object_storage":
+        record.asset = record.asset.model_copy(update={"status": "failed", "updated_at": utcnow()})
+        await db.save_asset(record)
+        raise validation_error("Uploaded part content is missing from database storage.")
     record.uploaded_parts = sorted(payload.parts, key=lambda part: part.part_number)
     record.asset = record.asset.model_copy(
         update={
@@ -2578,11 +2621,16 @@ async def get_asset(asset_id: str, ctx: AuthContext = Depends(auth_context), db:
 @router.get("/assets/{asset_id}/stream")
 async def stream_asset(asset_id: str, ctx: AuthContext = Depends(auth_context), db: PostgresRepository = Depends(get_repository)) -> Response:
     record = await get_asset_record(db, asset_id, ctx.user_id)
-    if record.content is not None:
+    content = asset_content_bytes(record)
+    if content is not None and record.asset.status in {"uploaded", "ready"}:
         return Response(
-            content=record.content,
+            content=content,
             media_type=record.asset.content_type,
-            headers={"Content-Disposition": f'inline; filename="{record.asset.filename}"'},
+            headers={
+                "Content-Length": str(len(content)),
+                "Content-Disposition": content_disposition_filename(record.asset.filename),
+                "Accept-Ranges": "bytes",
+            },
         )
     if settings.asset_upload_url_mode == "object_storage":
         return RedirectResponse(url=make_object_storage_url(record.asset.id, "download", expires_seconds=600), status_code=status.HTTP_302_FOUND)
