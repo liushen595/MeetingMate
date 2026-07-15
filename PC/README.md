@@ -216,7 +216,15 @@ Manuscript workspace: manuscript list + blank capture/editor canvas + manuscript
 AI workspace: standalone AI panel and future AI task surface.
 ```
 
-The manuscript workspace is no longer compressed under the document library. Click `手稿` in the primary sidebar to open a dedicated manuscript workspace with text input, handwriting canvas, speech-to-text, and image-to-text entry points.
+The manuscript workspace is no longer compressed under the document library. Click `手稿` in the primary sidebar to open a dedicated manuscript workspace.
+
+The PC manuscript editor now follows the mobile web manuscript model:
+
+- Top manuscript title and sync state
+- Pen toolbar with pen, highlighter, eraser, color, and brush width
+- Capture toolbar with recording, image append, and text append
+- Waterfall paper area where each text/audio/image/handwriting item is an independent block
+- Blank handwriting area that creates a handwriting block when the user draws with the mouse or touchpad
 
 ## Recommended Next Steps
 

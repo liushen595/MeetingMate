@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { BaseEditor, createEditor, Descendant } from "slate";
 import { Editable, ReactEditor, RenderElementProps, Slate, withReact } from "slate-react";
+import { pcApi } from "../lib/api";
 import type { DocumentBlock } from "../types/block";
 import { useWorkspaceStore } from "../stores/workspaceStore";
 
@@ -51,11 +52,9 @@ export function EditorPanel(): React.JSX.Element {
     const timeoutId = window.setTimeout(() => {
       const nextBlocks = slateValueToBlocks(editorValue);
       setSaveStatus("saving");
-      window.meetingMate
-        ?.saveDocument({
-          id: document.id,
+      pcApi.saveDocument({
+          ...document,
           title: getTitleFromBlocks(nextBlocks, document.title),
-          status: document.status,
           blocks: nextBlocks
         })
         .then((savedDocument) => {

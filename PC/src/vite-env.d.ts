@@ -25,7 +25,11 @@ interface Window {
     }) => Promise<import("./types/manuscript").Manuscript>;
     deleteManuscript: (id: string) => Promise<{ ok: boolean }>;
     exportManuscriptToDocument: (id: string) => Promise<import("./types/document").Document>;
-    speechToText: () => Promise<string | null>;
-    imageToText: () => Promise<string | null>;
+    selectAudioFile: () => Promise<import("./lib/api").SelectedFile | null>;
+    selectImageFile: () => Promise<import("./lib/api").SelectedFile | null>;
+    uploadFileParts: (input: {
+      path: string;
+      parts: Array<{ partNumber: number; uploadUrl: string; headers?: Record<string, string> }>;
+    }) => Promise<{ ok: boolean; parts: Array<{ part_number: number; etag: string; size_bytes: number }> }>;
   };
 }

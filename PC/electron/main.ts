@@ -1,5 +1,6 @@
 import { app, BrowserWindow, dialog, ipcMain, shell } from "electron";
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { basename, extname, join } from "node:path";
 import { AppDatabase } from "./database";
 
@@ -88,7 +89,7 @@ app.whenReady().then(() => {
     return database?.exportManuscriptToDocument(manuscriptId);
   });
 
-  ipcMain.handle("ai:speech-to-text", async () => {
+  ipcMain.handle("files:select-audio", async () => {
     const result = await dialog.showOpenDialog({
       properties: ["openFile"],
       filters: [{ name: "Audio", extensions: ["mp3", "wav", "m4a", "aac", "webm"] }]
@@ -98,11 +99,10 @@ app.whenReady().then(() => {
       return null;
     }
 
-    const fileName = basename(result.filePaths[0]);
-    return `语音识别结果占位：${fileName}\n这里后续会调用后端 ASR API 返回转写文本。`;
+    return getSelectedFile(result.filePaths[0], "audio");
   });
 
-  ipcMain.handle("ai:image-to-text", async () => {
+  ipcMain.handle("files:select-image", async () => {
     const result = await dialog.showOpenDialog({
       properties: ["openFile"],
       filters: [{ name: "Image", extensions: ["png", "jpg", "jpeg", "webp", "bmp"] }]
@@ -112,8 +112,24 @@ app.whenReady().then(() => {
       return null;
     }
 
-    const fileName = basename(result.filePaths[0]);
-    return `图片识别结果占位：${fileName}\n这里后续会调用后端 OCR/VLM API 返回图片文字。`;
+    return getSelectedFile(result.filePaths[0], "image");
+  });
+
+  ipcMain.handle("files:upload-parts", async (_event, input: { path: string; parts: Array<{ partNumber: number; uploadUrl: string; headers?: Record<string, string> }> }) => {
+    const content = readFileSync(input.path);
+    const uploadedParts: Array<{ part_number: number; etag: string; size_bytes: number }> = [];
+    for (const part of input.parts) {
+      const response = await fetch(part.uploadUrl, { method: "PUT", headers: part.headers, body: content });
+      if (!response.ok) {
+        throw new Error(`Upload part ${part.partNumber} failed: ${response.status} ${response.statusText}`);
+      }
+      uploadedParts.push({
+        part_number: part.partNumber,
+        etag: response.headers.get("etag") ?? `part-${part.partNumber}`,
+        size_bytes: content.byteLength
+      });
+    }
+    return { ok: true, parts: uploadedParts };
   });
 
   createWindow();
@@ -134,3 +150,28 @@ app.on("window-all-closed", () => {
 app.on("before-quit", () => {
   database?.close();
 });
+
+function getSelectedFile(filePath: string, kind: "audio" | "image") {
+  const content = readFileSync(filePath);
+  const extension = extname(filePath).toLowerCase();
+  return {
+    path: filePath,
+    kind,
+    filename: basename(filePath),
+    contentType: getContentType(extension, kind),
+    sizeBytes: statSync(filePath).size,
+    checksumSha256: createHash("sha256").update(content).digest("hex")
+  };
+}
+
+function getContentType(extension: string, kind: "audio" | "image"): string {
+  if (extension === ".mp3") return "audio/mpeg";
+  if (extension === ".wav") return "audio/wav";
+  if (extension === ".m4a") return "audio/mp4";
+  if (extension === ".aac") return "audio/aac";
+  if (extension === ".webm") return kind === "audio" ? "audio/webm" : "image/webp";
+  if (extension === ".jpg" || extension === ".jpeg") return "image/jpeg";
+  if (extension === ".png") return "image/png";
+  if (extension === ".bmp") return "image/bmp";
+  return kind === "audio" ? "application/octet-stream" : "image/webp";
+}

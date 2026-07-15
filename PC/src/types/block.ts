@@ -5,15 +5,21 @@ export type DocumentBlockType = "heading" | "paragraph" | "list" | "quote" | "ac
 export type ManuscriptBlock = {
   id: string;
   type: ManuscriptBlockType;
+  revision?: number;
+  createdAt?: string;
+  updatedAt?: string;
   title: string;
   timestamp: string;
   summary: string;
-  props: Record<string, string | number | string[]>;
+  props: Record<string, unknown>;
 };
 
 export type DocumentBlock = {
   id: string;
   type: DocumentBlockType;
+  revision?: number;
+  createdAt?: string;
+  updatedAt?: string;
   content: string;
   items?: string[];
 };
