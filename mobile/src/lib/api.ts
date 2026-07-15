@@ -120,11 +120,11 @@ export class ApiClient {
     });
   }
 
-  convertManuscript(manuscriptId: string, mode: ConvertMode, title: string) {
+  convertManuscript(manuscriptId: string, mode: ConvertMode, title: string, optimizeAudio: boolean) {
     return this.request<Task>("/tasks/convert-manuscript", {
       method: "POST",
       idempotent: true,
-      body: JSON.stringify({ manuscript_id: manuscriptId, mode, title, client_id: this.clientId }),
+      body: JSON.stringify({ manuscript_id: manuscriptId, mode, title, client_id: this.clientId, optimize_audio: optimizeAudio }),
     });
   }
 
@@ -141,6 +141,22 @@ export class ApiClient {
       method: "POST",
       idempotent: true,
       body: JSON.stringify({ asset_id: assetId, language: "zh-CN", enable_diarization: true, client_id: this.clientId }),
+    }, true);
+  }
+
+  recognizeImage(assetId: string) {
+    return this.request<Task>("/tasks/recognize-image", {
+      method: "POST",
+      idempotent: true,
+      body: JSON.stringify({ asset_id: assetId, language: "zh-CN", client_id: this.clientId }),
+    });
+  }
+
+  streamRecognizeImage(assetId: string) {
+    return this.request<Response>("/tasks/recognize-image/stream", {
+      method: "POST",
+      idempotent: true,
+      body: JSON.stringify({ asset_id: assetId, language: "zh-CN", client_id: this.clientId }),
     }, true);
   }
 

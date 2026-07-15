@@ -44,7 +44,7 @@ export function createAudioBlock(authorId: string, assetId: string, durationMs: 
 }
 
 export function createImageBlock(authorId: string, assetId: string, width: number, height: number, caption = ""): ManuscriptImageBlock {
-  return { id: makeId("block"), type: "image", ...base(authorId), props: { asset_id: assetId, caption, width, height } };
+  return { id: makeId("block"), type: "image", ...base(authorId), props: { asset_id: assetId, caption, width, height, recognition_task_id: null, recognition_generated_at: null } };
 }
 
 export function createHandwritingBlock(authorId: string, strokes: Stroke[] = []): ManuscriptHandwritingBlock {

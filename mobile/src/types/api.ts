@@ -121,9 +121,11 @@ export interface ManuscriptImageBlock extends BaseBlock {
   type: "image";
   props: {
     asset_id: string;
-    caption: string;
-    width: number;
-    height: number;
+    caption: string | null;
+    width: number | null;
+    height: number | null;
+    recognition_task_id: string | null;
+    recognition_generated_at: string | null;
   };
 }
 
@@ -188,7 +190,7 @@ export interface QuoteBlock extends BaseDocumentBlock {
 
 export interface DocumentImageBlock extends BaseDocumentBlock {
   type: "image";
-  props: { asset_id: string; caption: string; width: number; height: number };
+  props: { asset_id: string; caption: string | null; width: number | null; height: number | null };
 }
 
 export interface TableBlock extends BaseDocumentBlock {
@@ -263,12 +265,13 @@ export interface SyncResponse<TBlock> {
   blocks: TBlock[];
 }
 
-export type TaskType = "convert_manuscript" | "asr_audio" | "export_document" | "ai_rewrite";
+export type TaskType = "convert_manuscript" | "asr_audio" | "recognize_image" | "export_document" | "ai_rewrite";
 export type TaskStatus = "queued" | "processing" | "succeeded" | "failed" | "cancelled";
 export type TaskStage =
   | "queued"
   | "uploading"
   | "asr"
+  | "image_recognition"
   | "diarization"
   | "llm_parse"
   | "document_build"
@@ -285,12 +288,15 @@ export interface Task {
     document_id?: string;
     asset_id?: string;
     transcript?: string;
+    caption?: string;
+    recognized_text?: string;
+    text?: string;
     speaker_segments?: SpeakerSegment[];
+    warnings?: Array<{ block_id: string; code: string; message: string }>;
     export_id?: string;
     document_revision?: number;
     format?: "pdf" | "docx";
     message_id?: string;
-    text?: string;
   };
   error: null | { code: string; message: string; retryable: boolean };
   retry_count: number;

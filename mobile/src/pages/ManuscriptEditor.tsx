@@ -14,7 +14,7 @@ import {
   upsertOperation,
 } from "../lib/blocks";
 import { captureImageFromCamera, createPcmRecorder, formatDuration, normalizeRecordedAudio, readImageFile, type PcmRecorder } from "../lib/media";
-import { readAsrSse } from "../lib/sse";
+import { readAsrSse, readImageRecognitionSse } from "../lib/sse";
 import type { ConvertMode, Manuscript, ManuscriptBlock, ManuscriptHandwritingBlock, Stroke, StrokeTool, SyncOperation, Task } from "../types/api";
 import { AssetImage } from "../components/AssetImage";
 import { AudioAsset } from "../components/AudioAsset";
@@ -61,7 +61,12 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
   const [recording, setRecording] = useState<{ recorder: PcmRecorder; startedAt: number; afterBlockId: string | null } | null>(null);
   const [pendingAudios, setPendingAudios] = useState<PendingAudio[]>([]);
   const [localAudioUrls, setLocalAudioUrls] = useState<Record<string, string>>({});
+  const [localImageUrls, setLocalImageUrls] = useState<Record<string, string>>({});
   const [task, setTask] = useState<Task | null>(null);
+  const [recognizingImageAssetIds, setRecognizingImageAssetIds] = useState<string[]>([]);
+  const [convertDialogOpen, setConvertDialogOpen] = useState(false);
+  const [convertTitle, setConvertTitle] = useState("");
+  const [optimizeAudio, setOptimizeAudio] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [blockHeights, setBlockHeights] = useState<Record<string, number>>({});
   const pendingOpsRef = useRef<PendingOp[]>([]);
@@ -89,6 +94,7 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
     setManuscript(data);
     setRevision(data.revision);
     setBlocks(data.blocks.filter((block) => !block.deleted));
+    return data;
   }
 
   useEffect(() => {
@@ -365,8 +371,45 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
   async function uploadImage(image: { blob: Blob; width: number; height: number; filename: string; contentType: string }, afterBlockId: string | null) {
     if (!userId) return;
     setSyncState("上传图片");
+    const objectUrl = URL.createObjectURL(image.blob);
     const asset = await api.uploadAsset(image.blob, { kind: "image", filename: image.filename, contentType: image.contentType, width: image.width, height: image.height });
+    setLocalImageUrls((current) => ({ ...current, [asset.id]: objectUrl }));
     insertBlockRespectingSelection(createImageBlock(userId, asset.id, image.width, image.height), afterBlockId);
+    const syncResult = await flushOps({ throwOnError: true });
+    if (!syncResult) throw new Error("图片块尚未同步到服务器，已暂停图片识别。请稍后重试。");
+    await startImageRecognitionStream(asset.id);
+  }
+
+  async function startImageRecognitionStream(assetId: string) {
+    setRecognizingImageAssetIds((current) => (current.includes(assetId) ? current : [...current, assetId]));
+    setSyncState("图片识别中");
+    try {
+      const response = await api.streamRecognizeImage(assetId);
+      await readImageRecognitionSse(response, {
+        onTask: (nextTask) => setTask(nextTask),
+        onDelta: (payload) => {
+          if (payload.recognized_text ?? payload.text ?? payload.caption) setSyncState("图片文字提取中");
+        },
+        onDone: async (nextTask) => {
+          setTask(nextTask);
+          setSyncState("图片识别已完成，正在同步手稿");
+          const refreshed = await reloadManuscript();
+          const result = nextTask.result;
+          const extractedText = result?.text ?? result?.recognized_text ?? result?.caption ?? "";
+          if (extractedText) {
+            const block = refreshed.blocks.find((item): item is Extract<ManuscriptBlock, { type: "image" }> => item.type === "image" && item.props.asset_id === assetId);
+            if (block) {
+              applyBlock(createTextBlock(userId, extractedText), block.id);
+            }
+          }
+          setSyncState("已保存");
+        },
+      });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "图片文字提取失败，可稍后重试或手动编辑提取文本");
+    } finally {
+      setRecognizingImageAssetIds((current) => current.filter((id) => id !== assetId));
+    }
   }
 
   function commitBlankHandwriting(strokes: Stroke[], height: number) {
@@ -456,11 +499,26 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
     localStorage.setItem(PEN_WIDTH_KEY, String(normalizedWidth));
   }
 
+  function openConvertDialog() {
+    if (!manuscript) return;
+    setConvertTitle(manuscript.title.replace(/手稿$/, "文档"));
+    setConvertDialogOpen(true);
+  }
+
   async function convert(mode: ConvertMode) {
     if (!manuscript) return;
-    await flushOps();
-    const taskResult = await api.convertManuscript(manuscript.id, mode, manuscript.title.replace(/手稿$/, "文档"));
+    const title = convertTitle.trim();
+    if (!title) {
+      setError("文档标题不能为空");
+      return;
+    }
+    const hasPendingAudio = visibleBlocks.some((block) => block.type === "audio" && !block.props.transcript);
+    if (hasPendingAudio && !window.confirm("存在录音尚未完成转写，建议等待 ASR 完成后再转文档。仍然继续？")) return;
+    if (recognizingImageAssetIds.length > 0 && !window.confirm("图片文字仍在提取，继续转换时后端会尝试补充提取文本。仍然继续？")) return;
+    await flushOps({ throwOnError: true });
+    const taskResult = await api.convertManuscript(manuscript.id, mode, title, optimizeAudio);
     setTask(taskResult);
+    setConvertDialogOpen(false);
   }
 
   if (error && !manuscript) return <EditorMessage title="手稿加载失败" message={error} onBack={onBack} />;
@@ -475,7 +533,7 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
           <h1>{manuscript.title}</h1>
           <p>{syncState}</p>
         </div>
-        <button className="primary-small" onClick={() => convert("meeting_minutes")} type="button">转文档</button>
+        <button className="primary-small" onClick={openConvertDialog} type="button">转文档</button>
       </header>
 
       {task && <TaskBanner task={task} />}
@@ -517,7 +575,7 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
               onPointerDown={(event) => startLongPress(block.id, event)}
               onPointerMove={cancelLongPress}
             >
-              {block.type === "text" && <textarea onChange={(event) => handleTextInput(block, event.target.value)} placeholder="输入文字" value={block.props.content} />}
+              {block.type === "text" && <AutoResizeTextarea onChange={(event) => handleTextInput(block, event.target.value)} placeholder="输入文字" value={block.props.content} />}
               {block.type === "audio" && (
                 <div className="audio-block">
                   <AudioAsset assetId={block.props.asset_id} fallbackSrc={localAudioUrls[block.props.asset_id]} />
@@ -529,8 +587,7 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
               )}
               {block.type === "image" && (
                 <figure className="image-block">
-                  <AssetImage alt={block.props.caption || "手稿图片"} assetId={block.props.asset_id} />
-                  <figcaption>{block.props.caption || "图片"}</figcaption>
+                  <AssetImage alt="手稿图片原图" assetId={block.props.asset_id} fallbackSrc={localImageUrls[block.props.asset_id]} />
                 </figure>
               )}
               {block.type === "handwriting" && (
@@ -574,8 +631,34 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
           <button onClick={() => setMenu(null)} type="button">关闭</button>
         </div>
       )}
+
+      {convertDialogOpen && (
+        <div className="context-menu convert-dialog" style={{ left: 24, top: 96 }}>
+          <strong>转文档</strong>
+          <input onChange={(event) => setConvertTitle(event.target.value)} placeholder="文档标题" value={convertTitle} />
+          <label>
+            <input checked={optimizeAudio} onChange={(event) => setOptimizeAudio(event.target.checked)} type="checkbox" />
+            启用录音内容优化
+          </label>
+          <button onClick={() => convert("meeting_minutes")} type="button">开始转换</button>
+          <button onClick={() => setConvertDialogOpen(false)} type="button">取消</button>
+        </div>
+      )}
     </section>
   );
+}
+
+function AutoResizeTextarea({ onChange, placeholder, value }: { onChange: (event: ChangeEvent<HTMLTextAreaElement>) => void; placeholder: string; value: string }) {
+  const ref = useRef<HTMLTextAreaElement | null>(null);
+
+  useEffect(() => {
+    const node = ref.current;
+    if (!node) return;
+    node.style.height = "auto";
+    node.style.height = `${node.scrollHeight}px`;
+  }, [value]);
+
+  return <textarea onChange={onChange} placeholder={placeholder} ref={ref} rows={1} style={{ overflow: "hidden", resize: "none" }} value={value} />;
 }
 
 function PendingAudioBlock({ audio }: { audio: PendingAudio }) {
