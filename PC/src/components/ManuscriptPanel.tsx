@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type MouseEvent, type PointerEvent as ReactPointerEvent } from "react";
 import { Layer, Line, Rect, Stage } from "react-konva";
 import type { KonvaEventObject } from "konva/lib/Node";
-import { pcApi } from "../lib/api";
+import { pcApi, type AudioTranscription } from "../lib/api";
 import { useWorkspaceStore } from "../stores/workspaceStore";
 import type { ManuscriptBlock } from "../types/block";
 
@@ -10,6 +10,7 @@ type StrokePoint = { x: number; y: number; t: number; pressure: number };
 type Stroke = { id: string; tool: StrokeTool; color: string; width: number; points: StrokePoint[] };
 type HandwritingBlock = ManuscriptBlock & { type: "handwriting"; props: Record<string, unknown> & { strokes?: Stroke[] } };
 type TextBlock = ManuscriptBlock & { type: "text"; props: Record<string, unknown> & { content?: string } };
+type AudioBlock = ManuscriptBlock & { type: "audio"; props: Record<string, unknown> & { asset_id?: string; duration_ms?: number; transcript?: string; speaker_segments?: unknown[] } };
 type MenuState = { blockId: string | null; x: number; y: number; selectedStrokeIds: string[] } | null;
 type RenameDialogState = { manuscriptId: string; title: string };
 type UiPointEvent = MouseEvent<Element> | ReactPointerEvent<Element>;
@@ -206,8 +207,8 @@ export function ManuscriptPanel(): React.JSX.Element {
     try {
       const file = await window.meetingMate?.selectAudioFile();
       if (!file) return;
-      const text = await pcApi.transcribeAudio(file);
-      insertBlockRespectingSelection(createAudioBlock(text), afterBlockId);
+      const audio = await pcApi.transcribeAudio(file);
+      insertBlockRespectingSelection(createAudioBlock(audio), afterBlockId);
       setMenu(null);
     } catch (error) {
       window.alert(error instanceof Error ? error.message : String(error));
@@ -380,7 +381,7 @@ export function ManuscriptPanel(): React.JSX.Element {
             <div key={block.id}>
               <div className={activeBlockId === block.id ? "rounded-xl outline outline-1 outline-[#7c5c2f]" : "rounded-xl"} onContextMenu={(event) => showBlockMenu(block.id, event)} onPointerDown={(event) => startLongPress(block.id, event)} onPointerMove={cancelLongPress}>
                 {block.type === "text" && <textarea className="block min-h-24 w-full resize-none border-0 bg-transparent p-3 text-sm leading-7 text-[#2c2115] outline-none" onChange={(event) => handleTextInput(block as TextBlock, event.target.value)} placeholder="输入文字" value={String(block.props.content ?? "")} />}
-                {block.type === "audio" && <PaperCard label="Audio" text={String(block.props.transcript ?? block.summary)} />}
+                {block.type === "audio" && <AudioCard block={block as AudioBlock} />}
                 {block.type === "image" && <PaperCard label="Image" text={String(block.props.ocrText ?? block.summary)} />}
                 {block.type === "handwriting" && (
                   <HandwritingCanvas
@@ -453,6 +454,47 @@ function PaperCard({ label, text }: { label: string; text: string }): React.JSX.
     <div className="my-1 rounded-xl bg-white/75 p-3 text-sm leading-7 text-[#2c2115] shadow-sm">
       <span className="mb-1 block text-[11px] uppercase tracking-wide text-[#7c5c2f]">{label}</span>
       {text}
+    </div>
+  );
+}
+
+function AudioCard({ block }: { block: AudioBlock }): React.JSX.Element {
+  const assetId = typeof block.props.asset_id === "string" ? block.props.asset_id : "";
+  const transcript = String(block.props.transcript ?? block.summary ?? "");
+  const durationMs = typeof block.props.duration_ms === "number" ? block.props.duration_ms : 0;
+  const [src, setSrc] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setSrc(null);
+    setError(null);
+    if (!assetId) return;
+    let active = true;
+    let objectUrl: string | null = null;
+    pcApi
+      .getAssetObjectUrl(assetId)
+      .then((url) => {
+        objectUrl = url;
+        if (active) setSrc(url);
+        else URL.revokeObjectURL(url);
+      })
+      .catch((err) => {
+        if (active) setError(err instanceof Error ? err.message : "音频加载失败");
+      });
+    return () => {
+      active = false;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [assetId]);
+
+  return (
+    <div className="my-1 grid gap-3 rounded-xl bg-white/75 p-3 text-sm leading-7 text-[#2c2115] shadow-sm">
+      {src ? <audio className="w-full" controls preload="metadata" src={src} /> : <div className="rounded-lg bg-[#f8efe0] px-3 py-2 text-xs text-[#7c5c2f]">{assetId ? "音频加载中" : "音频资源缺失"}</div>}
+      <div>
+        <span className="mb-1 block text-[11px] uppercase tracking-wide text-[#7c5c2f]">Audio · {formatDuration(durationMs)}</span>
+        <p>{transcript || "录音已保存，ASR 完成后会写回转写文本。"}</p>
+        {error && <p className="mt-1 text-xs text-red-600">{error}</p>}
+      </div>
     </div>
   );
 }
@@ -626,7 +668,7 @@ function useResizeWidth(ref: React.RefObject<HTMLDivElement | null>, setWidth: (
 }
 
 function createTextBlock(content: string): TextBlock { return { id: makeId("block"), type: "text", title: content ? firstLine(content) : "文字", timestamp: "刚刚", summary: content, props: { content } }; }
-function createAudioBlock(transcript: string): ManuscriptBlock { return { id: makeId("block"), type: "audio", title: "录音", timestamp: "刚刚", summary: transcript, props: { transcript } }; }
+function createAudioBlock(audio: AudioTranscription): ManuscriptBlock { return { id: makeId("block"), type: "audio", title: "录音", timestamp: "刚刚", summary: audio.transcript, props: { asset_id: audio.assetId, duration_ms: audio.durationMs, transcript: audio.transcript, speaker_segments: audio.speakerSegments } }; }
 function createImageBlock(ocrText: string): ManuscriptBlock { return { id: makeId("block"), type: "image", title: "图片", timestamp: "刚刚", summary: ocrText, props: { ocrText } }; }
 function createHandwritingBlock(strokes: Stroke[]): HandwritingBlock { return { id: makeId("block"), type: "handwriting", title: "手写", timestamp: "刚刚", summary: "手写内容", props: { strokes, aiText: "" } }; }
 function touchBlock<T extends ManuscriptBlock>(block: T): T { return { ...block, timestamp: "刚刚" }; }
@@ -639,6 +681,7 @@ function getStrokeBounds(strokes: Stroke[]) { if (strokes.length === 0) return n
 function estimateStrokeHeight(strokes: Stroke[]) { if (strokes.length === 0) return 220; return Math.max(120, Math.ceil(Math.max(...strokes.flatMap((stroke) => stroke.points.map((point) => point.y))) + 44)); }
 function normalizeStrokesToTop(strokes: Stroke[]) { const minY = Math.min(...strokes.flatMap((stroke) => stroke.points.map((point) => point.y))); return strokes.map((stroke) => ({ ...stroke, points: stroke.points.map((point) => ({ ...point, y: Math.max(0, point.y - minY + 14) })) })); }
 function appendStrokesAtOffset(existing: Stroke[], incoming: Stroke[], offsetY: number) { return [...existing, ...incoming.map((stroke) => ({ ...stroke, points: stroke.points.map((point) => ({ ...point, y: point.y + offsetY })) }))]; }
+function formatDuration(ms: number) { const totalSeconds = Math.max(0, Math.round(ms / 1000)); const minutes = Math.floor(totalSeconds / 60); const seconds = String(totalSeconds % 60).padStart(2, "0"); return `${minutes}:${seconds}`; }
 function distance(a: StrokePoint, b: StrokePoint) { return Math.hypot(a.x - b.x, a.y - b.y); }
 function clamp(value: number, min: number, max: number) { return Math.min(max, Math.max(min, value)); }
 function makeId(prefix: string) { return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`; }
