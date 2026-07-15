@@ -392,13 +392,9 @@ export class AppDatabase {
 
 function manuscriptToDocumentBlocks(manuscript: StoredManuscript): unknown[] {
   const contentBlocks = manuscript.blocks
-    .map((block) => blockToDocumentText(block))
+    .map((block, index) => blockToDocumentBlock(block, index))
     .filter(Boolean)
-    .map((content, index) => ({
-      id: `converted-${index}`,
-      type: "paragraph",
-      content
-    }));
+    .map((block) => block as Record<string, unknown>);
 
   return [
     {
@@ -410,19 +406,43 @@ function manuscriptToDocumentBlocks(manuscript: StoredManuscript): unknown[] {
   ];
 }
 
-function blockToDocumentText(block: unknown): string {
+function blockToDocumentBlock(block: unknown, index: number): Record<string, unknown> | null {
   if (!block || typeof block !== "object") {
-    return "";
+    return null;
   }
 
   const record = block as Record<string, unknown>;
   const props = record.props && typeof record.props === "object" ? (record.props as Record<string, unknown>) : {};
 
+  if (record.type === "image") {
+    const content = readFirstString(props, ["caption", "ocrText", "content"]) || readFirstString(record, ["summary", "title"]);
+    return {
+      id: `converted-${index}`,
+      type: "image",
+      content,
+      props: {
+        asset_id: typeof props.asset_id === "string" ? props.asset_id : null,
+        caption: content,
+        width: typeof props.width === "number" ? props.width : null,
+        height: typeof props.height === "number" ? props.height : null,
+        url: typeof props.url === "string" ? props.url : null
+      }
+    };
+  }
+
   for (const key of ["content", "transcript", "aiText", "ocrText"]) {
     if (typeof props[key] === "string") {
-      return String(props[key]);
+      return { id: `converted-${index}`, type: "paragraph", content: String(props[key]) };
     }
   }
 
-  return [record.title, record.summary].filter((value) => typeof value === "string").join("\n");
+  const content = [record.title, record.summary].filter((value) => typeof value === "string").join("\n");
+  return content ? { id: `converted-${index}`, type: "paragraph", content } : null;
+}
+
+function readFirstString(record: Record<string, unknown>, keys: string[]): string {
+  for (const key of keys) {
+    if (typeof record[key] === "string") return String(record[key]);
+  }
+  return "";
 }

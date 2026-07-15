@@ -43,7 +43,22 @@ type Task = {
 type AssetUploadResponse = {
   asset_id: string;
   upload_id: string;
+  part_size_bytes: number;
   parts: Array<{ part_number: number; upload_url: string; headers?: Record<string, string> }>;
+};
+
+type Asset = {
+  id: string;
+  kind: "audio" | "image" | "export" | "attachment";
+  width?: number | null;
+  height?: number | null;
+};
+
+export type ImageRecognitionResult = {
+  assetId: string;
+  text: string;
+  width: number | null;
+  height: number | null;
 };
 
 export type SelectedFile = {
@@ -206,11 +221,11 @@ class PcApiClient {
   }
 
   async transcribeAudio(file: SelectedFile): Promise<string> {
-    const assetId = await this.createReadyAsset(file);
+    const asset = await this.createReadyAsset(file);
     const task = await this.request<Task>("/tasks/asr-audio", {
       method: "POST",
       idempotent: true,
-      body: JSON.stringify({ asset_id: assetId, language: "zh-CN", enable_diarization: true, client_id: this.clientId })
+      body: JSON.stringify({ asset_id: asset.id, language: "zh-CN", enable_diarization: true, client_id: this.clientId })
     });
     const completedTask = await this.waitForTask(task);
     const transcript = extractTranscript(completedTask.result);
@@ -218,9 +233,17 @@ class PcApiClient {
     throw new Error(`ASR 任务已完成，但服务器返回了空转写文本。请检查服务器 ASR 服务是否成功读取音频内容、音频格式是否受支持，以及 assets.content/part_contents 是否有实际文件内容。（task: ${completedTask.id}, result: ${JSON.stringify(completedTask.result ?? {})}）`);
   }
 
-  async recognizeImage(file: SelectedFile): Promise<string> {
-    await this.createReadyAsset(file);
-    throw new Error("服务器契约中尚未提供图片 OCR/VLM 识别接口，PC 端不会生成本地占位文本。请由服务器端补充图片识别 API 后接入。");
+  async recognizeImage(file: SelectedFile): Promise<ImageRecognitionResult> {
+    const asset = await this.createReadyAsset(file);
+    const task = await this.request<Task>("/tasks/recognize-image", {
+      method: "POST",
+      idempotent: true,
+      body: JSON.stringify({ asset_id: asset.id, client_id: this.clientId })
+    });
+    const completedTask = await this.waitForTask(task, "图片识别任务超时未返回文本");
+    const text = extractImageText(completedTask.result);
+    if (text) return { assetId: asset.id, text, width: asset.width ?? null, height: asset.height ?? null };
+    throw new Error(`图片识别任务已完成，但服务器返回了空文本。（task: ${completedTask.id}, result: ${JSON.stringify(completedTask.result ?? {})}）`);
   }
 
   async runP0SmokeTest(): Promise<string[]> {
@@ -263,7 +286,7 @@ class PcApiClient {
     return lines;
   }
 
-  private async createReadyAsset(file: SelectedFile): Promise<string> {
+  private async createReadyAsset(file: SelectedFile): Promise<Asset> {
     const upload = await this.request<AssetUploadResponse>("/assets/upload", {
       method: "POST",
       idempotent: true,
@@ -277,9 +300,12 @@ class PcApiClient {
       })
     });
 
-    if (!window.meetingMate?.uploadFileParts) throw new Error("文件上传接口不可用");
-    const uploaded = await window.meetingMate.uploadFileParts({
+    if (!window.meetingMate?.uploadAssetParts) throw new Error("文件上传接口不可用");
+    const uploaded = await window.meetingMate.uploadAssetParts({
       path: file.path,
+      assetId: upload.asset_id,
+      uploadId: upload.upload_id,
+      partSizeBytes: upload.part_size_bytes,
       parts: upload.parts.map((part) => ({
         partNumber: part.part_number,
         uploadUrl: toAbsoluteUploadUrl(part.upload_url),
@@ -287,7 +313,7 @@ class PcApiClient {
       }))
     });
 
-    await this.request(`/assets/${upload.asset_id}/complete`, {
+    return this.request<Asset>(`/assets/${upload.asset_id}/complete`, {
       method: "POST",
       idempotent: true,
       body: JSON.stringify({
@@ -300,11 +326,9 @@ class PcApiClient {
         height: null
       })
     });
-
-    return upload.asset_id;
   }
 
-  private async waitForTask(task: Task): Promise<Task> {
+  private async waitForTask(task: Task, timeoutMessage = "服务器已接收音频，但 ASR 任务超时未返回文本"): Promise<Task> {
     let current = task;
     for (let attempt = 0; attempt < 30; attempt += 1) {
       if (current.status === "succeeded") return current;
@@ -313,7 +337,7 @@ class PcApiClient {
       await sleep(2000);
       current = await this.request<Task>(`/tasks/${current.id}`);
     }
-    throw new Error(`服务器已接收音频，但 ASR 任务超时未返回文本（task: ${current.id}, status: ${current.status}）`);
+    throw new Error(`${timeoutMessage}（task: ${current.id}, status: ${current.status}）`);
   }
 
   private async authenticate(path: string, body: unknown, persistSession: boolean): Promise<Session> {
@@ -418,6 +442,17 @@ function toManuscriptBlock(block: Record<string, unknown>): ManuscriptBlock {
 
 function toDocumentBlock(block: Record<string, unknown>): DocumentBlock {
   const props = isRecord(block.props) ? block.props : {};
+  if (block.type === "image") {
+    return {
+      id: String(block.id),
+      type: "image",
+      revision: toNumber(block.revision),
+      createdAt: String(block.created_at ?? ""),
+      updatedAt: String(block.updated_at ?? ""),
+      content: String(props.caption ?? props.ocrText ?? props.content ?? ""),
+      props
+    };
+  }
   const type = block.type === "heading" || block.type === "list" || block.type === "quote" ? block.type : "paragraph";
   const content = type === "list" && Array.isArray(props.items) ? props.items.map(String).join("\n") : String(props.content ?? "");
   return {
@@ -446,6 +481,7 @@ function toRemoteDocumentBlock(block: DocumentBlock, authorId: string, clientId:
   if (block.type === "heading") return { ...base, type: "heading", props: { level: 1, content: block.content } };
   if (block.type === "list") return { ...base, type: "list", props: { style: "bullet", items: block.items?.length ? block.items : block.content.split("\n").filter(Boolean) } };
   if (block.type === "quote") return { ...base, type: "quote", props: { content: block.content } };
+  if (block.type === "image") return { ...base, type: "image", props: { asset_id: block.props?.asset_id ?? null, caption: String(block.props?.caption ?? block.content), width: nullableNumber(block.props?.width), height: nullableNumber(block.props?.height) } };
   return { ...base, type: "paragraph", props: { content: block.content } };
 }
 
@@ -496,6 +532,22 @@ function extractTranscript(result: Record<string, unknown> | null): string {
       .join("\n");
   }
   return "";
+}
+
+function extractImageText(result: Record<string, unknown> | null): string {
+  if (!result) return "";
+  const candidates = [
+    result.caption,
+    result.text,
+    result.content,
+    result.ocr_text,
+    result.description,
+    isRecord(result.image) ? result.image.caption ?? result.image.text ?? result.image.ocr_text : undefined,
+    isRecord(result.data) ? result.data.caption ?? result.data.text ?? result.data.ocr_text : undefined,
+    isRecord(result.result) ? result.result.caption ?? result.result.text ?? result.result.ocr_text : undefined
+  ];
+  const direct = candidates.find((value): value is string => typeof value === "string" && value.trim().length > 0);
+  return direct ? direct.trim() : "";
 }
 
 function sleep(ms: number): Promise<void> {

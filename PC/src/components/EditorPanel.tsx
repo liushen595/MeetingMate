@@ -10,7 +10,8 @@ type SlateText = {
 };
 
 type SlateBlock = {
-  type: "heading" | "paragraph" | "list" | "quote" | "action";
+  type: "heading" | "paragraph" | "list" | "quote" | "action" | "image";
+  props?: Record<string, unknown>;
   children: SlateText[];
 };
 
@@ -153,6 +154,19 @@ function Element({ attributes, children, element }: RenderElementProps): React.J
     );
   }
 
+  if (element.type === "image") {
+    const caption = element.children.map((child) => child.text).join("");
+    const assetId = typeof element.props?.asset_id === "string" ? element.props.asset_id : "";
+    return (
+      <figure className="my-5 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm" {...attributes}>
+        <div contentEditable={false} className="rounded-xl border border-dashed border-slate-200 bg-slate-50 px-4 py-8 text-center text-sm text-slate-500">
+          图片{assetId ? `：${assetId}` : ""}
+        </div>
+        <figcaption className="mt-3 text-sm leading-7 text-slate-600">{children || caption}</figcaption>
+      </figure>
+    );
+  }
+
   return (
     <p className="my-4 leading-8 text-slate-700" {...attributes}>
       {children}
@@ -175,6 +189,7 @@ function blocksToSlateValue(blocks: DocumentBlock[]): Descendant[] {
 
     return {
       type: block.type,
+      props: block.props,
       children: [{ text: block.content }]
     };
   });
@@ -194,6 +209,15 @@ function slateValueToBlocks(value: Descendant[]): DocumentBlock[] {
         type: "list",
         content: lines.find((line) => !line.startsWith("- ")) ?? "列表",
         items
+      };
+    }
+
+    if (element.type === "image") {
+      return {
+        id: `slate-${index}`,
+        type: "image",
+        content,
+        props: { ...element.props, caption: content }
       };
     }
 

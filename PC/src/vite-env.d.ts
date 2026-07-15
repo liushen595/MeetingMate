@@ -27,8 +27,11 @@ interface Window {
     exportManuscriptToDocument: (id: string) => Promise<import("./types/document").Document>;
     selectAudioFile: () => Promise<import("./lib/api").SelectedFile | null>;
     selectImageFile: () => Promise<import("./lib/api").SelectedFile | null>;
-    uploadFileParts: (input: {
+    uploadAssetParts: (input: {
       path: string;
+      assetId: string;
+      uploadId: string;
+      partSizeBytes: number;
       parts: Array<{ partNumber: number; uploadUrl: string; headers?: Record<string, string> }>;
     }) => Promise<{ ok: boolean; parts: Array<{ part_number: number; etag: string; size_bytes: number }> }>;
   };

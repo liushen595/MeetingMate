@@ -218,8 +218,8 @@ export function ManuscriptPanel(): React.JSX.Element {
     try {
       const file = await window.meetingMate?.selectImageFile();
       if (!file) return;
-      const text = await pcApi.recognizeImage(file);
-      insertBlockRespectingSelection(createImageBlock(text), afterBlockId);
+      const result = await pcApi.recognizeImage(file);
+      insertBlockRespectingSelection(createImageBlock(result), afterBlockId);
       setMenu(null);
     } catch (error) {
       window.alert(error instanceof Error ? error.message : String(error));
@@ -254,6 +254,10 @@ export function ManuscriptPanel(): React.JSX.Element {
   }
 
   function handleTextInput(block: TextBlock, content: string) {
+    if (content.length === 0) {
+      deleteManuscriptBlock(block.id);
+      return;
+    }
     applyBlock(touchBlock({ ...block, summary: content, props: { ...block.props, content } }));
   }
 
@@ -627,7 +631,7 @@ function useResizeWidth(ref: React.RefObject<HTMLDivElement | null>, setWidth: (
 
 function createTextBlock(content: string): TextBlock { return { id: makeId("block"), type: "text", title: content ? firstLine(content) : "文字", timestamp: "刚刚", summary: content, props: { content } }; }
 function createAudioBlock(transcript: string): ManuscriptBlock { return { id: makeId("block"), type: "audio", title: "录音", timestamp: "刚刚", summary: transcript, props: { transcript } }; }
-function createImageBlock(ocrText: string): ManuscriptBlock { return { id: makeId("block"), type: "image", title: "图片", timestamp: "刚刚", summary: ocrText, props: { ocrText } }; }
+function createImageBlock(result: { assetId: string; text: string; width: number | null; height: number | null }): ManuscriptBlock { return { id: makeId("block"), type: "image", title: "图片", timestamp: "刚刚", summary: result.text, props: { asset_id: result.assetId, caption: result.text, ocrText: result.text, width: result.width, height: result.height } }; }
 function createHandwritingBlock(strokes: Stroke[]): HandwritingBlock { return { id: makeId("block"), type: "handwriting", title: "手写", timestamp: "刚刚", summary: "手写内容", props: { strokes, aiText: "" } }; }
 function touchBlock<T extends ManuscriptBlock>(block: T): T { return { ...block, timestamp: "刚刚" }; }
 function insertAfter(blocks: ManuscriptBlock[], next: ManuscriptBlock, afterBlockId: string | null) { if (!afterBlockId) return [...blocks, next]; const index = blocks.findIndex((block) => block.id === afterBlockId); return index === -1 ? [...blocks, next] : [...blocks.slice(0, index + 1), next, ...blocks.slice(index + 1)]; }

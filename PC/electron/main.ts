@@ -115,11 +115,15 @@ app.whenReady().then(() => {
     return getSelectedFile(result.filePaths[0], "image");
   });
 
-  ipcMain.handle("files:upload-parts", async (_event, input: { path: string; parts: Array<{ partNumber: number; uploadUrl: string; headers?: Record<string, string> }> }) => {
+  ipcMain.handle("files:upload-asset-parts", async (_event, input: { path: string; assetId: string; uploadId: string; partSizeBytes: number; parts: Array<{ partNumber: number; uploadUrl: string; headers?: Record<string, string> }> }) => {
     const content = readFileSync(input.path);
     const uploadedParts: Array<{ part_number: number; etag: string; size_bytes: number }> = [];
     for (const part of input.parts) {
-      const response = await fetch(part.uploadUrl, { method: "PUT", headers: part.headers, body: content });
+      const url = parseBackendUploadUrl(part.uploadUrl, input.assetId, part.partNumber);
+      const start = (part.partNumber - 1) * input.partSizeBytes;
+      const end = Math.min(content.byteLength, start + input.partSizeBytes);
+      const body = content.subarray(start, end);
+      const response = await fetch(url, { method: "PUT", headers: part.headers, body });
       if (!response.ok) {
         throw new Error(`Upload part ${part.partNumber} failed: ${response.status} ${response.statusText}`);
       }
@@ -128,7 +132,7 @@ app.whenReady().then(() => {
       uploadedParts.push({
         part_number: part.partNumber,
         etag: String(getResponseValue(responseJson, "etag") ?? response.headers.get("etag") ?? `part-${part.partNumber}`),
-        size_bytes: Number(getResponseValue(responseJson, "size_bytes") ?? content.byteLength)
+        size_bytes: Number(getResponseValue(responseJson, "size_bytes") ?? body.byteLength)
       });
     }
     return { ok: true, parts: uploadedParts };
@@ -176,6 +180,18 @@ function getContentType(extension: string, kind: "audio" | "image"): string {
   if (extension === ".png") return "image/png";
   if (extension === ".bmp") return "image/bmp";
   return kind === "audio" ? "application/octet-stream" : "image/webp";
+}
+
+function parseBackendUploadUrl(uploadUrl: string, assetId: string, partNumber: number): string {
+  const url = new URL(uploadUrl);
+  const expectedPath = `/assets/${assetId}/upload-parts/${partNumber}`;
+  if (!url.pathname.endsWith(expectedPath)) {
+    throw new Error("后端对象存储已弃用，PC 端只支持后端 API 上传代理 URL。");
+  }
+  if (!url.searchParams.get("upload_id") || !url.searchParams.get("expires_at") || !url.searchParams.get("signature")) {
+    throw new Error("后端上传代理 URL 缺少 upload_id、expires_at 或 signature。");
+  }
+  return url.toString();
 }
 
 function safeJsonParse(value: string): unknown {
