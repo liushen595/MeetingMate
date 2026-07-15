@@ -68,9 +68,9 @@ export default function App() {
       openAccount: () => navigate("/account"),
       openManuscript: (id: string) => navigate(`/manuscripts/${id}`),
       openDocument: (id: string) => navigate(`/documents/${id}`),
-      async createManuscript() {
-        const title = new Intl.DateTimeFormat("zh-CN", { month: "long", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(new Date());
-        const manuscript = await api.createManuscript(`${title} 手稿`);
+      async createManuscript(title?: string) {
+        const defaultTitle = new Intl.DateTimeFormat("zh-CN", { month: "long", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(new Date());
+        const manuscript = await api.createManuscript(title?.trim() || `${defaultTitle} 手稿`);
         await refreshLibrary();
         navigate(`/manuscripts/${manuscript.id}`);
       },
@@ -82,6 +82,13 @@ export default function App() {
     }),
     [refreshLibrary],
   );
+
+  function handleLogout() {
+    setSession(null);
+    setManuscripts([]);
+    setDocuments([]);
+    navigate("/home");
+  }
 
   if (!session) {
     return <AuthScreen onAuthed={(next) => setSession(next)} />;
@@ -120,7 +127,7 @@ export default function App() {
             onRefresh={refreshLibrary}
           />
         )}
-        {route.screen === "account" && <AccountPage onLogout={() => setSession(null)} onRefresh={refreshLibrary} user={session.user} />}
+        {route.screen === "account" && <AccountPage onLogout={handleLogout} onRefresh={refreshLibrary} user={session.user} />}
         {route.screen === "manuscript" && <ManuscriptEditor id={route.id} onBack={actions.openLibrary} onOpenDocument={actions.openDocument} />}
         {route.screen === "document" && <DocumentEditor id={route.id} onBack={actions.openLibrary} />}
       </main>
