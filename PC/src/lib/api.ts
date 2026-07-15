@@ -44,7 +44,11 @@ type AssetUploadResponse = {
   asset_id: string;
   upload_id: string;
   part_size_bytes: number;
-  parts: Array<{ part_number: number; upload_url: string; headers?: Record<string, string> }>;
+  parts: Array<{
+    part_number: number;
+    upload_url: string;
+    headers?: Record<string, string>;
+  }>;
 };
 
 type Asset = {
@@ -70,6 +74,13 @@ export type SelectedFile = {
   checksumSha256: string;
 };
 
+export type AudioTranscription = {
+  assetId: string;
+  durationMs: number;
+  transcript: string;
+  speakerSegments: unknown[];
+};
+
 const SESSION_KEY = "meetingmate.session";
 const API_BASE_URL = "http://10.90.130.14:8000/api/v1";
 
@@ -86,19 +97,33 @@ class PcApiClient {
     return API_BASE_URL;
   }
 
-  async register(input: { email: string; password: string; name: string }, persistSession = true): Promise<Session> {
-    return this.authenticate("/auth/register", { ...input, device: this.devicePayload() }, persistSession);
+  async register(
+    input: { email: string; password: string; name: string },
+    persistSession = true,
+  ): Promise<Session> {
+    return this.authenticate(
+      "/auth/register",
+      { ...input, device: this.devicePayload() },
+      persistSession,
+    );
   }
 
   async login(input: { email: string; password: string }): Promise<Session> {
-    return this.authenticate("/auth/login", { ...input, device: this.devicePayload() }, true);
+    return this.authenticate(
+      "/auth/login",
+      { ...input, device: this.devicePayload() },
+      true,
+    );
   }
 
   async logout(): Promise<void> {
     if (!this.session) return;
     await this.request<void>("/auth/logout", {
       method: "POST",
-      body: JSON.stringify({ client_id: this.clientId, refresh_token: this.session.refresh_token })
+      body: JSON.stringify({
+        client_id: this.clientId,
+        refresh_token: this.session.refresh_token,
+      }),
     });
     this.setSession(null);
   }
@@ -107,14 +132,21 @@ class PcApiClient {
     this.setSession(null);
   }
 
-  async loadWorkspace(): Promise<{ documents: Document[]; manuscripts: Manuscript[] }> {
+  async loadWorkspace(): Promise<{
+    documents: Document[];
+    manuscripts: Manuscript[];
+  }> {
     const [manuscriptRes, documentRes] = await Promise.all([
       this.request<PagedResponse<{ id: string }>>("/manuscripts?limit=50"),
-      this.request<PagedResponse<{ id: string }>>("/documents?limit=50")
+      this.request<PagedResponse<{ id: string }>>("/documents?limit=50"),
     ]);
 
-    const manuscripts = await Promise.all(manuscriptRes.items.map((item) => this.getManuscript(item.id)));
-    const documents = await Promise.all(documentRes.items.map((item) => this.getDocument(item.id)));
+    const manuscripts = await Promise.all(
+      manuscriptRes.items.map((item) => this.getManuscript(item.id)),
+    );
+    const documents = await Promise.all(
+      documentRes.items.map((item) => this.getDocument(item.id)),
+    );
 
     return { documents, manuscripts };
   }
@@ -123,13 +155,18 @@ class PcApiClient {
     const remote = await this.request<RemoteManuscript>("/manuscripts", {
       method: "POST",
       idempotent: true,
-      body: JSON.stringify({ title, client_id: this.clientId, initial_blocks: [] })
+      body: JSON.stringify({
+        title,
+        client_id: this.clientId,
+        initial_blocks: [],
+      }),
     });
     return toManuscript(remote);
   }
 
   async saveManuscript(manuscript: Manuscript): Promise<Manuscript> {
-    if (typeof manuscript.revision !== "number") throw new Error("远端手稿缺少 revision，无法同步");
+    if (typeof manuscript.revision !== "number")
+      throw new Error("远端手稿缺少 revision，无法同步");
     await this.request(`/manuscripts/${manuscript.id}/blocks`, {
       method: "PUT",
       idempotent: true,
@@ -139,32 +176,47 @@ class PcApiClient {
         operations: manuscript.blocks.map((block, index) => ({
           op_id: `op_${crypto.randomUUID()}`,
           type: "upsert_block",
-          block: toRemoteManuscriptBlock(block, this.sessionUserId(), this.clientId, this.platform),
+          block: toRemoteManuscriptBlock(
+            block,
+            this.sessionUserId(),
+            this.clientId,
+            this.platform,
+          ),
           block_id: null,
           before_block_id: null,
-          after_block_id: index > 0 ? manuscript.blocks[index - 1]?.id ?? null : null,
-          created_at: new Date().toISOString()
-        }))
-      })
+          after_block_id:
+            index > 0 ? (manuscript.blocks[index - 1]?.id ?? null) : null,
+          created_at: new Date().toISOString(),
+        })),
+      }),
     });
     return this.getManuscript(manuscript.id);
   }
 
   async getManuscript(id: string): Promise<Manuscript> {
-    return toManuscript(await this.request<RemoteManuscript>(`/manuscripts/${id}`));
+    return toManuscript(
+      await this.request<RemoteManuscript>(`/manuscripts/${id}`),
+    );
   }
 
   async createDocument(title: string): Promise<Document> {
     const remote = await this.request<RemoteDocument>("/documents", {
       method: "POST",
       idempotent: true,
-      body: JSON.stringify({ title, client_id: this.clientId, source_manuscript_ids: [], derived_from: null, initial_blocks: [] })
+      body: JSON.stringify({
+        title,
+        client_id: this.clientId,
+        source_manuscript_ids: [],
+        derived_from: null,
+        initial_blocks: [],
+      }),
     });
     return toDocument(remote);
   }
 
   async saveDocument(document: Document): Promise<Document> {
-    if (typeof document.revision !== "number") throw new Error("远端文档缺少 revision，无法同步");
+    if (typeof document.revision !== "number")
+      throw new Error("远端文档缺少 revision，无法同步");
     await this.request(`/documents/${document.id}/blocks`, {
       method: "PUT",
       idempotent: true,
@@ -174,13 +226,19 @@ class PcApiClient {
         operations: document.blocks.map((block, index) => ({
           op_id: `op_${crypto.randomUUID()}`,
           type: "upsert_block",
-          block: toRemoteDocumentBlock(block, this.sessionUserId(), this.clientId, this.platform),
+          block: toRemoteDocumentBlock(
+            block,
+            this.sessionUserId(),
+            this.clientId,
+            this.platform,
+          ),
           block_id: null,
           before_block_id: null,
-          after_block_id: index > 0 ? document.blocks[index - 1]?.id ?? null : null,
-          created_at: new Date().toISOString()
-        }))
-      })
+          after_block_id:
+            index > 0 ? (document.blocks[index - 1]?.id ?? null) : null,
+          created_at: new Date().toISOString(),
+        })),
+      }),
     });
     return this.getDocument(document.id);
   }
@@ -201,36 +259,80 @@ class PcApiClient {
     const task = await this.request<Task>("/tasks/convert-manuscript", {
       method: "POST",
       idempotent: true,
-      body: JSON.stringify({ manuscript_id: id, mode: "meeting_minutes", title, client_id: this.clientId })
+      body: JSON.stringify({
+        manuscript_id: id,
+        mode: "meeting_minutes",
+        title,
+        client_id: this.clientId,
+      }),
     });
     const documentId = task.result?.document_id;
-    if (typeof documentId !== "string") throw new Error("转换任务未返回 document_id");
+    if (typeof documentId !== "string")
+      throw new Error("转换任务未返回 document_id");
     return this.getDocument(documentId);
   }
 
-  async exportDocument(documentId: string, format: "pdf" | "docx" = "pdf"): Promise<string> {
+  async exportDocument(
+    documentId: string,
+    format: "pdf" | "docx" = "pdf",
+  ): Promise<string> {
     const task = await this.request<Task>("/exports", {
       method: "POST",
       idempotent: true,
-      body: JSON.stringify({ document_id: documentId, format, client_id: this.clientId })
+      body: JSON.stringify({
+        document_id: documentId,
+        format,
+        client_id: this.clientId,
+      }),
     });
     const exportId = task.result?.export_id;
-    if (typeof exportId !== "string") throw new Error("导出任务未返回 export_id");
-    const download = await this.request<{ download_url: string }>(`/exports/${exportId}/download`);
+    if (typeof exportId !== "string")
+      throw new Error("导出任务未返回 export_id");
+    const download = await this.request<{ download_url: string }>(
+      `/exports/${exportId}/download`,
+    );
     return download.download_url;
   }
 
-  async transcribeAudio(file: SelectedFile): Promise<string> {
-    const asset = await this.createReadyAsset(file);
+  async transcribeAudio(file: SelectedFile): Promise<AudioTranscription> {
+    const assetId = await this.createReadyAsset(file);
     const task = await this.request<Task>("/tasks/asr-audio", {
       method: "POST",
       idempotent: true,
-      body: JSON.stringify({ asset_id: asset.id, language: "zh-CN", enable_diarization: true, client_id: this.clientId })
+      body: JSON.stringify({
+        asset_id: asset.id,
+        language: "zh-CN",
+        enable_diarization: true,
+        client_id: this.clientId,
+      }),
     });
     const completedTask = await this.waitForTask(task);
     const transcript = extractTranscript(completedTask.result);
-    if (transcript) return transcript;
-    throw new Error(`ASR 任务已完成，但服务器返回了空转写文本。请检查服务器 ASR 服务是否成功读取音频内容、音频格式是否受支持，以及 assets.content/part_contents 是否有实际文件内容。（task: ${completedTask.id}, result: ${JSON.stringify(completedTask.result ?? {})}）`);
+    if (transcript)
+      return {
+        assetId,
+        durationMs: 0,
+        transcript,
+        speakerSegments: extractSpeakerSegments(completedTask.result),
+      };
+    throw new Error(
+      `ASR 任务已完成，但服务器返回了空转写文本。请检查服务器 ASR 服务是否成功读取音频内容、音频格式是否受支持，以及 assets.content/part_contents 是否有实际文件内容。（task: ${completedTask.id}, result: ${JSON.stringify(completedTask.result ?? {})}）`,
+    );
+  }
+
+  async getAssetObjectUrl(assetId: string): Promise<string> {
+    if (!this.session) throw new Error("请先登录服务器");
+    const headers = new Headers();
+    headers.set("X-Client-Id", this.clientId);
+    headers.set("Authorization", `Bearer ${this.session.access_token}`);
+    const response = await fetch(`${API_BASE_URL}/assets/${assetId}/stream`, {
+      headers,
+    });
+    if (!response.ok)
+      throw new Error(
+        `音频加载失败：${response.status} ${response.statusText}`,
+      );
+    return URL.createObjectURL(await response.blob());
   }
 
   async recognizeImage(file: SelectedFile): Promise<ImageRecognitionResult> {
@@ -238,45 +340,89 @@ class PcApiClient {
     const task = await this.request<Task>("/tasks/recognize-image", {
       method: "POST",
       idempotent: true,
-      body: JSON.stringify({ asset_id: asset.id, client_id: this.clientId })
+      body: JSON.stringify({ asset_id: asset.id, client_id: this.clientId }),
     });
-    const completedTask = await this.waitForTask(task, "图片识别任务超时未返回文本");
+    const completedTask = await this.waitForTask(
+      task,
+      "图片识别任务超时未返回文本",
+    );
     const text = extractImageText(completedTask.result);
-    if (text) return { assetId: asset.id, text, width: asset.width ?? null, height: asset.height ?? null };
-    throw new Error(`图片识别任务已完成，但服务器返回了空文本。（task: ${completedTask.id}, result: ${JSON.stringify(completedTask.result ?? {})}）`);
+    if (text)
+      return {
+        assetId: asset.id,
+        text,
+        width: asset.width ?? null,
+        height: asset.height ?? null,
+      };
+    throw new Error(
+      `图片识别任务已完成，但服务器返回了空文本。（task: ${completedTask.id}, result: ${JSON.stringify(completedTask.result ?? {})}）`,
+    );
   }
 
   async runP0SmokeTest(): Promise<string[]> {
     const lines: string[] = [];
     const previousSession = this.session;
     const suffix = Date.now();
-    const session = await this.register({ email: `pc-smoke-${suffix}@example.com`, password: "secret", name: "PC Smoke" });
+    const session = await this.register({
+      email: `pc-smoke-${suffix}@example.com`,
+      password: "secret",
+      name: "PC Smoke",
+    });
     lines.push(`注册成功：${session.user.email}`);
 
     const upload = await this.request<AssetUploadResponse>("/assets/upload", {
       method: "POST",
       idempotent: true,
-      body: JSON.stringify({ kind: "audio", filename: "meeting.m4a", content_type: "audio/mp4", size_bytes: 10, checksum_sha256: "abc", part_size_bytes: 10 })
+      body: JSON.stringify({
+        kind: "audio",
+        filename: "meeting.m4a",
+        content_type: "audio/mp4",
+        size_bytes: 10,
+        checksum_sha256: "abc",
+        part_size_bytes: 10,
+      }),
     });
     lines.push(`创建 Asset 上传：${upload.asset_id}`);
 
     await this.request(`/assets/${upload.asset_id}/complete`, {
       method: "POST",
       idempotent: true,
-      body: JSON.stringify({ upload_id: upload.upload_id, size_bytes: 10, checksum_sha256: "abc", parts: [{ part_number: 1, etag: "etag", size_bytes: 10 }], duration_ms: 1000, width: null, height: null })
+      body: JSON.stringify({
+        upload_id: upload.upload_id,
+        size_bytes: 10,
+        checksum_sha256: "abc",
+        parts: [{ part_number: 1, etag: "etag", size_bytes: 10 }],
+        duration_ms: 1000,
+        width: null,
+        height: null,
+      }),
     });
     lines.push("完成 Asset 上传：ready");
 
     const manuscript = await this.createManuscript("PC API Smoke Manuscript");
     lines.push(`创建手稿：${manuscript.id}`);
 
-    const savedManuscript = await this.saveManuscript({ ...manuscript, blocks: [createSmokeTextBlock()] });
+    const savedManuscript = await this.saveManuscript({
+      ...manuscript,
+      blocks: [createSmokeTextBlock()],
+    });
     lines.push(`同步手稿 Block：revision ${savedManuscript.revision}`);
 
-    const document = await this.convertManuscript(savedManuscript.id, "PC API Smoke Document");
+    const document = await this.convertManuscript(
+      savedManuscript.id,
+      "PC API Smoke Document",
+    );
     lines.push(`手稿转文档：${document.id}`);
 
-    const savedDocument = await this.saveDocument({ ...document, blocks: [{ ...document.blocks[0], content: `${document.blocks[0]?.content ?? ""}\nEdited from PC smoke test.` }] });
+    const savedDocument = await this.saveDocument({
+      ...document,
+      blocks: [
+        {
+          ...document.blocks[0],
+          content: `${document.blocks[0]?.content ?? ""}\nEdited from PC smoke test.`,
+        },
+      ],
+    });
     lines.push(`同步文档 Block：revision ${savedDocument.revision}`);
 
     const downloadUrl = await this.exportDocument(savedDocument.id);
@@ -296,11 +442,12 @@ class PcApiClient {
         content_type: file.contentType,
         size_bytes: file.sizeBytes,
         checksum_sha256: file.checksumSha256,
-        part_size_bytes: Math.max(file.sizeBytes, 1)
-      })
+        part_size_bytes: Math.max(file.sizeBytes, 1),
+      }),
     });
 
-    if (!window.meetingMate?.uploadAssetParts) throw new Error("文件上传接口不可用");
+    if (!window.meetingMate?.uploadAssetParts)
+      throw new Error("文件上传接口不可用");
     const uploaded = await window.meetingMate.uploadAssetParts({
       path: file.path,
       assetId: upload.asset_id,
@@ -309,8 +456,8 @@ class PcApiClient {
       parts: upload.parts.map((part) => ({
         partNumber: part.part_number,
         uploadUrl: toAbsoluteUploadUrl(part.upload_url),
-        headers: part.headers
-      }))
+        headers: part.headers,
+      })),
     });
 
     return this.request<Asset>(`/assets/${upload.asset_id}/complete`, {
@@ -323,50 +470,78 @@ class PcApiClient {
         parts: uploaded.parts,
         duration_ms: file.kind === "audio" ? 0 : null,
         width: null,
-        height: null
-      })
+        height: null,
+      }),
     });
   }
 
-  private async waitForTask(task: Task, timeoutMessage = "服务器已接收音频，但 ASR 任务超时未返回文本"): Promise<Task> {
+  private async waitForTask(
+    task: Task,
+    timeoutMessage = "服务器已接收音频，但 ASR 任务超时未返回文本",
+  ): Promise<Task> {
     let current = task;
     for (let attempt = 0; attempt < 30; attempt += 1) {
       if (current.status === "succeeded") return current;
-      if (current.status === "failed") throw new Error(current.error?.message ?? `任务执行失败（task: ${current.id}）`);
-      if (current.status === "cancelled") throw new Error(`任务已取消（task: ${current.id}）`);
+      if (current.status === "failed")
+        throw new Error(
+          current.error?.message ?? `任务执行失败（task: ${current.id}）`,
+        );
+      if (current.status === "cancelled")
+        throw new Error(`任务已取消（task: ${current.id}）`);
       await sleep(2000);
       current = await this.request<Task>(`/tasks/${current.id}`);
     }
-    throw new Error(`${timeoutMessage}（task: ${current.id}, status: ${current.status}）`);
+    throw new Error(
+      `${timeoutMessage}（task: ${current.id}, status: ${current.status}）`,
+    );
   }
 
-  private async authenticate(path: string, body: unknown, persistSession: boolean): Promise<Session> {
+  private async authenticate(
+    path: string,
+    body: unknown,
+    persistSession: boolean,
+  ): Promise<Session> {
     const response = await fetch(`${API_BASE_URL}${path}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json; charset=utf-8", "X-Request-Id": crypto.randomUUID() },
-      body: JSON.stringify(body)
+      headers: {
+        "Content-Type": "application/json; charset=utf-8",
+        "X-Request-Id": crypto.randomUUID(),
+      },
+      body: JSON.stringify(body),
     });
     const session = await parseResponse<Session>(response);
     if (persistSession) this.setSession(session);
     return session;
   }
 
-  private async request<T>(path: string, options: (RequestInit & { idempotent?: boolean }) = {}): Promise<T> {
+  private async request<T>(
+    path: string,
+    options: RequestInit & { idempotent?: boolean } = {},
+  ): Promise<T> {
     if (!this.session) throw new Error("请先登录服务器");
 
     const headers = new Headers(options.headers);
-    if (options.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json; charset=utf-8");
+    if (options.body && !headers.has("Content-Type"))
+      headers.set("Content-Type", "application/json; charset=utf-8");
     headers.set("X-Client-Id", this.clientId);
     headers.set("X-Request-Id", crypto.randomUUID());
     if (options.idempotent) headers.set("Idempotency-Key", crypto.randomUUID());
     headers.set("Authorization", `Bearer ${this.session.access_token}`);
 
-    const response = await fetch(`${API_BASE_URL}${path}`, { ...options, headers });
+    const response = await fetch(`${API_BASE_URL}${path}`, {
+      ...options,
+      headers,
+    });
     return parseResponse<T>(response);
   }
 
   private devicePayload() {
-    return { client_id: this.clientId, platform: this.platform, app_version: "0.1.0", name: "MeetingMate PC" };
+    return {
+      client_id: this.clientId,
+      platform: this.platform,
+      app_version: "0.1.0",
+      name: "MeetingMate PC",
+    };
   }
 
   private sessionUserId(): string {
@@ -396,7 +571,8 @@ async function parseResponse<T>(response: Response): Promise<T> {
   if (response.status === 204) return undefined as T;
   const text = await response.text();
   const json = text ? JSON.parse(text) : null;
-  if (!response.ok) throw new Error(json?.error?.message ?? response.statusText);
+  if (!response.ok)
+    throw new Error(json?.error?.message ?? response.statusText);
   return json as T;
 }
 
@@ -408,7 +584,9 @@ function toManuscript(remote: RemoteManuscript): Manuscript {
     createdAt: remote.created_at,
     updatedAt: remote.updated_at,
     source: "desktop",
-    blocks: remote.blocks.filter((block) => block.deleted !== true).map(toManuscriptBlock)
+    blocks: remote.blocks
+      .filter((block) => block.deleted !== true)
+      .map(toManuscriptBlock),
   };
 }
 
@@ -420,23 +598,38 @@ function toDocument(remote: RemoteDocument): Document {
     title: remote.title,
     status: "synced",
     updatedAt: remote.updated_at,
-    blocks: remote.blocks.filter((block) => block.deleted !== true).map(toDocumentBlock)
+    blocks: remote.blocks
+      .filter((block) => block.deleted !== true)
+      .map(toDocumentBlock),
   };
 }
 
 function toManuscriptBlock(block: Record<string, unknown>): ManuscriptBlock {
   const props = isRecord(block.props) ? block.props : {};
-  const type = block.type === "audio" || block.type === "image" || block.type === "handwriting" ? block.type : "text";
+  const type =
+    block.type === "audio" ||
+    block.type === "image" ||
+    block.type === "handwriting"
+      ? block.type
+      : "text";
   return {
     id: String(block.id),
     type,
     revision: toNumber(block.revision),
     createdAt: String(block.created_at ?? ""),
     updatedAt: String(block.updated_at ?? ""),
-    title: String(props.content ?? props.transcript ?? props.caption ?? block.type ?? "Block").slice(0, 32),
+    title: String(
+      props.content ??
+        props.transcript ??
+        props.caption ??
+        block.type ??
+        "Block",
+    ).slice(0, 32),
     timestamp: String(block.updated_at ?? ""),
-    summary: String(props.content ?? props.transcript ?? props.caption ?? props.ai_text ?? ""),
-    props
+    summary: String(
+      props.content ?? props.transcript ?? props.caption ?? props.ai_text ?? "",
+    ),
+    props,
   };
 }
 
@@ -450,11 +643,17 @@ function toDocumentBlock(block: Record<string, unknown>): DocumentBlock {
       createdAt: String(block.created_at ?? ""),
       updatedAt: String(block.updated_at ?? ""),
       content: String(props.caption ?? props.ocrText ?? props.content ?? ""),
-      props
+      props,
     };
   }
-  const type = block.type === "heading" || block.type === "list" || block.type === "quote" ? block.type : "paragraph";
-  const content = type === "list" && Array.isArray(props.items) ? props.items.map(String).join("\n") : String(props.content ?? "");
+  const type =
+    block.type === "heading" || block.type === "list" || block.type === "quote"
+      ? block.type
+      : "paragraph";
+  const content =
+    type === "list" && Array.isArray(props.items)
+      ? props.items.map(String).join("\n")
+      : String(props.content ?? "");
   return {
     id: String(block.id),
     type,
@@ -462,36 +661,149 @@ function toDocumentBlock(block: Record<string, unknown>): DocumentBlock {
     createdAt: String(block.created_at ?? ""),
     updatedAt: String(block.updated_at ?? ""),
     content,
-    items: Array.isArray(props.items) ? props.items.map(String) : undefined
+    items: Array.isArray(props.items) ? props.items.map(String) : undefined,
   };
 }
 
-function toRemoteManuscriptBlock(block: ManuscriptBlock, authorId: string, clientId: string, platform: Platform): Record<string, unknown> {
+function toRemoteManuscriptBlock(
+  block: ManuscriptBlock,
+  authorId: string,
+  clientId: string,
+  platform: Platform,
+): Record<string, unknown> {
   const now = new Date().toISOString();
   const base = remoteBlockBase(block, authorId, clientId, platform, now);
-  if (block.type === "handwriting") return { ...base, type: "handwriting", props: { strokes: block.props.strokes ?? [], image_asset_id: block.props.image_asset_id ?? null, ai_text: block.props.ai_text ?? block.props.aiText ?? "" } };
-  if (block.type === "audio" && typeof block.props.asset_id === "string") return { ...base, type: "audio", props: { asset_id: block.props.asset_id, duration_ms: Number(block.props.duration_ms ?? 0), transcript: String(block.props.transcript ?? block.summary ?? ""), speaker_segments: block.props.speaker_segments ?? [] } };
-  if (block.type === "image" && typeof block.props.asset_id === "string") return { ...base, type: "image", props: { asset_id: block.props.asset_id, caption: String(block.props.caption ?? block.props.ocrText ?? block.summary ?? ""), width: nullableNumber(block.props.width), height: nullableNumber(block.props.height) } };
-  return { ...base, type: "text", props: { content: String(block.props.content ?? block.props.transcript ?? block.props.caption ?? block.props.ocrText ?? block.summary ?? "") } };
+  if (block.type === "handwriting")
+    return {
+      ...base,
+      type: "handwriting",
+      props: {
+        strokes: block.props.strokes ?? [],
+        image_asset_id: block.props.image_asset_id ?? null,
+        ai_text: block.props.ai_text ?? block.props.aiText ?? "",
+      },
+    };
+  if (block.type === "audio" && typeof block.props.asset_id === "string")
+    return {
+      ...base,
+      type: "audio",
+      props: {
+        asset_id: block.props.asset_id,
+        duration_ms: Number(block.props.duration_ms ?? 0),
+        transcript: String(block.props.transcript ?? block.summary ?? ""),
+        speaker_segments: block.props.speaker_segments ?? [],
+      },
+    };
+  if (block.type === "image" && typeof block.props.asset_id === "string")
+    return {
+      ...base,
+      type: "image",
+      props: {
+        asset_id: block.props.asset_id,
+        caption: String(
+          block.props.caption ?? block.props.ocrText ?? block.summary ?? "",
+        ),
+        width: nullableNumber(block.props.width),
+        height: nullableNumber(block.props.height),
+      },
+    };
+  return {
+    ...base,
+    type: "text",
+    props: {
+      content: String(
+        block.props.content ??
+          block.props.transcript ??
+          block.props.caption ??
+          block.props.ocrText ??
+          block.summary ??
+          "",
+      ),
+    },
+  };
 }
 
-function toRemoteDocumentBlock(block: DocumentBlock, authorId: string, clientId: string, platform: Platform): Record<string, unknown> {
+function toRemoteDocumentBlock(
+  block: DocumentBlock,
+  authorId: string,
+  clientId: string,
+  platform: Platform,
+): Record<string, unknown> {
   const now = new Date().toISOString();
-  const base = { ...remoteBlockBase(block, authorId, clientId, platform, now), source_refs: [] };
-  if (block.type === "heading") return { ...base, type: "heading", props: { level: 1, content: block.content } };
-  if (block.type === "list") return { ...base, type: "list", props: { style: "bullet", items: block.items?.length ? block.items : block.content.split("\n").filter(Boolean) } };
-  if (block.type === "quote") return { ...base, type: "quote", props: { content: block.content } };
-  if (block.type === "image") return { ...base, type: "image", props: { asset_id: block.props?.asset_id ?? null, caption: String(block.props?.caption ?? block.content), width: nullableNumber(block.props?.width), height: nullableNumber(block.props?.height) } };
+  const base = {
+    ...remoteBlockBase(block, authorId, clientId, platform, now),
+    source_refs: [],
+  };
+  if (block.type === "heading")
+    return {
+      ...base,
+      type: "heading",
+      props: { level: 1, content: block.content },
+    };
+  if (block.type === "list")
+    return {
+      ...base,
+      type: "list",
+      props: {
+        style: "bullet",
+        items: block.items?.length
+          ? block.items
+          : block.content.split("\n").filter(Boolean),
+      },
+    };
+  if (block.type === "quote")
+    return { ...base, type: "quote", props: { content: block.content } };
+  if (block.type === "image")
+    return {
+      ...base,
+      type: "image",
+      props: {
+        asset_id: block.props?.asset_id ?? null,
+        caption: String(block.props?.caption ?? block.content),
+        width: nullableNumber(block.props?.width),
+        height: nullableNumber(block.props?.height),
+      },
+    };
   return { ...base, type: "paragraph", props: { content: block.content } };
 }
 
-function remoteBlockBase(block: { id: string; revision?: number; createdAt?: string; updatedAt?: string }, authorId: string, clientId: string, platform: Platform, now: string): Record<string, unknown> {
-  return { id: block.id, revision: block.revision ?? 1, created_at: block.createdAt || now, updated_at: block.updatedAt || now, author_id: authorId, client_id: clientId, platform, deleted: false };
+function remoteBlockBase(
+  block: {
+    id: string;
+    revision?: number;
+    createdAt?: string;
+    updatedAt?: string;
+  },
+  authorId: string,
+  clientId: string,
+  platform: Platform,
+  now: string,
+): Record<string, unknown> {
+  return {
+    id: block.id,
+    revision: block.revision ?? 1,
+    created_at: block.createdAt || now,
+    updated_at: block.updatedAt || now,
+    author_id: authorId,
+    client_id: clientId,
+    platform,
+    deleted: false,
+  };
 }
 
 function createSmokeTextBlock(): ManuscriptBlock {
   const now = new Date().toISOString();
-  return { id: `block_${crypto.randomUUID()}`, type: "text", revision: 1, createdAt: now, updatedAt: now, title: "Smoke", timestamp: now, summary: "Ship the desktop API flow first.", props: { content: "Ship the desktop API flow first." } };
+  return {
+    id: `block_${crypto.randomUUID()}`,
+    type: "text",
+    revision: 1,
+    createdAt: now,
+    updatedAt: now,
+    title: "Smoke",
+    timestamp: now,
+    summary: "Ship the desktop API flow first.",
+    props: { content: "Ship the desktop API flow first." },
+  };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -519,15 +831,31 @@ function extractTranscript(result: Record<string, unknown> | null): string {
     result.content,
     result.asr_text,
     isRecord(result.asr_audio) ? result.asr_audio.transcript : undefined,
-    isRecord(result.data) ? result.data.transcript ?? result.data.text : undefined,
-    isRecord(result.result) ? result.result.transcript ?? result.result.text : undefined
+    isRecord(result.data)
+      ? (result.data.transcript ?? result.data.text)
+      : undefined,
+    isRecord(result.result)
+      ? (result.result.transcript ?? result.result.text)
+      : undefined,
   ];
-  const direct = candidates.find((value): value is string => typeof value === "string" && value.trim().length > 0);
+  const direct = candidates.find(
+    (value): value is string =>
+      typeof value === "string" && value.trim().length > 0,
+  );
   if (direct) return direct.trim();
-  const segments = result.speaker_segments ?? result.segments ?? (isRecord(result.asr_audio) ? result.asr_audio.speaker_segments : undefined);
+  const segments =
+    result.speaker_segments ??
+    result.segments ??
+    (isRecord(result.asr_audio)
+      ? result.asr_audio.speaker_segments
+      : undefined);
   if (Array.isArray(segments)) {
     return segments
-      .map((segment) => (isRecord(segment) && typeof segment.text === "string" ? segment.text.trim() : ""))
+      .map((segment) =>
+        isRecord(segment) && typeof segment.text === "string"
+          ? segment.text.trim()
+          : "",
+      )
       .filter(Boolean)
       .join("\n");
   }
@@ -542,12 +870,34 @@ function extractImageText(result: Record<string, unknown> | null): string {
     result.content,
     result.ocr_text,
     result.description,
-    isRecord(result.image) ? result.image.caption ?? result.image.text ?? result.image.ocr_text : undefined,
-    isRecord(result.data) ? result.data.caption ?? result.data.text ?? result.data.ocr_text : undefined,
-    isRecord(result.result) ? result.result.caption ?? result.result.text ?? result.result.ocr_text : undefined
+    isRecord(result.image)
+      ? (result.image.caption ?? result.image.text ?? result.image.ocr_text)
+      : undefined,
+    isRecord(result.data)
+      ? (result.data.caption ?? result.data.text ?? result.data.ocr_text)
+      : undefined,
+    isRecord(result.result)
+      ? (result.result.caption ?? result.result.text ?? result.result.ocr_text)
+      : undefined,
   ];
-  const direct = candidates.find((value): value is string => typeof value === "string" && value.trim().length > 0);
+  const direct = candidates.find(
+    (value): value is string =>
+      typeof value === "string" && value.trim().length > 0,
+  );
   return direct ? direct.trim() : "";
+}
+
+function extractSpeakerSegments(
+  result: Record<string, unknown> | null,
+): unknown[] {
+  if (!result) return [];
+  const segments =
+    result.speaker_segments ??
+    result.segments ??
+    (isRecord(result.asr_audio)
+      ? result.asr_audio.speaker_segments
+      : undefined);
+  return Array.isArray(segments) ? segments : [];
 }
 
 function sleep(ms: number): Promise<void> {
