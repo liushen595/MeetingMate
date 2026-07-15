@@ -72,6 +72,7 @@ export interface SpeakerSegment {
 }
 
 export type StrokeTool = "pen" | "highlighter" | "eraser" | "lasso";
+export type PersistedStrokeTool = "pen";
 
 export interface StrokePoint {
   x: number;
@@ -82,7 +83,7 @@ export interface StrokePoint {
 
 export interface Stroke {
   id: string;
-  tool: StrokeTool;
+  tool: StrokeTool | PersistedStrokeTool;
   color: string;
   width: number;
   points: StrokePoint[];
@@ -130,7 +131,7 @@ export interface ManuscriptHandwritingBlock extends BaseBlock {
   type: "handwriting";
   props: {
     strokes: Stroke[];
-    image_asset_id: string | null;
+    image_asset_id?: string;
     ai_text: string;
   };
 }

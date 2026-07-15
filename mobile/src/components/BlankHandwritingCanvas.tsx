@@ -24,7 +24,7 @@ export function BlankHandwritingCanvas({ tool, color, brushWidth, onCommit }: { 
   function pointFromEvent(event: KonvaEventObject<PointerEvent>): StrokePoint | null {
     const pointer = event.target.getStage()?.getPointerPosition();
     if (!pointer) return null;
-    return { x: clamp(pointer.x, 0, width), y: Math.max(0, pointer.y), t: performance.now(), pressure: event.evt.pressure || 0.5 };
+    return { x: clamp(pointer.x, 0, width), y: Math.max(0, pointer.y), t: Math.round(performance.now()), pressure: event.evt.pressure || 0.5 };
   }
 
   function start(event: KonvaEventObject<PointerEvent>) {
@@ -32,7 +32,7 @@ export function BlankHandwritingCanvas({ tool, color, brushWidth, onCommit }: { 
     const point = pointFromEvent(event);
     if (!point) return;
     event.evt.preventDefault();
-    const stroke: Stroke = { id: makeId("stroke"), tool, color, width: brushWidth, points: [point] };
+    const stroke: Stroke = { id: makeId("stroke"), tool: tool === "highlighter" ? "highlighter" : "pen", color, width: Math.round(brushWidth), points: [point] };
     setDraft([stroke]);
     setActiveStroke(stroke);
   }

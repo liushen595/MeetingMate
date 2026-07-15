@@ -68,7 +68,7 @@ export function HandwritingCanvas({ blockId, strokes, tool, color, brushWidth, h
     const pointer = stage?.getPointerPosition();
     if (!pointer) return null;
     const y = isLast ? Math.max(0, pointer.y) : clamp(pointer.y, 0, height);
-    return { x: clamp(pointer.x, 0, width), y, t: performance.now(), pressure: event.evt.pressure || 0.5 };
+    return { x: clamp(pointer.x, 0, width), y, t: Math.round(performance.now()), pressure: event.evt.pressure || 0.5 };
   }
 
   function maybeExtend(point: StrokePoint) {
@@ -97,7 +97,7 @@ export function HandwritingCanvas({ blockId, strokes, tool, color, brushWidth, h
       return;
     }
 
-    const stroke: Stroke = { id: makeId("stroke"), tool, color, width: brushWidth, points: [point] };
+    const stroke: Stroke = { id: makeId("stroke"), tool: tool === "highlighter" ? "highlighter" : "pen", color, width: Math.round(brushWidth), points: [point] };
     maybeExtend(point);
     setDrawing({ mode: "draw", stroke });
     const next = [...strokesRef.current, stroke];
