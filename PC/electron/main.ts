@@ -1,6 +1,6 @@
 import { app, BrowserWindow, dialog, ipcMain, shell } from "electron";
 import { nativeImage } from "electron";
-import { readFileSync, statSync } from "node:fs";
+import { readFileSync, statSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { basename, extname, join } from "node:path";
 import { AppDatabase } from "./database";
@@ -139,6 +139,21 @@ app.whenReady().then(() => {
     return { ok: true, parts: uploadedParts };
   });
 
+  ipcMain.handle("files:save-blob", async (_event, input: { filename: string; data: ArrayBuffer }) => {
+    const result = await dialog.showSaveDialog({
+      defaultPath: sanitizeFilename(input.filename),
+      filters: [
+        { name: "Word Document", extensions: ["docx"] },
+        { name: "PDF", extensions: ["pdf"] },
+        { name: "All Files", extensions: ["*"] }
+      ]
+    });
+    if (result.canceled || !result.filePath) return { ok: false };
+    writeFileSync(result.filePath, Buffer.from(input.data));
+    await shell.openPath(result.filePath);
+    return { ok: true, filePath: result.filePath };
+  });
+
   createWindow();
 
   app.on("activate", () => {
@@ -205,6 +220,11 @@ function safeJsonParse(value: string): unknown {
   } catch {
     return null;
   }
+}
+
+function sanitizeFilename(value: string): string {
+  const trimmed = value.trim() || "download.docx";
+  return trimmed.replace(/[<>:"/\\|?*\x00-\x1F]/g, "_");
 }
 
 function getResponseValue(value: unknown, key: "etag" | "size_bytes"): string | number | null {

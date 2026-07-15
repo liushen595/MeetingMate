@@ -14,5 +14,6 @@ contextBridge.exposeInMainWorld("meetingMate", {
   exportManuscriptToDocument: (id: string) => ipcRenderer.invoke("manuscripts:export-document", id),
   selectAudioFile: () => ipcRenderer.invoke("files:select-audio"),
   selectImageFile: () => ipcRenderer.invoke("files:select-image"),
-  uploadAssetParts: (input: unknown) => ipcRenderer.invoke("files:upload-asset-parts", input)
+  uploadAssetParts: (input: unknown) => ipcRenderer.invoke("files:upload-asset-parts", input),
+  saveBlobFile: (input: unknown) => ipcRenderer.invoke("files:save-blob", input)
 });

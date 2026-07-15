@@ -1,13 +1,24 @@
 import type { Document } from "../types/document";
 import type { Manuscript } from "../types/manuscript";
 import type { DocumentBlock, ManuscriptBlock } from "../types/block";
+import type { GroupDocumentMessage, GroupSummary } from "../types/group";
 
 type Platform = "windows" | "mac" | "web";
 
 type Session = {
   access_token: string;
+  access_token_expires_in?: number;
   refresh_token: string;
+  refresh_token_expires_in?: number;
   user: { id: string; email: string; name: string };
+};
+
+type ApiErrorPayload = {
+  error?: {
+    code?: string;
+    message?: string;
+    request_id?: string;
+  };
 };
 
 type PagedResponse<T> = {
@@ -32,12 +43,60 @@ type RemoteDocument = {
   derived_from?: { manuscript_id?: string } | null;
 };
 
+type RemoteGroupSummary = {
+  id: string;
+  name: string;
+  invite_code: string;
+  invite_code_expires_at: string;
+  member_count: number;
+  role: "owner" | "member";
+  created_at: string;
+  updated_at: string;
+};
+
+type RemoteGroupDocumentMessage = {
+  id: string;
+  group_id: string;
+  sender_id: string;
+  sender_name: string;
+  document_id: string;
+  document_title: string;
+  document_revision: number;
+  sent_at: string;
+};
+
 type Task = {
   id: string;
   type: string;
   status: "queued" | "processing" | "succeeded" | "failed" | "cancelled";
+  progress?: {
+    stage?: string;
+    current?: number;
+    total?: number;
+    message?: string;
+  } | null;
   result: Record<string, unknown> | null;
   error?: { message?: string } | null;
+};
+
+export type ConvertWarning = {
+  block_id: string;
+  code: string;
+  message: string;
+};
+
+export type ConvertProgress = {
+  taskId: string;
+  status: Task["status"];
+  stage?: string;
+  current?: number;
+  total?: number;
+  message?: string;
+};
+
+export type ConvertManuscriptResult = {
+  document: Document;
+  warnings: ConvertWarning[];
 };
 
 type AssetUploadResponse = {
@@ -87,11 +146,30 @@ export type AudioTranscription = {
   speakerSegments: unknown[];
 };
 
+export class ApiError extends Error {
+  readonly status: number;
+  readonly code: string;
+  readonly requestId?: string;
+
+  constructor(status: number, message: string, code = "", requestId?: string) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.code = code;
+    this.requestId = requestId;
+  }
+}
+
+export function isAuthError(error: unknown): boolean {
+  return error instanceof ApiError && error.status === 401;
+}
+
 const SESSION_KEY = "meetingmate.session";
 const API_BASE_URL = "http://10.90.130.14:8000/api/v1";
 
 class PcApiClient {
   private session: Session | null = this.readSession();
+  private refreshPromise: Promise<void> | null = null;
   readonly clientId = getClientId();
   readonly platform = getPlatform();
 
@@ -261,7 +339,89 @@ class PcApiClient {
     await this.request<void>(`/manuscripts/${id}`, { method: "DELETE" });
   }
 
-  async convertManuscript(id: string, title: string, optimizeAudio: boolean): Promise<Document> {
+  async listGroups(): Promise<GroupSummary[]> {
+    const response = await this.request<PagedResponse<RemoteGroupSummary>>("/groups?limit=50");
+    return response.items.map(toGroup);
+  }
+
+  async createGroup(name: string): Promise<GroupSummary> {
+    const remote = await this.request<RemoteGroupSummary>("/groups", {
+      method: "POST",
+      idempotent: true,
+      body: JSON.stringify({ name, client_id: this.clientId }),
+    });
+    return toGroup(remote);
+  }
+
+  async joinGroup(inviteCode: string): Promise<GroupSummary> {
+    const remote = await this.request<RemoteGroupSummary>("/groups/join", {
+      method: "POST",
+      idempotent: true,
+      body: JSON.stringify({ invite_code: inviteCode, client_id: this.clientId }),
+    });
+    return toGroup(remote);
+  }
+
+  async listGroupMessages(groupId: string): Promise<GroupDocumentMessage[]> {
+    const response = await this.request<PagedResponse<RemoteGroupDocumentMessage>>(
+      `/groups/${groupId}/messages?limit=50`,
+    );
+    return response.items.map(toGroupMessage);
+  }
+
+  async sendDocumentToGroup(
+    groupId: string,
+    documentId: string,
+  ): Promise<GroupDocumentMessage> {
+    const remote = await this.request<RemoteGroupDocumentMessage>(`/groups/${groupId}/documents`, {
+      method: "POST",
+      idempotent: true,
+      body: JSON.stringify({ document_id: documentId, client_id: this.clientId }),
+    });
+    return toGroupMessage(remote);
+  }
+
+  async downloadGroupDocument(
+    groupId: string,
+    messageId: string,
+    format: "pdf" | "docx" = "docx",
+  ): Promise<Blob> {
+    if (!this.session) throw new ApiError(401, "请先登录服务器");
+    const accessToken = this.session.access_token;
+    const response = await this.fetchGroupDocument(groupId, messageId, format);
+    if (response.ok) return response.blob();
+    if (response.status !== 401) throw await responseToApiError(response);
+
+    await this.refreshSession(accessToken);
+    const retryResponse = await this.fetchGroupDocument(groupId, messageId, format);
+    if (!retryResponse.ok) throw await responseToApiError(retryResponse);
+    return retryResponse.blob();
+  }
+
+  private async fetchGroupDocument(
+    groupId: string,
+    messageId: string,
+    format: "pdf" | "docx",
+  ): Promise<Response> {
+    if (!this.session) throw new ApiError(401, "请先登录服务器");
+    return fetch(
+      `${API_BASE_URL}/groups/${groupId}/documents/${messageId}/download?format=${format}`,
+      {
+        headers: {
+          Authorization: `Bearer ${this.session.access_token}`,
+          "X-Client-Id": this.clientId,
+          "X-Request-Id": crypto.randomUUID(),
+        },
+      },
+    );
+  }
+
+  async convertManuscript(
+    id: string,
+    title: string,
+    optimizeAudio: boolean,
+    onProgress?: (progress: ConvertProgress) => void,
+  ): Promise<ConvertManuscriptResult> {
     const task = await this.request<Task>("/tasks/convert-manuscript", {
       method: "POST",
       idempotent: true,
@@ -273,11 +433,18 @@ class PcApiClient {
         optimize_audio: optimizeAudio,
       }),
     });
-    const completedTask = await this.waitForTask(task, "手稿转文档任务超时未返回结果");
+    const completedTask = await this.waitForTask(
+      task,
+      "手稿转文档任务超时未返回结果",
+      onProgress,
+    );
     const documentId = completedTask.result?.document_id;
     if (typeof documentId !== "string")
       throw new Error("转换任务未返回 document_id");
-    return this.getDocument(documentId);
+    return {
+      document: await this.getDocument(documentId),
+      warnings: extractConvertWarnings(completedTask.result),
+    };
   }
 
   async exportDocument(
@@ -329,18 +496,26 @@ class PcApiClient {
   }
 
   async getAssetObjectUrl(assetId: string): Promise<string> {
-    if (!this.session) throw new Error("请先登录服务器");
+    if (!this.session) throw new ApiError(401, "请先登录服务器");
+    const accessToken = this.session.access_token;
+    const response = await this.fetchAssetStream(assetId);
+    if (response.ok) return URL.createObjectURL(await response.blob());
+    if (response.status !== 401) throw await responseToApiError(response, "音频加载失败");
+
+    await this.refreshSession(accessToken);
+    const retryResponse = await this.fetchAssetStream(assetId);
+    if (!retryResponse.ok) throw await responseToApiError(retryResponse, "音频加载失败");
+    return URL.createObjectURL(await retryResponse.blob());
+  }
+
+  private async fetchAssetStream(assetId: string): Promise<Response> {
+    if (!this.session) throw new ApiError(401, "请先登录服务器");
     const headers = new Headers();
     headers.set("X-Client-Id", this.clientId);
     headers.set("Authorization", `Bearer ${this.session.access_token}`);
-    const response = await fetch(`${API_BASE_URL}/assets/${assetId}/stream`, {
+    return fetch(`${API_BASE_URL}/assets/${assetId}/stream`, {
       headers,
     });
-    if (!response.ok)
-      throw new Error(
-        `音频加载失败：${response.status} ${response.statusText}`,
-      );
-    return URL.createObjectURL(await response.blob());
   }
 
   async uploadImageAsset(file: SelectedFile): Promise<{ assetId: string; width: number | null; height: number | null }> {
@@ -425,7 +600,7 @@ class PcApiClient {
     });
     lines.push(`同步手稿 Block：revision ${savedManuscript.revision}`);
 
-    const document = await this.convertManuscript(
+    const { document } = await this.convertManuscript(
       savedManuscript.id,
       "PC API Smoke Document",
       false,
@@ -496,9 +671,11 @@ class PcApiClient {
   private async waitForTask(
     task: Task,
     timeoutMessage = "服务器已接收音频，但 ASR 任务超时未返回文本",
+    onProgress?: (progress: ConvertProgress) => void,
   ): Promise<Task> {
     let current = task;
     for (let attempt = 0; attempt < 30; attempt += 1) {
+      onProgress?.(toTaskProgress(current));
       if (current.status === "succeeded") return current;
       if (current.status === "failed")
         throw new Error(
@@ -536,21 +713,84 @@ class PcApiClient {
     path: string,
     options: RequestInit & { idempotent?: boolean } = {},
   ): Promise<T> {
-    if (!this.session) throw new Error("请先登录服务器");
+    if (!this.session) throw new ApiError(401, "请先登录服务器");
 
+    const accessToken = this.session.access_token;
+    const requestOptions = this.withRequestHeaders(options);
+    const response = await this.fetchWithSession(path, requestOptions);
+    if (response.ok) return parseResponse<T>(response);
+    if (response.status !== 401) throw await responseToApiError(response);
+
+    await this.refreshSession(accessToken);
+    return parseResponse<T>(await this.fetchWithSession(path, requestOptions));
+  }
+
+  private withRequestHeaders(
+    options: RequestInit & { idempotent?: boolean },
+  ): RequestInit {
     const headers = new Headers(options.headers);
     if (options.body && !headers.has("Content-Type"))
       headers.set("Content-Type", "application/json; charset=utf-8");
     headers.set("X-Client-Id", this.clientId);
-    headers.set("X-Request-Id", crypto.randomUUID());
-    if (options.idempotent) headers.set("Idempotency-Key", crypto.randomUUID());
+    if (!headers.has("X-Request-Id")) headers.set("X-Request-Id", crypto.randomUUID());
+    if (options.idempotent && !headers.has("Idempotency-Key"))
+      headers.set("Idempotency-Key", crypto.randomUUID());
+    return { ...options, headers };
+  }
+
+  private async fetchWithSession(
+    path: string,
+    options: RequestInit,
+  ): Promise<Response> {
+    if (!this.session) throw new ApiError(401, "请先登录服务器");
+
+    const headers = new Headers(options.headers);
     headers.set("Authorization", `Bearer ${this.session.access_token}`);
 
-    const response = await fetch(`${API_BASE_URL}${path}`, {
+    return fetch(`${API_BASE_URL}${path}`, {
       ...options,
       headers,
     });
-    return parseResponse<T>(response);
+  }
+
+  private async refreshSession(expiredAccessToken: string): Promise<void> {
+    if (this.session?.access_token && this.session.access_token !== expiredAccessToken) return;
+
+    if (!this.session?.refresh_token) {
+      this.setSession(null);
+      throw new ApiError(401, "登录已失效，请重新登录");
+    }
+
+    if (!this.refreshPromise) {
+      const refreshToken = this.session.refresh_token;
+      this.refreshPromise = this.refreshWithToken(refreshToken).finally(() => {
+        this.refreshPromise = null;
+      });
+    }
+
+    await this.refreshPromise;
+  }
+
+  private async refreshWithToken(refreshToken: string): Promise<void> {
+    const response = await fetch(`${API_BASE_URL}/auth/refresh`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json; charset=utf-8",
+        "X-Client-Id": this.clientId,
+        "X-Request-Id": crypto.randomUUID(),
+      },
+      body: JSON.stringify({
+        client_id: this.clientId,
+        refresh_token: refreshToken,
+      }),
+    });
+
+    if (!response.ok) {
+      this.setSession(null);
+      throw await responseToApiError(response, "登录已失效，请重新登录");
+    }
+
+    this.setSession(await parseResponse<Session>(response));
   }
 
   private devicePayload() {
@@ -588,10 +828,60 @@ class PcApiClient {
 async function parseResponse<T>(response: Response): Promise<T> {
   if (response.status === 204) return undefined as T;
   const text = await response.text();
-  const json = text ? JSON.parse(text) : null;
-  if (!response.ok)
-    throw new Error(json?.error?.message ?? response.statusText);
+  const json = text ? (JSON.parse(text) as unknown) : null;
+  if (!response.ok) throw apiErrorFromResponse(response, json);
   return json as T;
+}
+
+async function responseToApiError(
+  response: Response,
+  fallbackMessage?: string,
+): Promise<ApiError> {
+  const text = await response.text();
+  let json: unknown = null;
+  try {
+    json = text ? JSON.parse(text) : null;
+  } catch {
+    json = null;
+  }
+  return apiErrorFromResponse(response, json, fallbackMessage);
+}
+
+function apiErrorFromResponse(
+  response: Response,
+  json: unknown,
+  fallbackMessage?: string,
+): ApiError {
+  const payload = isRecord(json) ? (json as ApiErrorPayload) : null;
+  const error = payload?.error;
+  return new ApiError(
+    response.status,
+    error?.message ?? fallbackMessage ?? response.statusText,
+    error?.code ?? "",
+    error?.request_id,
+  );
+}
+
+function toTaskProgress(task: Task): ConvertProgress {
+  return {
+    taskId: task.id,
+    status: task.status,
+    stage: task.progress?.stage,
+    current: task.progress?.current,
+    total: task.progress?.total,
+    message: task.progress?.message,
+  };
+}
+
+function extractConvertWarnings(result: Record<string, unknown> | null): ConvertWarning[] {
+  if (!result || !Array.isArray(result.warnings)) return [];
+  return result.warnings
+    .filter(isRecord)
+    .map((warning) => ({
+      block_id: String(warning.block_id ?? ""),
+      code: String(warning.code ?? ""),
+      message: String(warning.message ?? ""),
+    }));
 }
 
 function toManuscript(remote: RemoteManuscript): Manuscript {
@@ -619,6 +909,32 @@ function toDocument(remote: RemoteDocument): Document {
     blocks: remote.blocks
       .filter((block) => block.deleted !== true)
       .map(toDocumentBlock),
+  };
+}
+
+function toGroup(remote: RemoteGroupSummary): GroupSummary {
+  return {
+    id: remote.id,
+    name: remote.name,
+    inviteCode: remote.invite_code,
+    inviteCodeExpiresAt: remote.invite_code_expires_at,
+    memberCount: remote.member_count,
+    role: remote.role,
+    createdAt: remote.created_at,
+    updatedAt: remote.updated_at,
+  };
+}
+
+function toGroupMessage(remote: RemoteGroupDocumentMessage): GroupDocumentMessage {
+  return {
+    id: remote.id,
+    groupId: remote.group_id,
+    senderId: remote.sender_id,
+    senderName: remote.sender_name,
+    documentId: remote.document_id,
+    documentTitle: remote.document_title,
+    documentRevision: remote.document_revision,
+    sentAt: remote.sent_at,
   };
 }
 
@@ -662,6 +978,7 @@ function toDocumentBlock(block: Record<string, unknown>): DocumentBlock {
       updatedAt: String(block.updated_at ?? ""),
       content: String(props.caption ?? props.ocrText ?? props.content ?? ""),
       props,
+      sourceRefs: Array.isArray(block.source_refs) ? block.source_refs : [],
     };
   }
   const type =
@@ -680,6 +997,7 @@ function toDocumentBlock(block: Record<string, unknown>): DocumentBlock {
     updatedAt: String(block.updated_at ?? ""),
     content,
     items: Array.isArray(props.items) ? props.items.map(String) : undefined,
+    sourceRefs: Array.isArray(block.source_refs) ? block.source_refs : [],
   };
 }
 
@@ -750,7 +1068,7 @@ function toRemoteDocumentBlock(
   const now = new Date().toISOString();
   const base = {
     ...remoteBlockBase(block, authorId, clientId, platform, now),
-    source_refs: [],
+    source_refs: block.sourceRefs ?? [],
   };
   if (block.type === "heading")
     return {
