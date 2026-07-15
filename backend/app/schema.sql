@@ -106,6 +106,42 @@ CREATE TABLE IF NOT EXISTS documents (
 CREATE INDEX IF NOT EXISTS idx_documents_owner_updated_at ON documents(owner_id, updated_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_documents_blocks_gin ON documents USING GIN (blocks jsonb_path_ops);
 
+CREATE TABLE IF NOT EXISTS groups (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    invite_code TEXT NOT NULL UNIQUE,
+    invite_code_expires_at TIMESTAMPTZ NOT NULL,
+    created_by TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_groups_invite_code_expires_at ON groups(invite_code, invite_code_expires_at);
+CREATE INDEX IF NOT EXISTS idx_groups_updated_at ON groups(updated_at DESC, id DESC);
+
+CREATE TABLE IF NOT EXISTS group_members (
+    group_id TEXT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    role TEXT NOT NULL CHECK (role IN ('owner', 'member')),
+    joined_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (group_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_group_members_user_id ON group_members(user_id);
+
+CREATE TABLE IF NOT EXISTS group_document_messages (
+    id TEXT PRIMARY KEY,
+    group_id TEXT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+    sender_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    document_id TEXT NOT NULL,
+    document_title TEXT NOT NULL,
+    document_revision INTEGER NOT NULL CHECK (document_revision >= 0),
+    document_snapshot JSONB NOT NULL,
+    sent_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_group_document_messages_group_sent_at ON group_document_messages(group_id, sent_at DESC, id DESC);
+
 CREATE TABLE IF NOT EXISTS document_versions (
     id TEXT PRIMARY KEY,
     document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
