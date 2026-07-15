@@ -20,7 +20,7 @@ from urllib.parse import quote, urlencode
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, Query, Request, Response, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.routing import APIRouter
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.websockets import WebSocket, WebSocketDisconnect
@@ -33,6 +33,7 @@ from starlette.requests import HTTPConnection
 
 from app.asr import AsrProvider, AsrProviderError, AsrResult, provider_from_environment, result_from_text, stream_delta
 from app.database import DatabaseSettings, DatabaseState, check_database, close_database, connect_database, load_database_settings
+from app.vision import VisionProvider, VisionProviderError, VisionResult, provider_from_environment as vision_provider_from_environment, result_from_text as vision_result_from_text
 
 
 API_PREFIX = "/api/v1"
@@ -53,7 +54,7 @@ Platform = Literal["ios", "android", "mac", "windows", "web"]
 Permission = Literal["owner", "editor", "viewer"]
 AssetKind = Literal["audio", "image", "export", "attachment"]
 AssetStatus = Literal["pending_upload", "uploaded", "ready", "failed"]
-TaskType = Literal["convert_manuscript", "asr_audio", "export_document", "ai_rewrite"]
+TaskType = Literal["convert_manuscript", "asr_audio", "recognize_image", "export_document", "ai_rewrite"]
 TaskStatus = Literal["queued", "processing", "succeeded", "failed", "cancelled"]
 TaskStage = Literal[
     "queued",
@@ -111,11 +112,10 @@ class AppSettings:
     cors_origins: list[str]
     cors_origin_regex: str | None
     allowed_hosts: list[str]
-    object_storage_public_base_url: str | None
-    object_storage_bucket: str | None
     asset_upload_url_mode: str | None
     api_public_base_url: str | None
     asr_provider: str
+    vision_provider: str
     database: DatabaseSettings
 
 
@@ -141,11 +141,10 @@ def load_settings() -> AppSettings:
         cors_origins=parse_env_list("CORS_ORIGINS"),
         cors_origin_regex=os.getenv("CORS_ORIGIN_REGEX") or DEFAULT_CORS_ORIGIN_REGEX,
         allowed_hosts=parse_env_list("ALLOWED_HOSTS"),
-        object_storage_public_base_url=os.getenv("OBJECT_STORAGE_PUBLIC_BASE_URL") or None,
-        object_storage_bucket=os.getenv("OBJECT_STORAGE_BUCKET") or None,
-        asset_upload_url_mode=os.getenv("ASSET_UPLOAD_URL_MODE") or None,
+        asset_upload_url_mode=os.getenv("ASSET_UPLOAD_URL_MODE") or "api",
         api_public_base_url=os.getenv("API_PUBLIC_BASE_URL") or None,
         asr_provider=os.getenv("ASR_PROVIDER") or "dashscope",
+        vision_provider=os.getenv("VISION_PROVIDER") or "dashscope",
         database=load_database_settings(),
     )
 
@@ -158,6 +157,7 @@ async def lifespan(app: FastAPI):
     app.state.database = await connect_database(settings.database)
     app.state.repository = PostgresRepository(app.state.database)
     app.state.asr_provider = build_asr_provider()
+    app.state.vision_provider = build_vision_provider()
     try:
         yield
     finally:
@@ -180,11 +180,23 @@ def build_asr_provider() -> AsrProvider:
     return provider_from_environment(settings.asr_provider)
 
 
+def build_vision_provider() -> VisionProvider:
+    return vision_provider_from_environment(settings.vision_provider)
+
+
 def get_asr_provider(request: Request) -> AsrProvider:
     provider = getattr(request.app.state, "asr_provider", None)
     if provider is None:
         provider = build_asr_provider()
         request.app.state.asr_provider = provider
+    return provider
+
+
+def get_vision_provider(request: Request) -> VisionProvider:
+    provider = getattr(request.app.state, "vision_provider", None)
+    if provider is None:
+        provider = build_vision_provider()
+        request.app.state.vision_provider = provider
     return provider
 
 
@@ -205,22 +217,6 @@ def verify_password(password: str, encoded: str) -> bool:
 
 def hash_request_body(body: bytes) -> str:
     return hashlib.sha256(body).hexdigest()
-
-
-def make_object_storage_url(*path_parts: str, expires_seconds: int = 900) -> str:
-    if not settings.object_storage_public_base_url or not settings.object_storage_bucket:
-        raise APIError(
-            status.HTTP_500_INTERNAL_SERVER_ERROR,
-            "internal_error",
-            "Object storage public URL is not configured.",
-        )
-    base_url = settings.object_storage_public_base_url.rstrip("/")
-    bucket = quote(settings.object_storage_bucket.strip("/"), safe="")
-    encoded_parts = [quote(part.strip("/"), safe="") for part in path_parts]
-    object_path = "/".join([bucket, *encoded_parts])
-    expires_at = int((utcnow() + timedelta(seconds=expires_seconds)).timestamp())
-    signature = hashlib.sha256(f"{object_path}:{expires_at}".encode("utf-8")).hexdigest()[:32]
-    return f"{base_url}/{object_path}?expires_at={expires_at}&signature={signature}"
 
 
 def public_api_base_url(request: Request) -> str:
@@ -404,6 +400,8 @@ class ImageProps(StrictModel):
     caption: str | None = ""
     width: int | None = Field(default=None, ge=0)
     height: int | None = Field(default=None, ge=0)
+    recognition_task_id: str | None = None
+    recognition_generated_at: datetime | None = None
 
 
 class HandwritingProps(StrictModel):
@@ -831,6 +829,12 @@ class AsrAudioRequest(StrictModel):
     asset_id: str
     language: str
     enable_diarization: bool
+    client_id: str
+
+
+class RecognizeImageRequest(StrictModel):
+    asset_id: str
+    language: str = "zh-CN"
     client_id: str
 
 
@@ -1882,14 +1886,10 @@ def make_presigned_parts(request: Request, asset_id: str, upload_id: str, conten
     expires_at = utcnow() + timedelta(minutes=15)
     parts: list[UploadPart] = []
     for part_number in range(1, part_count + 1):
-        if settings.asset_upload_url_mode == "object_storage":
-            upload_url = make_object_storage_url(asset_id, upload_id, f"part-{part_number}")
-        else:
-            upload_url = make_api_upload_url(request, asset_id, upload_id, part_number, expires_at)
         parts.append(
             UploadPart(
                 part_number=part_number,
-                upload_url=upload_url,
+                upload_url=make_api_upload_url(request, asset_id, upload_id, part_number, expires_at),
                 headers={"Content-Type": content_type},
                 expires_at=expires_at,
             )
@@ -2164,6 +2164,38 @@ async def apply_asr_result_to_manuscripts(
             await db.save_manuscript(manuscript)
 
 
+async def apply_image_result_to_manuscripts(
+    db: PostgresRepository,
+    owner_id: str,
+    asset_id: str,
+    task_id: str,
+    result: VisionResult,
+    generated_at: datetime,
+) -> None:
+    manuscripts = await db.list_manuscripts(owner_id, include_deleted=True)
+    for manuscript in manuscripts:
+        changed = False
+        updated_blocks: list[ManuscriptBlock] = []
+        for block in manuscript.blocks:
+            if isinstance(block, ManuscriptImageBlock) and block.props.asset_id == asset_id:
+                props = block.props.model_copy(
+                    update={
+                        "caption": result.caption or result.text or block.props.caption,
+                        "recognition_task_id": task_id,
+                        "recognition_generated_at": generated_at,
+                    }
+                )
+                updated_blocks.append(block.model_copy(update={"props": props, "revision": block.revision + 1, "updated_at": generated_at}))
+                changed = True
+            else:
+                updated_blocks.append(block)
+        if changed:
+            manuscript.blocks = updated_blocks
+            manuscript.revision += 1
+            manuscript.updated_at = generated_at
+            await db.save_manuscript(manuscript)
+
+
 async def save_failed_asr_task(db: PostgresRepository, owner_id: str, task: Task, message: str, retryable: bool) -> None:
     failed = task.model_copy(
         update={
@@ -2176,7 +2208,19 @@ async def save_failed_asr_task(db: PostgresRepository, owner_id: str, task: Task
     await db.save_task(owner_id, failed)
 
 
-def asr_task_error_code(retryable: bool) -> str:
+async def save_failed_image_task(db: PostgresRepository, owner_id: str, task: Task, message: str, retryable: bool) -> None:
+    failed = task.model_copy(
+        update={
+            "status": "failed",
+            "progress": TaskProgress(stage="completed", current=0, total=1, message="Image recognition task failed."),
+            "error": TaskError(code="ai_unavailable" if retryable else "validation_error", message=message, retryable=retryable),
+            "updated_at": utcnow(),
+        }
+    )
+    await db.save_task(owner_id, failed)
+
+
+def provider_task_error_code(retryable: bool) -> str:
     return "ai_unavailable" if retryable else "validation_error"
 
 
@@ -2299,10 +2343,133 @@ async def stream_asr_task_events(
         yield sse_event("error", {"code": "validation_error", "message": exc.message})
     except AsrProviderError as exc:
         await save_failed_asr_task(db, owner_id, processing, exc.message, retryable=exc.retryable)
-        yield sse_event("error", {"code": asr_task_error_code(exc.retryable), "message": exc.message})
+        yield sse_event("error", {"code": provider_task_error_code(exc.retryable), "message": exc.message})
     except Exception:
         message = "ASR service is temporarily unavailable."
         await save_failed_asr_task(db, owner_id, processing, message, retryable=True)
+        yield sse_event("error", {"code": "ai_unavailable", "message": message})
+
+
+async def process_image_task(
+    db: PostgresRepository,
+    owner_id: str,
+    task_id: str,
+    payload: RecognizeImageRequest,
+    provider: VisionProvider,
+) -> None:
+    task = await get_task(db, task_id, owner_id)
+    if task.status == "cancelled":
+        return
+
+    processing = task.model_copy(
+        update={
+            "status": "processing",
+            "progress": TaskProgress(stage="llm_parse", current=0, total=1, message="Image recognition task processing."),
+            "updated_at": utcnow(),
+        }
+    )
+    await db.save_task(owner_id, processing)
+
+    try:
+        asset_record = await get_asset_record(db, payload.asset_id, owner_id)
+        if asset_record.asset.kind != "image" or asset_record.asset.status != "ready":
+            raise validation_error("Image recognition requires a ready image asset.")
+        content = require_asset_content(asset_record)
+        result = await provider.recognize(
+            filename=asset_record.asset.filename,
+            content_type=asset_record.asset.content_type,
+            content=content,
+            width=asset_record.asset.width,
+            height=asset_record.asset.height,
+            language=payload.language,
+        )
+        generated_at = utcnow()
+        await apply_image_result_to_manuscripts(db, owner_id, payload.asset_id, task_id, result, generated_at)
+        completed = processing.model_copy(
+            update={
+                "status": "succeeded",
+                "progress": TaskProgress(stage="completed", current=1, total=1, message="Image recognition task completed."),
+                "result": {
+                    "asset_id": payload.asset_id,
+                    "caption": result.caption,
+                    "text": result.text,
+                },
+                "error": None,
+                "updated_at": generated_at,
+            }
+        )
+        await db.save_task(owner_id, completed)
+    except APIError as exc:
+        await save_failed_image_task(db, owner_id, processing, exc.message, retryable=False)
+    except VisionProviderError as exc:
+        await save_failed_image_task(db, owner_id, processing, exc.message, retryable=exc.retryable)
+    except Exception:
+        await save_failed_image_task(db, owner_id, processing, "Image recognition service is temporarily unavailable.", retryable=True)
+
+
+async def stream_image_task_events(
+    db: PostgresRepository,
+    owner_id: str,
+    task: Task,
+    payload: RecognizeImageRequest,
+    provider: VisionProvider,
+) -> AsyncIterator[str]:
+    yield sse_event("task", {"task": task})
+    processing = task.model_copy(
+        update={
+            "status": "processing",
+            "progress": TaskProgress(stage="llm_parse", current=0, total=1, message="Image recognition task processing."),
+            "updated_at": utcnow(),
+        }
+    )
+    await db.save_task(owner_id, processing)
+    yield sse_event("task", {"task": processing})
+    try:
+        asset_record = await get_asset_record(db, payload.asset_id, owner_id)
+        if asset_record.asset.kind != "image" or asset_record.asset.status != "ready":
+            raise validation_error("Image recognition requires a ready image asset.")
+        content = require_asset_content(asset_record)
+        current_text = ""
+        async for chunk in provider.stream_recognize(
+            filename=asset_record.asset.filename,
+            content_type=asset_record.asset.content_type,
+            content=content,
+            width=asset_record.asset.width,
+            height=asset_record.asset.height,
+            language=payload.language,
+        ):
+            current_text, delta = stream_delta(current_text, chunk)
+            if delta:
+                result = vision_result_from_text(current_text)
+                yield sse_event("delta", {"task_id": task.id, "text": delta, "caption": result.caption, "recognized_text": current_text})
+
+        result = vision_result_from_text(current_text)
+        generated_at = utcnow()
+        await apply_image_result_to_manuscripts(db, owner_id, payload.asset_id, task.id, result, generated_at)
+        completed = processing.model_copy(
+            update={
+                "status": "succeeded",
+                "progress": TaskProgress(stage="completed", current=1, total=1, message="Image recognition task completed."),
+                "result": {
+                    "asset_id": payload.asset_id,
+                    "caption": result.caption,
+                    "text": result.text,
+                },
+                "error": None,
+                "updated_at": generated_at,
+            }
+        )
+        await db.save_task(owner_id, completed)
+        yield sse_event("done", {"task": completed})
+    except APIError as exc:
+        await save_failed_image_task(db, owner_id, processing, exc.message, retryable=False)
+        yield sse_event("error", {"code": "validation_error", "message": exc.message})
+    except VisionProviderError as exc:
+        await save_failed_image_task(db, owner_id, processing, exc.message, retryable=exc.retryable)
+        yield sse_event("error", {"code": provider_task_error_code(exc.retryable), "message": exc.message})
+    except Exception:
+        message = "Image recognition service is temporarily unavailable."
+        await save_failed_image_task(db, owner_id, processing, message, retryable=True)
         yield sse_event("error", {"code": "ai_unavailable", "message": message})
 
 
@@ -2594,7 +2761,7 @@ async def complete_asset_upload(
             await db.save_asset(record)
             raise validation_error("Uploaded content does not match size_bytes or checksum_sha256.")
         record.content = content
-    elif settings.asset_upload_url_mode != "object_storage":
+    else:
         record.asset = record.asset.model_copy(update={"status": "failed", "updated_at": utcnow()})
         await db.save_asset(record)
         raise validation_error("Uploaded part content is missing from database storage.")
@@ -2632,8 +2799,6 @@ async def stream_asset(asset_id: str, ctx: AuthContext = Depends(auth_context), 
                 "Accept-Ranges": "bytes",
             },
         )
-    if settings.asset_upload_url_mode == "object_storage":
-        return RedirectResponse(url=make_object_storage_url(record.asset.id, "download", expires_seconds=600), status_code=status.HTTP_302_FOUND)
     raise APIError(status.HTTP_404_NOT_FOUND, "not_found", "Asset content is not available.")
 
 
@@ -3049,6 +3214,65 @@ async def asr_audio_stream(
     await db.save_task(ctx.user_id, task, task_input=payload.model_dump(mode="json"))
     return StreamingResponse(
         stream_asr_task_events(db, ctx.user_id, task, payload, get_asr_provider(request)),
+        media_type="text/event-stream",
+    )
+
+
+@router.post("/tasks/recognize-image", response_model=Task, status_code=status.HTTP_202_ACCEPTED, dependencies=IDEMPOTENT_WRITE_DEPENDENCIES)
+async def recognize_image(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    payload: RecognizeImageRequest,
+    ctx: AuthContext = Depends(auth_context),
+    db: PostgresRepository = Depends(get_repository),
+) -> JSONResponse:
+    require_client_header(request, ctx, payload.client_id)
+    idem = await require_idempotency(request, ctx, db)
+    if idem[2]:
+        return await idempotent_json_response(db, idem, None, status.HTTP_202_ACCEPTED)
+    asset_record = await get_asset_record(db, payload.asset_id, ctx.user_id)
+    if asset_record.asset.kind != "image" or asset_record.asset.status != "ready":
+        raise validation_error("Image recognition requires a ready image asset.")
+    now = utcnow()
+    task = Task(
+        id=new_id("task"),
+        type="recognize_image",
+        status="queued",
+        progress=TaskProgress(stage="queued", current=0, total=1, message="Image recognition task queued."),
+        result=None,
+        created_at=now,
+        updated_at=now,
+    )
+    await db.save_task(ctx.user_id, task, task_input=payload.model_dump(mode="json"))
+    background_tasks.add_task(process_image_task, db, ctx.user_id, task.id, payload, get_vision_provider(request))
+    return await idempotent_json_response(db, idem, task, status.HTTP_202_ACCEPTED)
+
+
+@router.post("/tasks/recognize-image/stream", dependencies=IDEMPOTENT_WRITE_DEPENDENCIES)
+async def recognize_image_stream(
+    request: Request,
+    payload: RecognizeImageRequest,
+    ctx: AuthContext = Depends(auth_context),
+    db: PostgresRepository = Depends(get_repository),
+) -> StreamingResponse:
+    require_client_header(request, ctx, payload.client_id)
+    require_idempotency_header(request)
+    asset_record = await get_asset_record(db, payload.asset_id, ctx.user_id)
+    if asset_record.asset.kind != "image" or asset_record.asset.status != "ready":
+        raise validation_error("Image recognition requires a ready image asset.")
+    now = utcnow()
+    task = Task(
+        id=new_id("task"),
+        type="recognize_image",
+        status="queued",
+        progress=TaskProgress(stage="queued", current=0, total=1, message="Image recognition task queued."),
+        result=None,
+        created_at=now,
+        updated_at=now,
+    )
+    await db.save_task(ctx.user_id, task, task_input=payload.model_dump(mode="json"))
+    return StreamingResponse(
+        stream_image_task_events(db, ctx.user_id, task, payload, get_vision_provider(request)),
         media_type="text/event-stream",
     )
 

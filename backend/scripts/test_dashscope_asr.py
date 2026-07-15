@@ -38,7 +38,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Encode a local audio file as Base64 and call DashScope ASR.")
     parser.add_argument("audio", type=pathlib.Path, help="Local audio file path, for example ../test.m4a")
     parser.add_argument("--mime", default="audio/mp4", help="Audio MIME type. Default: audio/mp4")
-    parser.add_argument("--model", default=None, help="DashScope ASR model name. Default: DASHSCOPE_MODEL or qwen3-asr-flash")
+    parser.add_argument("--model", default=None, help="DashScope ASR model name. Default: DASHSCOPE_ASR_MODEL or qwen3-asr-flash")
     parser.add_argument("--language", default="zh", help="ASR language option. Default: zh")
     parser.add_argument("--env-file", type=pathlib.Path, default=BACKEND_ROOT / ".env", help="Env file path. Default: backend/.env")
     parser.add_argument("--no-stream", action="store_true", help="Use non-streaming API call")
@@ -55,7 +55,7 @@ def main() -> int:
 
     api_url = os.getenv("DASHSCOPE_API_URL")
     api_key = os.getenv("DASHSCOPE_API_KEY")
-    model = args.model or os.getenv("DASHSCOPE_MODEL", "qwen3-asr-flash")
+    model = args.model or os.getenv("DASHSCOPE_ASR_MODEL", "qwen3-asr-flash")
     if not api_url:
         print("DASHSCOPE_API_URL is not set in .env or the current shell.", file=sys.stderr)
         return 2

@@ -10,13 +10,12 @@ from datetime import datetime, timezone
 from fastapi.testclient import TestClient
 
 os.environ["CORS_ORIGIN_REGEX"] = r"^https?://(localhost|127\.0\.0\.1|10\.(?:\d{1,3}\.){2}\d{1,3})(?::\d+)?$"
-os.environ["OBJECT_STORAGE_PUBLIC_BASE_URL"] = "http://10.90.129.20:9000"
-os.environ["OBJECT_STORAGE_BUCKET"] = "bucket"
 os.environ["API_PUBLIC_BASE_URL"] = "http://testserver"
 os.environ["MEETINGMATE_SKIP_DOTENV"] = "1"
 
 import app.main as backend
 from app.asr import AsrProvider, AsrResult, AsrSegment
+from app.vision import VisionProvider, VisionResult
 
 
 class TestAsrProvider(AsrProvider):
@@ -48,6 +47,39 @@ class TestAsrProvider(AsrProvider):
         assert content
         yield "你好，"
         yield "你好，我是谁"
+
+
+class TestVisionProvider(VisionProvider):
+    async def recognize(
+        self,
+        *,
+        filename: str,
+        content_type: str,
+        content: bytes,
+        width: int | None,
+        height: int | None,
+        language: str,
+    ) -> VisionResult:
+        assert filename
+        assert content_type.startswith("image/")
+        assert content
+        assert width == 320
+        assert height == 200
+        return VisionResult(caption="白板架构图", text="白板架构图\n移动端、PC 端和后端 API 协作。")
+
+    async def stream_recognize(
+        self,
+        *,
+        filename: str,
+        content_type: str,
+        content: bytes,
+        width: int | None,
+        height: int | None,
+        language: str,
+    ):
+        assert content
+        yield "白板架构图\n"
+        yield "白板架构图\n移动端、PC 端和后端 API 协作。"
 
 
 class TestRepository:
@@ -240,6 +272,7 @@ repo.reset()
 app = backend.app
 app.dependency_overrides[backend.get_repository] = lambda: repo
 app.state.asr_provider = TestAsrProvider()
+app.state.vision_provider = TestVisionProvider()
 
 
 client = TestClient(app)
@@ -371,7 +404,8 @@ def test_p0_flow_register_upload_manuscript_convert_export() -> None:
     )
     assert upload.status_code == 201, upload.text
     assert upload.json()["parts"][0]["upload_url"].startswith("http://testserver/api/v1/assets/")
-    assert "object-storage.local" not in upload.json()["parts"][0]["upload_url"]
+    assert "/upload-parts/" in upload.json()["parts"][0]["upload_url"]
+    assert "object-storage" not in upload.json()["parts"][0]["upload_url"]
     uploaded_part = upload_single_part(upload, upload_content)
     asset_id = upload.json()["asset_id"]
     upload_parts = client.get(f"/api/v1/assets/{asset_id}/upload-parts", headers=auth_headers(auth))
@@ -506,6 +540,117 @@ def test_asset_stream_can_fallback_to_stored_part_contents() -> None:
     assert stream.status_code == 200, stream.text
     assert stream.content == content
     assert stream.headers["content-type"] == "audio/webm"
+
+
+def test_image_recognition_task_updates_image_block_and_convert_keeps_source_ref() -> None:
+    repo.reset()
+    auth = register_user("image@example.com", "device_image")
+    image_content = b"fake-png-image"
+    image_checksum = hashlib.sha256(image_content).hexdigest()
+    upload = client.post(
+        "/api/v1/assets/upload",
+        json={
+            "kind": "image",
+            "filename": "whiteboard.png",
+            "content_type": "image/png",
+            "size_bytes": len(image_content),
+            "checksum_sha256": image_checksum,
+            "part_size_bytes": len(image_content),
+        },
+        headers=auth_headers(auth, "device_image", "idem_image_upload"),
+    )
+    assert upload.status_code == 201, upload.text
+    assert upload.json()["parts"][0]["upload_url"].startswith("http://testserver/api/v1/assets/")
+    uploaded_part = upload_single_part(upload, image_content)
+    asset_id = upload.json()["asset_id"]
+    complete = client.post(
+        f"/api/v1/assets/{asset_id}/complete",
+        json={
+            "upload_id": upload.json()["upload_id"],
+            "size_bytes": len(image_content),
+            "checksum_sha256": image_checksum,
+            "parts": [uploaded_part],
+            "duration_ms": None,
+            "width": 320,
+            "height": 200,
+        },
+        headers=auth_headers(auth, "device_image", "idem_image_complete"),
+    )
+    assert complete.status_code == 200, complete.text
+    assert complete.json()["kind"] == "image"
+    assert complete.json()["status"] == "ready"
+    assert complete.json()["width"] == 320
+    assert complete.json()["height"] == 200
+
+    created_at = iso_now()
+    manuscript = client.post(
+        "/api/v1/manuscripts",
+        json={
+            "title": "Images",
+            "client_id": "device_image",
+            "initial_blocks": [
+                {
+                    "id": "block_image1",
+                    "type": "image",
+                    "revision": 1,
+                    "created_at": created_at,
+                    "updated_at": created_at,
+                    "author_id": auth["user"]["id"],
+                    "client_id": "device_image",
+                    "platform": "web",
+                    "deleted": False,
+                    "props": {"asset_id": asset_id, "caption": "", "width": 320, "height": 200},
+                }
+            ],
+        },
+        headers=auth_headers(auth, "device_image", "idem_image_manuscript"),
+    )
+    assert manuscript.status_code == 201, manuscript.text
+
+    recognize = client.post(
+        "/api/v1/tasks/recognize-image",
+        json={"asset_id": asset_id, "language": "zh-CN", "client_id": "device_image"},
+        headers=auth_headers(auth, "device_image", "idem_image_task"),
+    )
+    assert recognize.status_code == 202, recognize.text
+    task_id = recognize.json()["id"]
+    task = client.get(f"/api/v1/tasks/{task_id}", headers=auth_headers(auth, "device_image"))
+    assert task.status_code == 200, task.text
+    assert task.json()["status"] == "succeeded"
+    assert task.json()["type"] == "recognize_image"
+    assert task.json()["result"] == {"asset_id": asset_id, "caption": "白板架构图", "text": "白板架构图\n移动端、PC 端和后端 API 协作。"}
+    fetched = client.get(f"/api/v1/manuscripts/{manuscript.json()['id']}", headers=auth_headers(auth, "device_image"))
+    image_props = fetched.json()["blocks"][0]["props"]
+    assert image_props["caption"] == "白板架构图"
+    assert image_props["recognition_task_id"] == task_id
+    assert image_props["recognition_generated_at"] is not None
+
+    streamed = client.post(
+        "/api/v1/tasks/recognize-image/stream",
+        json={"asset_id": asset_id, "language": "zh-CN", "client_id": "device_image"},
+        headers=auth_headers(auth, "device_image", "idem_stream_image_task"),
+    )
+    assert streamed.status_code == 200, streamed.text
+    assert "event: delta" in streamed.text
+    assert "白板架构图" in streamed.text
+    done_task = sse_events(streamed.text, "done")[0]["task"]
+    assert done_task["type"] == "recognize_image"
+    assert done_task["result"]["asset_id"] == asset_id
+    assert done_task["result"]["caption"] == "白板架构图"
+
+    convert = client.post(
+        "/api/v1/tasks/convert-manuscript",
+        json={"manuscript_id": manuscript.json()["id"], "mode": "meeting_minutes", "title": "Image Doc", "client_id": "device_image"},
+        headers=auth_headers(auth, "device_image", "idem_image_convert"),
+    )
+    assert convert.status_code == 202, convert.text
+    document = client.get(f"/api/v1/documents/{convert.json()['result']['document_id']}", headers=auth_headers(auth, "device_image"))
+    assert document.status_code == 200, document.text
+    document_block = document.json()["blocks"][0]
+    assert document_block["type"] == "image"
+    assert document_block["props"]["asset_id"] == asset_id
+    assert document_block["props"]["caption"] == "白板架构图"
+    assert document_block["source_refs"][0]["block_id"] == "block_image1"
 
 
 def test_idempotency_conflict_and_revision_conflict() -> None:
