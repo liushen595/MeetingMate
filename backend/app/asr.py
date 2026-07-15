@@ -287,7 +287,7 @@ def provider_from_environment(provider_name: str) -> AsrProvider:
         return DashscopeAsrProvider(
             api_url=os.getenv("DASHSCOPE_API_URL", "").strip(),
             api_key=os.getenv("DASHSCOPE_API_KEY", "").strip(),
-            model=os.getenv("DASHSCOPE_MODEL", "qwen3-asr-flash").strip() or "qwen3-asr-flash",
+            model=os.getenv("DASHSCOPE_ASR_MODEL", "qwen3-asr-flash").strip() or "qwen3-asr-flash",
         )
     if provider == "azure":
         return AzureFastTranscriptionProvider(

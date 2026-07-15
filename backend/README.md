@@ -20,15 +20,15 @@ Create `backend/.env` before starting the server:
 CORS_ORIGINS=[]
 CORS_ORIGIN_REGEX="^https?://(localhost|127\\.0\\.0\\.1|10\\.(?:\\d{1,3}\\.){2}\\d{1,3})(?::\\d+)?$"
 ALLOWED_HOSTS=[]
-OBJECT_STORAGE_PUBLIC_BASE_URL="http://10.90.129.20:9000"
-OBJECT_STORAGE_BUCKET="bucket"
 ASSET_UPLOAD_URL_MODE="api"
 API_PUBLIC_BASE_URL=""
 
 ASR_PROVIDER="dashscope"
+VISION_PROVIDER="dashscope"
 DASHSCOPE_API_URL="https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api/v1"
 DASHSCOPE_API_KEY=""
-DASHSCOPE_MODEL="qwen3-asr-flash"
+DASHSCOPE_ASR_MODEL="qwen3-asr-flash"
+DASHSCOPE_IMAGE_MODEL="qwen-vl-plus"
 
 # Optional fallback provider kept for future use.
 AZURE_SPEECH_ENDPOINT=""
@@ -49,9 +49,11 @@ DATABASE_COMMAND_TIMEOUT_SECONDS=30
 
 `DATABASE_URL` is also supported. If it is set, it takes precedence over the component fields above.
 
-`ASSET_UPLOAD_URL_MODE="api"` makes `/assets/upload` return FastAPI upload proxy URLs. This is the recommended local/LAN development mode when MinIO/S3 is not reachable directly from the browser. Set `API_PUBLIC_BASE_URL` only when the backend is behind a proxy and `request.base_url` is not the browser-reachable API base URL.
+`ASSET_UPLOAD_URL_MODE="api"` is the only supported MVP upload mode. `/assets/upload` returns FastAPI upload proxy URLs under `/api/v1/assets/{asset_id}/upload-parts/{part_number}` and `/assets/{asset_id}/stream` serves bytes from the API. Set `API_PUBLIC_BASE_URL` only when the backend is behind a proxy and `request.base_url` is not the browser-reachable API base URL.
 
 `ASR_PROVIDER="dashscope"` uses Alibaba Cloud Model Studio DashScope ASR. The backend sends uploaded audio as a Base64 data URI and rejects input whose Base64 payload exceeds 10MB. `AZURE_SPEECH_*` is retained as a fallback provider configuration for future Azure Speech support.
+
+`VISION_PROVIDER="dashscope"` uses DashScope multimodal image recognition. The image model is read from `DASHSCOPE_IMAGE_MODEL` and defaults to `qwen-vl-plus` when unset.
 
 ```bash
 uvicorn app.main:app --reload
