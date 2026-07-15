@@ -180,7 +180,7 @@ export interface HeadingBlock extends BaseDocumentBlock {
 
 export interface ListBlock extends BaseDocumentBlock {
   type: "list";
-  props: { style: "bullet" | "number"; items: string[] };
+  props: { style: "bullet" | "numbered"; items: string[] };
 }
 
 export interface QuoteBlock extends BaseDocumentBlock {

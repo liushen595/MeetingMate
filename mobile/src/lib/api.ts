@@ -19,6 +19,7 @@ import type {
   UploadedPart,
 } from "../types/api";
 import { getClientId, getDevicePayload } from "./device";
+import type { DocumentAgentContext, DocumentAgentMode } from "./documentAgent";
 import { makeIdempotencyKey } from "./ids";
 
 export const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "/api/v1";
@@ -145,19 +146,10 @@ export class ApiClient {
   }
 
   convertManuscript(manuscriptId: string, mode: ConvertMode, title: string, optimizeAudio: boolean) {
-    const body = { manuscript_id: manuscriptId, mode, title, client_id: this.clientId, optimize_audio: optimizeAudio };
     return this.request<Task>("/tasks/convert-manuscript", {
       method: "POST",
       idempotent: true,
-      body: JSON.stringify(body),
-    }).catch((error) => {
-      if (!(error instanceof ApiError) || error.status !== 422) throw error;
-      if (optimizeAudio) throw new Error("当前后端暂未支持录音内容优化，请关闭该选项后重试。");
-      return this.request<Task>("/tasks/convert-manuscript", {
-        method: "POST",
-        idempotent: true,
-        body: JSON.stringify({ manuscript_id: manuscriptId, mode, title, client_id: this.clientId }),
-      });
+      body: JSON.stringify({ manuscript_id: manuscriptId, mode, title, client_id: this.clientId, optimize_audio: optimizeAudio }),
     });
   }
 
@@ -340,11 +332,27 @@ export class ApiClient {
     });
   }
 
-  streamAgent(documentId: string, selectedBlockIds: string[], prompt: string, mode: "rewrite" | "chat" = "rewrite") {
+  streamAgent(
+    documentId: string,
+    selectedBlockIds: string[],
+    prompt: string,
+    mode: DocumentAgentMode = "rewrite",
+    options: { context?: DocumentAgentContext; toolsVersion?: string; selection?: { block_id: string; start: number; end: number; text: string } | null } = {},
+  ) {
+    const body: Record<string, unknown> = {
+      document_id: documentId,
+      selected_block_ids: selectedBlockIds,
+      prompt,
+      mode,
+      client_id: this.clientId,
+    };
+    if (options.context) body.context = options.context;
+    if (options.toolsVersion) body.tools_version = options.toolsVersion;
+    if ("selection" in options) body.selection = options.selection ?? null;
     return this.request<Response>("/ai/agent/chat", {
       method: "POST",
       idempotent: true,
-      body: JSON.stringify({ document_id: documentId, selected_block_ids: selectedBlockIds, prompt, mode, client_id: this.clientId }),
+      body: JSON.stringify(body),
     }, true);
   }
 

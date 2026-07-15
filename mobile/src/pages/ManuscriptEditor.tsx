@@ -102,6 +102,9 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
     if (!convertTask) return;
     if (convertTask.status === "succeeded" && convertTask.result?.document_id && openedDocumentTaskRef.current !== convertTask.id) {
       openedDocumentTaskRef.current = convertTask.id;
+      if (convertTask.result.warnings?.length) {
+        sessionStorage.setItem(`meetingmate.convertWarnings.${convertTask.result.document_id}`, JSON.stringify(convertTask.result.warnings));
+      }
       onOpenDocument(convertTask.result.document_id);
       return;
     }
@@ -548,8 +551,6 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
     }
     const hasPendingAudio = visibleBlocks.some((block) => block.type === "audio" && !block.props.transcript);
     if (hasPendingAudio && !window.confirm("存在录音尚未完成转写，建议等待 ASR 完成后再转文档。仍然继续？")) return;
-    const hasUnrecognizedHandwriting = visibleBlocks.some((block) => block.type === "handwriting" && block.props.strokes.length > 0 && !block.props.ai_text?.trim());
-    if (hasUnrecognizedHandwriting && !window.confirm("当前后端尚未接入手写识别，未识别的手写块不会出现在转换后的文档中。仍然继续？")) return;
     if (recognizingImageAssetIds.length > 0 && !window.confirm("图片文字仍在提取，继续转换时后端会尝试补充提取文本。仍然继续？")) return;
     await flushOps({ throwOnError: true });
     const taskResult = await api.convertManuscript(manuscript.id, mode, title, optimizeAudio);
