@@ -15,6 +15,7 @@ os.environ["MEETINGMATE_SKIP_DOTENV"] = "1"
 
 import app.main as backend
 from app.asr import AsrProvider, AsrResult, AsrSegment
+from app.text import TextProvider
 from app.vision import VisionProvider, VisionResult
 
 
@@ -50,6 +51,12 @@ class TestAsrProvider(AsrProvider):
 
 
 class TestVisionProvider(VisionProvider):
+    calls: list[dict[str, object]] = []
+
+    @classmethod
+    def reset_calls(cls) -> None:
+        cls.calls = []
+
     async def recognize(
         self,
         *,
@@ -59,12 +66,29 @@ class TestVisionProvider(VisionProvider):
         width: int | None,
         height: int | None,
         language: str,
+        prompt: str | None = None,
     ) -> VisionResult:
         assert filename
         assert content_type.startswith("image/")
         assert content
-        assert width == 320
-        assert height == 200
+        self.calls.append({"filename": filename, "content_type": content_type, "content": content, "prompt": prompt})
+        if prompt and "手写手稿" in prompt:
+            assert content_type == "image/png"
+            assert content.startswith(b"\x89PNG\r\n\x1a\n")
+            return VisionResult(
+                caption="手写流程图",
+                text="```json\n"
+                + json.dumps(
+                    {
+                        "recognized_text": "移动端优先推进",
+                        "has_keepable_drawing": True,
+                        "drawing_caption": "手写流程图",
+                        "confidence": 0.86,
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n```",
+            )
         return VisionResult(caption="白板架构图", text="白板架构图\n移动端、PC 端和后端 API 协作。")
 
     async def stream_recognize(
@@ -76,10 +100,17 @@ class TestVisionProvider(VisionProvider):
         width: int | None,
         height: int | None,
         language: str,
+        prompt: str | None = None,
     ):
         assert content
         yield "白板架构图\n"
         yield "白板架构图\n移动端、PC 端和后端 API 协作。"
+
+
+class TestTextProvider(TextProvider):
+    async def clean_transcript(self, text: str, language: str = "zh-CN") -> str:
+        assert language == "zh-CN"
+        return text.replace("嗯", "").replace("就是", "").strip()
 
 
 class TestRepository:
@@ -357,6 +388,7 @@ app = backend.app
 app.dependency_overrides[backend.get_repository] = lambda: repo
 app.state.asr_provider = TestAsrProvider()
 app.state.vision_provider = TestVisionProvider()
+app.state.text_provider = TestTextProvider()
 
 
 client = TestClient(app)
@@ -396,6 +428,40 @@ def upload_single_part(upload_response, content: bytes) -> dict:
     metadata = response.json()
     assert metadata == {"part_number": part["part_number"], "etag": response.headers["etag"], "size_bytes": len(content)}
     return metadata
+
+
+def upload_ready_image(auth: dict, device_id: str, idempotency_prefix: str, content: bytes = b"fake-png-image") -> str:
+    checksum = hashlib.sha256(content).hexdigest()
+    upload = client.post(
+        "/api/v1/assets/upload",
+        json={
+            "kind": "image",
+            "filename": "whiteboard.png",
+            "content_type": "image/png",
+            "size_bytes": len(content),
+            "checksum_sha256": checksum,
+            "part_size_bytes": len(content),
+        },
+        headers=auth_headers(auth, device_id, f"{idempotency_prefix}_upload"),
+    )
+    assert upload.status_code == 201, upload.text
+    uploaded_part = upload_single_part(upload, content)
+    asset_id = upload.json()["asset_id"]
+    complete = client.post(
+        f"/api/v1/assets/{asset_id}/complete",
+        json={
+            "upload_id": upload.json()["upload_id"],
+            "size_bytes": len(content),
+            "checksum_sha256": checksum,
+            "parts": [uploaded_part],
+            "duration_ms": None,
+            "width": 320,
+            "height": 200,
+        },
+        headers=auth_headers(auth, device_id, f"{idempotency_prefix}_complete"),
+    )
+    assert complete.status_code == 200, complete.text
+    return asset_id
 
 
 def sse_events(text: str, event_name: str) -> list[dict]:
@@ -467,6 +533,50 @@ def test_postgres_asset_save_persists_part_contents_as_base64_jsonb() -> None:
     query, args = fake_pool.calls[0]
     assert "part_contents" in query
     assert json.loads(args[15]) == {"1": base64.b64encode(content).decode("ascii")}
+
+
+def test_postgres_image_asset_save_persists_content_bytea() -> None:
+    class FakePool:
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def execute(self, query: str, *args):
+            self.calls.append((query, args))
+
+    now = backend.utcnow()
+    fake_pool = FakePool()
+    postgres = backend.PostgresRepository.__new__(backend.PostgresRepository)
+    postgres.pool = fake_pool
+    content = b"fake-png-image"
+    record = backend.AssetRecord(
+        owner_id="u_test",
+        asset=backend.Asset(
+            id="asset_image_test",
+            kind="image",
+            filename="whiteboard.png",
+            content_type="image/png",
+            size_bytes=len(content),
+            checksum_sha256=hashlib.sha256(content).hexdigest(),
+            duration_ms=None,
+            width=320,
+            height=200,
+            status="ready",
+            url=None,
+            created_at=now,
+            updated_at=now,
+        ),
+        upload_id="upload_image_test",
+        part_size_bytes=len(content),
+        uploaded_parts=[backend.UploadedPart(part_number=1, etag=hashlib.sha256(content).hexdigest(), size_bytes=len(content))],
+        content=content,
+    )
+
+    asyncio.run(postgres.save_asset(record))
+
+    query, args = fake_pool.calls[0]
+    assert "content" in query
+    assert args[2] == "image"
+    assert args[14] == content
 
 
 def test_p0_flow_register_upload_manuscript_convert_export() -> None:
@@ -566,12 +676,15 @@ def test_p0_flow_register_upload_manuscript_convert_export() -> None:
 
     convert = client.post(
         "/api/v1/tasks/convert-manuscript",
-        json={"manuscript_id": manuscript_id, "mode": "meeting_minutes", "title": "Minutes", "client_id": "device_test"},
+        json={"manuscript_id": manuscript_id, "mode": "meeting_minutes", "title": "Minutes", "client_id": "device_test", "optimize_audio": False},
         headers=auth_headers(auth, idempotency_key="idem_convert"),
     )
     assert convert.status_code == 202, convert.text
-    assert convert.json()["status"] == "succeeded"
-    document_id = convert.json()["result"]["document_id"]
+    assert convert.json()["status"] == "queued"
+    convert_task = client.get(f"/api/v1/tasks/{convert.json()['id']}", headers=auth_headers(auth))
+    assert convert_task.status_code == 200, convert_task.text
+    assert convert_task.json()["status"] == "succeeded"
+    document_id = convert_task.json()["result"]["document_id"]
     document = client.get(f"/api/v1/documents/{document_id}", headers=auth_headers(auth))
     assert document.status_code == 200, document.text
     assert document.json()["derived_from"]["manuscript_id"] == manuscript_id
@@ -624,6 +737,52 @@ def test_asset_stream_can_fallback_to_stored_part_contents() -> None:
     assert stream.status_code == 200, stream.text
     assert stream.content == content
     assert stream.headers["content-type"] == "audio/webm"
+
+
+def test_image_asset_stream_handles_unicode_filename_and_persists_content() -> None:
+    repo.reset()
+    auth = register_user("unicode-image@example.com", "device_unicode_image")
+    content = b"fake-unicode-png-image"
+    checksum = hashlib.sha256(content).hexdigest()
+    upload = client.post(
+        "/api/v1/assets/upload",
+        json={
+            "kind": "image",
+            "filename": "会议白板.png",
+            "content_type": "image/png",
+            "size_bytes": len(content),
+            "checksum_sha256": checksum,
+            "part_size_bytes": len(content),
+        },
+        headers=auth_headers(auth, "device_unicode_image", "idem_unicode_image_upload"),
+    )
+    assert upload.status_code == 201, upload.text
+    uploaded_part = upload_single_part(upload, content)
+    asset_id = upload.json()["asset_id"]
+    complete = client.post(
+        f"/api/v1/assets/{asset_id}/complete",
+        json={
+            "upload_id": upload.json()["upload_id"],
+            "size_bytes": len(content),
+            "checksum_sha256": checksum,
+            "parts": [uploaded_part],
+            "duration_ms": None,
+            "width": 320,
+            "height": 200,
+        },
+        headers=auth_headers(auth, "device_unicode_image", "idem_unicode_image_complete"),
+    )
+    assert complete.status_code == 200, complete.text
+    assert repo.assets[asset_id].content == content
+    assert repo.assets[asset_id].asset.kind == "image"
+    assert repo.assets[asset_id].asset.status == "ready"
+
+    stream = client.get(f"/api/v1/assets/{asset_id}/stream", headers=auth_headers(auth, "device_unicode_image"))
+    assert stream.status_code == 200, stream.text
+    assert stream.content == content
+    disposition = stream.headers["content-disposition"]
+    disposition.encode("latin-1")
+    assert "filename*=UTF-8''%E4%BC%9A%E8%AE%AE%E7%99%BD%E6%9D%BF.png" in disposition
 
 
 def test_group_flow_create_join_send_and_download_document_snapshot() -> None:
@@ -830,17 +989,286 @@ def test_image_recognition_task_updates_image_block_and_convert_keeps_source_ref
 
     convert = client.post(
         "/api/v1/tasks/convert-manuscript",
-        json={"manuscript_id": manuscript.json()["id"], "mode": "meeting_minutes", "title": "Image Doc", "client_id": "device_image"},
+        json={"manuscript_id": manuscript.json()["id"], "mode": "meeting_minutes", "title": "Image Doc", "client_id": "device_image", "optimize_audio": False},
         headers=auth_headers(auth, "device_image", "idem_image_convert"),
     )
     assert convert.status_code == 202, convert.text
-    document = client.get(f"/api/v1/documents/{convert.json()['result']['document_id']}", headers=auth_headers(auth, "device_image"))
+    convert_task = client.get(f"/api/v1/tasks/{convert.json()['id']}", headers=auth_headers(auth, "device_image"))
+    assert convert_task.status_code == 200, convert_task.text
+    assert convert_task.json()["status"] == "succeeded"
+    document = client.get(f"/api/v1/documents/{convert_task.json()['result']['document_id']}", headers=auth_headers(auth, "device_image"))
     assert document.status_code == 200, document.text
     document_block = document.json()["blocks"][0]
     assert document_block["type"] == "image"
     assert document_block["props"]["asset_id"] == asset_id
     assert document_block["props"]["caption"] == "白板架构图"
     assert document_block["source_refs"][0]["block_id"] == "block_image1"
+
+
+def test_image_recognition_does_not_overwrite_existing_caption() -> None:
+    repo.reset()
+    auth = register_user("image-caption@example.com", "device_caption")
+    asset_id = upload_ready_image(auth, "device_caption", "idem_caption_image")
+    created_at = iso_now()
+    manuscript = client.post(
+        "/api/v1/manuscripts",
+        json={
+            "title": "Caption",
+            "client_id": "device_caption",
+            "initial_blocks": [
+                {
+                    "id": "block_image_caption",
+                    "type": "image",
+                    "revision": 1,
+                    "created_at": created_at,
+                    "updated_at": created_at,
+                    "author_id": auth["user"]["id"],
+                    "client_id": "device_caption",
+                    "platform": "web",
+                    "deleted": False,
+                    "props": {"asset_id": asset_id, "caption": "用户手写描述", "width": 320, "height": 200},
+                }
+            ],
+        },
+        headers=auth_headers(auth, "device_caption", "idem_caption_manuscript"),
+    )
+    assert manuscript.status_code == 201, manuscript.text
+    recognize = client.post(
+        "/api/v1/tasks/recognize-image",
+        json={"asset_id": asset_id, "language": "zh-CN", "client_id": "device_caption"},
+        headers=auth_headers(auth, "device_caption", "idem_caption_task"),
+    )
+    assert recognize.status_code == 202, recognize.text
+    task = client.get(f"/api/v1/tasks/{recognize.json()['id']}", headers=auth_headers(auth, "device_caption"))
+    assert task.json()["status"] == "succeeded"
+    assert task.json()["result"]["caption"] == "白板架构图"
+    fetched = client.get(f"/api/v1/manuscripts/{manuscript.json()['id']}", headers=auth_headers(auth, "device_caption"))
+    image_props = fetched.json()["blocks"][0]["props"]
+    assert image_props["caption"] == "用户手写描述"
+    assert image_props["recognition_task_id"] is None
+
+
+def test_convert_manuscript_async_builds_mixed_blocks_and_warnings() -> None:
+    repo.reset()
+    TestVisionProvider.reset_calls()
+    auth = register_user("convert-mixed@example.com", "device_convert")
+    asset_id = upload_ready_image(auth, "device_convert", "idem_convert_image")
+    now = backend.utcnow()
+    for audio_asset_id in ["asset_audio_local", "asset_audio_empty"]:
+        content = f"{audio_asset_id}-bytes".encode("utf-8")
+        repo.assets[audio_asset_id] = backend.AssetRecord(
+            owner_id=auth["user"]["id"],
+            asset=backend.Asset(
+                id=audio_asset_id,
+                kind="audio",
+                filename=f"{audio_asset_id}.wav",
+                content_type="audio/wav",
+                size_bytes=len(content),
+                checksum_sha256=hashlib.sha256(content).hexdigest(),
+                duration_ms=1000,
+                width=None,
+                height=None,
+                status="ready",
+                url=None,
+                created_at=now,
+                updated_at=now,
+            ),
+            upload_id=f"upload_{audio_asset_id}",
+            part_size_bytes=len(content),
+            uploaded_parts=[],
+            content=content,
+        )
+    created_at = iso_now()
+    manuscript = client.post(
+        "/api/v1/manuscripts",
+        json={
+            "title": "Mixed Manuscript",
+            "client_id": "device_convert",
+            "initial_blocks": [
+                {
+                    "id": "block_text_convert",
+                    "type": "text",
+                    "revision": 1,
+                    "created_at": created_at,
+                    "updated_at": created_at,
+                    "author_id": auth["user"]["id"],
+                    "client_id": "device_convert",
+                    "platform": "web",
+                    "deleted": False,
+                    "props": {"content": "会议目标：推进移动端。"},
+                },
+                {
+                    "id": "block_audio_convert",
+                    "type": "audio",
+                    "revision": 1,
+                    "created_at": created_at,
+                    "updated_at": created_at,
+                    "author_id": auth["user"]["id"],
+                    "client_id": "device_convert",
+                    "platform": "web",
+                    "deleted": False,
+                    "props": {"asset_id": "asset_audio_local", "duration_ms": 1000, "transcript": "嗯我们就是今天讨论移动端", "speaker_segments": []},
+                },
+                {
+                    "id": "block_audio_empty",
+                    "type": "audio",
+                    "revision": 1,
+                    "created_at": created_at,
+                    "updated_at": created_at,
+                    "author_id": auth["user"]["id"],
+                    "client_id": "device_convert",
+                    "platform": "web",
+                    "deleted": False,
+                    "props": {"asset_id": "asset_audio_empty", "duration_ms": 1000, "transcript": "", "speaker_segments": []},
+                },
+                {
+                    "id": "block_image_convert",
+                    "type": "image",
+                    "revision": 1,
+                    "created_at": created_at,
+                    "updated_at": created_at,
+                    "author_id": auth["user"]["id"],
+                    "client_id": "device_convert",
+                    "platform": "web",
+                    "deleted": False,
+                    "props": {"asset_id": asset_id, "caption": "", "width": 320, "height": 200},
+                },
+                {
+                    "id": "block_hw_convert",
+                    "type": "handwriting",
+                    "revision": 1,
+                    "created_at": created_at,
+                    "updated_at": created_at,
+                    "author_id": auth["user"]["id"],
+                    "client_id": "device_convert",
+                    "platform": "web",
+                    "deleted": False,
+                    "props": {
+                        "strokes": [
+                            {
+                                "id": "stroke_1",
+                                "tool": "pen",
+                                "color": "#111111",
+                                "width": 2,
+                                "points": [
+                                    {"x": 10, "y": 10, "t": 0, "pressure": 0.5},
+                                    {"x": 120, "y": 30, "t": 16, "pressure": 0.5},
+                                ],
+                            }
+                        ],
+                        "image_asset_id": None,
+                        "ai_text": "",
+                    },
+                },
+            ],
+        },
+        headers=auth_headers(auth, "device_convert", "idem_convert_manuscript"),
+    )
+    assert manuscript.status_code == 201, manuscript.text
+    convert = client.post(
+        "/api/v1/tasks/convert-manuscript",
+        json={"manuscript_id": manuscript.json()["id"], "mode": "meeting_minutes", "title": "Mixed Doc", "client_id": "device_convert", "optimize_audio": True},
+        headers=auth_headers(auth, "device_convert", "idem_convert_task"),
+    )
+    assert convert.status_code == 202, convert.text
+    assert convert.json()["status"] == "queued"
+    task = client.get(f"/api/v1/tasks/{convert.json()['id']}", headers=auth_headers(auth, "device_convert"))
+    assert task.status_code == 200, task.text
+    assert task.json()["status"] == "succeeded"
+    assert task.json()["progress"]["stage"] == "completed"
+    assert task.json()["progress"]["current"] == task.json()["progress"]["total"]
+    warning_codes = {warning["code"] for warning in task.json()["result"].get("warnings", [])}
+    assert "audio_transcript_missing" in warning_codes
+    document = client.get(f"/api/v1/documents/{task.json()['result']['document_id']}", headers=auth_headers(auth, "device_convert"))
+    assert document.status_code == 200, document.text
+    blocks = document.json()["blocks"]
+    assert blocks[0]["type"] == "paragraph"
+    assert blocks[0]["props"]["content"] == "会议目标：推进移动端。"
+    assert blocks[1]["props"]["content"] == "发言：我们今天讨论移动端"
+    assert blocks[2]["type"] == "image"
+    assert blocks[2]["props"]["asset_id"] == asset_id
+    assert blocks[2]["props"]["caption"] == "白板架构图"
+    assert blocks[3]["type"] == "image"
+    assert blocks[3]["props"]["caption"] == "手写流程图"
+    assert blocks[4]["type"] == "heading"
+    assert blocks[4]["props"]["content"] == "移动端优先推进"
+    assert {block["source_refs"][0]["block_id"] for block in blocks if block["source_refs"]} >= {"block_text_convert", "block_audio_convert", "block_image_convert", "block_hw_convert"}
+    rendered = next(record for record in repo.assets.values() if record.asset.filename == "block_hw_convert.png")
+    assert rendered.asset.content_type == "image/png"
+    assert rendered.asset.width >= 320
+    assert rendered.asset.height >= 120
+    assert rendered.content and rendered.content.startswith(b"\x89PNG\r\n\x1a\n")
+    handwriting_calls = [call for call in TestVisionProvider.calls if call.get("prompt")]
+    assert len(handwriting_calls) == 1
+    assert handwriting_calls[0]["content_type"] == "image/png"
+
+
+def test_handwriting_convert_does_not_send_svg_to_vision() -> None:
+    repo.reset()
+    TestVisionProvider.reset_calls()
+    auth = register_user("convert-svg@example.com", "device_convert_svg")
+    now = backend.utcnow()
+    svg_content = b'<svg xmlns="http://www.w3.org/2000/svg"><text>SVG</text></svg>'
+    svg_asset_id = "asset_hw_svg"
+    repo.assets[svg_asset_id] = backend.AssetRecord(
+        owner_id=auth["user"]["id"],
+        asset=backend.Asset(
+            id=svg_asset_id,
+            kind="image",
+            filename="handwriting.svg",
+            content_type="image/svg+xml",
+            size_bytes=len(svg_content),
+            checksum_sha256=hashlib.sha256(svg_content).hexdigest(),
+            duration_ms=None,
+            width=320,
+            height=120,
+            status="ready",
+            url=None,
+            created_at=now,
+            updated_at=now,
+        ),
+        upload_id="upload_hw_svg",
+        part_size_bytes=len(svg_content),
+        uploaded_parts=[],
+        content=svg_content,
+    )
+    created_at = iso_now()
+    manuscript = client.post(
+        "/api/v1/manuscripts",
+        json={
+            "title": "SVG Handwriting",
+            "client_id": "device_convert_svg",
+            "initial_blocks": [
+                {
+                    "id": "block_hw_svg",
+                    "type": "handwriting",
+                    "revision": 1,
+                    "created_at": created_at,
+                    "updated_at": created_at,
+                    "author_id": auth["user"]["id"],
+                    "client_id": "device_convert_svg",
+                    "platform": "web",
+                    "deleted": False,
+                    "props": {"strokes": [], "image_asset_id": svg_asset_id, "ai_text": ""},
+                }
+            ],
+        },
+        headers=auth_headers(auth, "device_convert_svg", "idem_svg_manuscript"),
+    )
+    assert manuscript.status_code == 201, manuscript.text
+
+    convert = client.post(
+        "/api/v1/tasks/convert-manuscript",
+        json={"manuscript_id": manuscript.json()["id"], "mode": "meeting_minutes", "title": "SVG Doc", "client_id": "device_convert_svg", "optimize_audio": False},
+        headers=auth_headers(auth, "device_convert_svg", "idem_svg_convert"),
+    )
+    assert convert.status_code == 202, convert.text
+    task = client.get(f"/api/v1/tasks/{convert.json()['id']}", headers=auth_headers(auth, "device_convert_svg"))
+    assert task.status_code == 200, task.text
+    assert task.json()["status"] == "succeeded"
+    warning_codes = {warning["code"] for warning in task.json()["result"].get("warnings", [])}
+    assert "handwriting_render_failed" in warning_codes
+    assert TestVisionProvider.calls == []
 
 
 def test_idempotency_conflict_and_revision_conflict() -> None:
@@ -872,6 +1300,10 @@ def test_openapi_declares_required_auth_and_write_headers() -> None:
     parameter_names = {parameter["name"] for parameter in upload["parameters"]}
     assert {"X-Client-Id", "Idempotency-Key"}.issubset(parameter_names)
     assert upload["security"] == [{"HTTPBearer": []}]
+    convert_request = schema["components"]["schemas"]["ConvertManuscriptRequest"]
+    assert "optimize_audio" in convert_request["required"]
+    assert convert_request["properties"]["optimize_audio"]["type"] == "boolean"
+    assert "/api/v1/tasks/recognize-image" in schema["paths"]
 
 
 def test_logout_revokes_current_access_token() -> None:

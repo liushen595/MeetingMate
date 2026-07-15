@@ -7,6 +7,7 @@ import io
 import json
 import math
 import os
+import re
 import secrets
 import uuid
 import zipfile
@@ -31,8 +32,9 @@ from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.requests import HTTPConnection
 
-from app.asr import AsrProvider, AsrProviderError, AsrResult, provider_from_environment, result_from_text, stream_delta
+from app.asr import AsrProvider, AsrProviderError, AsrResult, provider_from_environment as asr_provider_from_environment, result_from_text, stream_delta
 from app.database import DatabaseSettings, DatabaseState, check_database, close_database, connect_database, load_database_settings
+from app.text import TextProvider, local_clean_transcript, provider_from_environment as text_provider_from_environment
 from app.vision import VisionProvider, VisionProviderError, VisionResult, provider_from_environment as vision_provider_from_environment, result_from_text as vision_result_from_text
 
 
@@ -50,6 +52,19 @@ MAX_CLIENT_TIME_SKEW_SECONDS = 24 * 60 * 60
 GROUP_INVITE_CODE_SECONDS = 24 * 60 * 60
 MAX_INVITE_CODE_ATTEMPTS = 10
 DEFAULT_CORS_ORIGIN_REGEX = r"^https?://(localhost|127\.0\.0\.1|10\.(?:\d{1,3}\.){2}\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3})(?::\d+)?$"
+HANDWRITING_BITMAP_CONTENT_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/bmp"}
+HANDWRITING_RENDER_SCALE = 2
+HANDWRITING_RECOGNITION_PROMPT = """
+请识别这张手写手稿图片。
+只输出 JSON，不要输出 Markdown，不要输出解释。
+recognized_text 是图中可读手写正文，尽量按原始换行返回。
+has_keepable_drawing 表示图片中是否有值得在正式文档中保留的手绘图、示意图、流程图、结构图或草图。
+如果只有手写文字，没有图示，has_keepable_drawing 必须为 false。
+drawing_caption 是可保留手绘图的一句话说明；没有可保留绘图时返回空字符串。
+confidence 是 0 到 1 的识别置信度。
+不要编造看不见的信息。
+返回格式：{"recognized_text":"","has_keepable_drawing":false,"drawing_caption":"","confidence":0}
+""".strip()
 
 
 Platform = Literal["ios", "android", "mac", "windows", "web"]
@@ -161,6 +176,7 @@ async def lifespan(app: FastAPI):
     app.state.repository = PostgresRepository(app.state.database)
     app.state.asr_provider = build_asr_provider()
     app.state.vision_provider = build_vision_provider()
+    app.state.text_provider = build_text_provider()
     try:
         yield
     finally:
@@ -184,11 +200,15 @@ def make_invite_code() -> str:
 
 
 def build_asr_provider() -> AsrProvider:
-    return provider_from_environment(settings.asr_provider)
+    return asr_provider_from_environment(settings.asr_provider)
 
 
 def build_vision_provider() -> VisionProvider:
     return vision_provider_from_environment(settings.vision_provider)
+
+
+def build_text_provider() -> TextProvider:
+    return text_provider_from_environment()
 
 
 def get_asr_provider(request: Request) -> AsrProvider:
@@ -204,6 +224,14 @@ def get_vision_provider(request: Request) -> VisionProvider:
     if provider is None:
         provider = build_vision_provider()
         request.app.state.vision_provider = provider
+    return provider
+
+
+def get_text_provider(request: Request) -> TextProvider:
+    provider = getattr(request.app.state, "text_provider", None)
+    if provider is None:
+        provider = build_text_provider()
+        request.app.state.text_provider = provider
     return provider
 
 
@@ -881,6 +909,7 @@ class ConvertManuscriptRequest(StrictModel):
     mode: Literal["meeting_minutes", "todo_list", "article_draft"]
     title: str
     client_id: str
+    optimize_audio: bool
 
 
 class AsrAudioRequest(StrictModel):
@@ -2245,13 +2274,18 @@ def require_asset_content(record: AssetRecord) -> bytes:
     return content
 
 
+def header_filename_fallback(filename: str, default: str) -> str:
+    fallback = "".join(char if 32 <= ord(char) < 127 and char not in {'\\', '/', '"'} else "_" for char in filename).strip()
+    return fallback or default
+
+
 def content_disposition_filename(filename: str) -> str:
-    fallback = filename.replace("\\", "_").replace("/", "_").replace('"', "_").strip() or "asset"
+    fallback = header_filename_fallback(filename, "asset")
     return f"inline; filename=\"{fallback}\"; filename*=UTF-8''{quote(filename, safe='')}"
 
 
 def attachment_disposition_filename(filename: str) -> str:
-    fallback = "".join(char if 32 <= ord(char) < 127 and char not in {'\\', '/', '"'} else "_" for char in filename).strip() or "document"
+    fallback = header_filename_fallback(filename, "document")
     return f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{quote(filename, safe='')}"
 
 
@@ -2292,10 +2326,211 @@ def source_ref(manuscript_id: str, block_id: str, time_range: SourceRange | None
     return [SourceRef(manuscript_id=manuscript_id, block_id=block_id, range=time_range, region=region)]
 
 
-async def build_document_blocks_from_manuscript(db: PostgresRepository, manuscript: Manuscript, task_id: str, client_id: str) -> list[DocumentBlock]:
+def convert_warning(block_id: str, code: str, message: str) -> dict[str, str]:
+    return {"block_id": block_id, "code": code, "message": message}
+
+
+def strip_speech_prefix(text: str) -> str:
+    return re.sub(r"^(?:发言[:：]\s*)+", "", text.strip())
+
+
+def speech_paragraph_text(text: str) -> str:
+    content = strip_speech_prefix(text)
+    return f"发言：{content}" if content else ""
+
+
+def fallback_optimize_audio_transcript(text: str) -> str:
+    content = local_clean_transcript(text)
+    content = re.sub(r"([，,。！？!?])\1+", r"\1", content)
+    return content
+
+
+async def optimize_audio_transcript(text: str, optimize_audio: bool, text_provider: TextProvider) -> str:
+    content = strip_speech_prefix(text)
+    if not optimize_audio:
+        return content
+    try:
+        optimized = strip_speech_prefix(await text_provider.clean_transcript(content, language="zh-CN"))
+        return optimized if optimized else fallback_optimize_audio_transcript(content)
+    except Exception:
+        return fallback_optimize_audio_transcript(content)
+
+
+def image_props_with_caption(props: ImageProps, caption: str) -> ImageProps:
+    return props.model_copy(update={"caption": caption})
+
+
+def looks_like_heading(text: str) -> bool:
+    return 0 < len(text.strip()) <= 20
+
+
+def stroke_bounds(strokes: list[Stroke]) -> tuple[int, int]:
+    points = [point for stroke in strokes for point in stroke.points]
+    if not points:
+        return 320, 120
+    width = max(320, math.ceil(max(point.x for point in points) + 24))
+    height = max(120, math.ceil(max(point.y for point in points) + 24))
+    return width, height
+
+
+def safe_hex_color(value: str) -> str:
+    return value if re.fullmatch(r"#[0-9A-Fa-f]{3}(?:[0-9A-Fa-f]{3})?", value) else "#111111"
+
+
+def is_supported_handwriting_bitmap(content_type: str) -> bool:
+    return content_type.split(";", 1)[0].strip().lower() in HANDWRITING_BITMAP_CONTENT_TYPES
+
+
+def render_handwriting_png(strokes: list[Stroke]) -> tuple[bytes, int, int]:
+    try:
+        from PIL import Image, ImageDraw
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("Pillow is required to render handwriting strokes.") from exc
+
+    width, height = stroke_bounds(strokes)
+    scale = HANDWRITING_RENDER_SCALE
+    image = Image.new("RGB", (width * scale, height * scale), "#ffffff")
+    draw = ImageDraw.Draw(image)
+    for stroke in strokes:
+        if not stroke.points:
+            continue
+        color = "#ffffff" if stroke.tool == "eraser" else safe_hex_color(stroke.color)
+        stroke_width = max(1, round(stroke.width * scale))
+        points = [(point.x * scale, point.y * scale) for point in stroke.points]
+        if len(points) == 1:
+            x, y = points[0]
+            radius = stroke_width / 2
+            draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=color)
+        else:
+            draw.line(points, fill=color, width=stroke_width, joint="curve")
+
+    resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+    if scale != 1:
+        image = image.resize((width, height), resampling)
+    output = io.BytesIO()
+    image.save(output, format="PNG")
+    return output.getvalue(), width, height
+
+
+async def save_handwriting_render_asset(db: PostgresRepository, owner_id: str, block_id: str, strokes: list[Stroke]) -> AssetRecord:
+    content, width, height = render_handwriting_png(strokes)
+    now = utcnow()
+    checksum = hashlib.sha256(content).hexdigest()
+    asset = Asset(
+        id=new_id("asset"),
+        kind="image",
+        filename=f"{block_id}.png",
+        content_type="image/png",
+        size_bytes=len(content),
+        checksum_sha256=checksum,
+        duration_ms=None,
+        width=width,
+        height=height,
+        status="ready",
+        url=None,
+        created_at=now,
+        updated_at=now,
+    )
+    record = AssetRecord(owner_id=owner_id, asset=asset, upload_id=new_id("upload"), part_size_bytes=max(1, len(content)), uploaded_parts=[], content=content)
+    await db.save_asset(record)
+    return record
+
+
+async def handwriting_image_record(db: PostgresRepository, owner_id: str, block: ManuscriptHandwritingBlock) -> AssetRecord | None:
+    if block.props.image_asset_id:
+        record = await get_asset_record(db, block.props.image_asset_id, owner_id)
+        if record.asset.kind == "image" and record.asset.status == "ready" and is_supported_handwriting_bitmap(record.asset.content_type):
+            return record
+        if not block.props.strokes:
+            raise validation_error("Handwriting recognition requires a ready bitmap image asset or strokes that can be rendered.")
+    if not block.props.strokes:
+        return None
+    return await save_handwriting_render_asset(db, owner_id, block.id, block.props.strokes)
+
+
+def strip_json_fence(text: str) -> str:
+    stripped = text.strip()
+    if not stripped.startswith("```"):
+        return stripped
+    lines = stripped.splitlines()
+    if len(lines) >= 2 and lines[0].startswith("```") and lines[-1].strip() == "```":
+        return "\n".join(lines[1:-1]).strip()
+    return stripped
+
+
+def extract_json_object(text: str) -> str | None:
+    stripped = strip_json_fence(text)
+    if stripped.startswith("{") and stripped.endswith("}"):
+        return stripped
+    start = stripped.find("{")
+    end = stripped.rfind("}")
+    if start != -1 and end > start:
+        return stripped[start : end + 1]
+    return None
+
+
+def parse_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes", "y"}
+    return bool(value)
+
+
+def parse_handwriting_result(text: str) -> dict[str, Any]:
+    raw = text.strip()
+    if not raw:
+        return {"recognized_text": "", "has_keepable_drawing": False, "drawing_caption": "", "confidence": None}
+    json_object = extract_json_object(raw)
+    if json_object is None:
+        return {"recognized_text": raw, "has_keepable_drawing": False, "drawing_caption": "", "confidence": None}
+    try:
+        payload = json.loads(json_object)
+    except json.JSONDecodeError:
+        return {"recognized_text": raw, "has_keepable_drawing": False, "drawing_caption": "", "confidence": None}
+    if not isinstance(payload, dict):
+        return {"recognized_text": raw, "has_keepable_drawing": False, "drawing_caption": "", "confidence": None}
+    confidence = payload.get("confidence")
+    if not isinstance(confidence, (int, float)):
+        confidence = None
+    return {
+        "recognized_text": str(payload.get("recognized_text") or "").strip(),
+        "has_keepable_drawing": parse_bool(payload.get("has_keepable_drawing")),
+        "drawing_caption": str(payload.get("drawing_caption") or "").strip(),
+        "confidence": confidence,
+    }
+
+
+def count_convert_model_units(manuscript: Manuscript, optimize_audio: bool) -> int:
+    total = 0
+    image_assets: set[str] = set()
+    for block in manuscript.blocks:
+        if block.deleted:
+            continue
+        if isinstance(block, ManuscriptAudioBlock) and optimize_audio and (block.props.speaker_segments or block.props.transcript):
+            total += max(1, len(block.props.speaker_segments))
+        elif isinstance(block, ManuscriptImageBlock) and not (block.props.caption or "").strip():
+            image_assets.add(block.props.asset_id)
+        elif isinstance(block, ManuscriptHandwritingBlock) and (block.props.strokes or block.props.image_asset_id):
+            total += 1
+    return total + len(image_assets)
+
+
+async def build_document_blocks_from_manuscript(
+    db: PostgresRepository,
+    manuscript: Manuscript,
+    task_id: str,
+    client_id: str,
+    optimize_audio: bool,
+    vision_provider: VisionProvider,
+    text_provider: TextProvider,
+    advance_progress: Any | None = None,
+) -> tuple[list[DocumentBlock], list[dict[str, str]]]:
     now = utcnow()
     platform = await device_platform(db, manuscript.owner_id, client_id)
     blocks: list[DocumentBlock] = []
+    warnings: list[dict[str, str]] = []
+    image_caption_cache: dict[str, str] = {}
     base = {
         "revision": 1,
         "created_at": now,
@@ -2322,11 +2557,20 @@ async def build_document_blocks_from_manuscript(db: PostgresRepository, manuscri
             segments = sorted(source.props.speaker_segments, key=lambda segment: segment.start_ms)
             if segments:
                 for segment in segments:
+                    content = segment.text
+                    if optimize_audio:
+                        content = await optimize_audio_transcript(segment.text, optimize_audio=True, text_provider=text_provider)
+                        if advance_progress:
+                            await advance_progress("正在优化录音内容")
+                    content = speech_paragraph_text(content)
+                    if not content:
+                        warnings.append(convert_warning(source.id, "audio_transcript_missing", "录音转写为空，已跳过该片段。"))
+                        continue
                     blocks.append(
                         DocumentParagraphBlock(
                             id=new_id("doc_block"),
                             type="paragraph",
-                            props=TextProps(content=segment.text),
+                            props=TextProps(content=content),
                             source_refs=source_ref(
                                 manuscript.id,
                                 source.id,
@@ -2336,28 +2580,15 @@ async def build_document_blocks_from_manuscript(db: PostgresRepository, manuscri
                         )
                     )
             elif source.props.transcript:
-                blocks.append(
-                    DocumentParagraphBlock(
-                        id=new_id("doc_block"),
-                        type="paragraph",
-                        props=TextProps(content=source.props.transcript),
-                        source_refs=source_ref(manuscript.id, source.id),
-                        **base,
-                    )
-                )
-        elif isinstance(source, ManuscriptHandwritingBlock) and source.props.ai_text:
-            content = source.props.ai_text
-            if len(content) <= 20:
-                blocks.append(
-                    DocumentHeadingBlock(
-                        id=new_id("doc_block"),
-                        type="heading",
-                        props=HeadingProps(level=2, content=content),
-                        source_refs=source_ref(manuscript.id, source.id),
-                        **base,
-                    )
-                )
-            else:
+                content = source.props.transcript
+                if optimize_audio:
+                    content = await optimize_audio_transcript(content, optimize_audio=True, text_provider=text_provider)
+                    if advance_progress:
+                        await advance_progress("正在优化录音内容")
+                content = speech_paragraph_text(content)
+                if not content:
+                    warnings.append(convert_warning(source.id, "audio_transcript_missing", "录音转写为空，已跳过该录音块。"))
+                    continue
                 blocks.append(
                     DocumentParagraphBlock(
                         id=new_id("doc_block"),
@@ -2367,12 +2598,117 @@ async def build_document_blocks_from_manuscript(db: PostgresRepository, manuscri
                         **base,
                     )
                 )
+            else:
+                warnings.append(convert_warning(source.id, "audio_transcript_missing", "录音没有可用转写文本，已跳过。"))
+        elif isinstance(source, ManuscriptHandwritingBlock):
+            content = (source.props.ai_text or "").strip()
+            image_record: AssetRecord | None = None
+            if source.props.strokes or source.props.image_asset_id:
+                try:
+                    image_record = await handwriting_image_record(db, manuscript.owner_id, source)
+                    if image_record:
+                        result = await vision_provider.recognize(
+                            filename=image_record.asset.filename,
+                            content_type=image_record.asset.content_type,
+                            content=require_asset_content(image_record),
+                            width=image_record.asset.width,
+                            height=image_record.asset.height,
+                            language="zh-CN",
+                            prompt=HANDWRITING_RECOGNITION_PROMPT,
+                        )
+                        parsed = parse_handwriting_result(result.text)
+                        content = str(parsed.get("recognized_text") or content).strip()
+                        if parsed.get("has_keepable_drawing"):
+                            blocks.append(
+                                DocumentImageBlock(
+                                    id=new_id("doc_block"),
+                                    type="image",
+                                    props=ImageProps(
+                                        asset_id=image_record.asset.id,
+                                        caption=str(parsed.get("drawing_caption") or ""),
+                                        width=image_record.asset.width,
+                                        height=image_record.asset.height,
+                                    ),
+                                    source_refs=source_ref(manuscript.id, source.id),
+                                    **base,
+                                )
+                            )
+                        if advance_progress:
+                            await advance_progress("正在识别手写内容")
+                except Exception:
+                    if image_record:
+                        blocks.append(
+                            DocumentImageBlock(
+                                id=new_id("doc_block"),
+                                type="image",
+                                props=ImageProps(asset_id=image_record.asset.id, caption="", width=image_record.asset.width, height=image_record.asset.height),
+                                source_refs=source_ref(manuscript.id, source.id),
+                                **base,
+                            )
+                        )
+                        warnings.append(convert_warning(source.id, "handwriting_recognition_failed", "手写识别失败，已保留手写图片。"))
+                    else:
+                        warnings.append(convert_warning(source.id, "handwriting_render_failed", "手写渲染失败，已跳过该手写块。"))
+                    if advance_progress:
+                        await advance_progress("手写处理已降级")
+            elif not content:
+                warnings.append(convert_warning(source.id, "handwriting_empty", "手写块为空，已跳过。"))
+            if content:
+                block_type = "heading" if looks_like_heading(content) else "paragraph"
+                if block_type == "heading":
+                    blocks.append(
+                        DocumentHeadingBlock(
+                            id=new_id("doc_block"),
+                            type="heading",
+                            props=HeadingProps(level=2, content=content),
+                            source_refs=source_ref(manuscript.id, source.id),
+                            **base,
+                        )
+                    )
+                else:
+                    blocks.append(
+                        DocumentParagraphBlock(
+                            id=new_id("doc_block"),
+                            type="paragraph",
+                            props=TextProps(content=content),
+                            source_refs=source_ref(manuscript.id, source.id),
+                            **base,
+                        )
+                    )
         elif isinstance(source, ManuscriptImageBlock):
+            caption = (source.props.caption or "").strip()
+            if not caption:
+                try:
+                    requested_caption = False
+                    if source.props.asset_id in image_caption_cache:
+                        caption = image_caption_cache[source.props.asset_id]
+                    else:
+                        image_record = await get_asset_record(db, source.props.asset_id, manuscript.owner_id)
+                        if image_record.asset.kind != "image" or image_record.asset.status != "ready":
+                            raise validation_error("Image block references an unavailable image asset.")
+                        result = await vision_provider.recognize(
+                            filename=image_record.asset.filename,
+                            content_type=image_record.asset.content_type,
+                            content=require_asset_content(image_record),
+                            width=image_record.asset.width,
+                            height=image_record.asset.height,
+                            language="zh-CN",
+                        )
+                        caption = result.caption
+                        image_caption_cache[source.props.asset_id] = caption
+                        requested_caption = True
+                    if requested_caption and advance_progress:
+                        await advance_progress("正在生成图片描述")
+                except Exception:
+                    caption = ""
+                    warnings.append(convert_warning(source.id, "image_caption_failed", "图片描述生成失败，已保留原图。"))
+                    if advance_progress:
+                        await advance_progress("图片描述已降级")
             blocks.append(
                 DocumentImageBlock(
                     id=new_id("doc_block"),
                     type="image",
-                    props=source.props,
+                    props=image_props_with_caption(source.props, caption),
                     source_refs=source_ref(manuscript.id, source.id),
                     **base,
                 )
@@ -2387,7 +2723,7 @@ async def build_document_blocks_from_manuscript(db: PostgresRepository, manuscri
                 **base,
             )
         )
-    return blocks
+    return blocks, warnings
 
 
 def document_plain_text(document: Document) -> str:
@@ -2489,6 +2825,9 @@ async def apply_image_result_to_manuscripts(
         updated_blocks: list[ManuscriptBlock] = []
         for block in manuscript.blocks:
             if isinstance(block, ManuscriptImageBlock) and block.props.asset_id == asset_id:
+                if (block.props.caption or "").strip():
+                    updated_blocks.append(block)
+                    continue
                 props = block.props.model_copy(
                     update={
                         "caption": result.caption or result.text or block.props.caption,
@@ -2782,6 +3121,115 @@ async def stream_image_task_events(
         message = "Image recognition service is temporarily unavailable."
         await save_failed_image_task(db, owner_id, processing, message, retryable=True)
         yield sse_event("error", {"code": "ai_unavailable", "message": message})
+
+
+async def process_convert_task(
+    db: PostgresRepository,
+    owner_id: str,
+    task_id: str,
+    manuscript: Manuscript,
+    payload: ConvertManuscriptRequest,
+    provider: VisionProvider,
+    text_provider: TextProvider,
+) -> None:
+    task = await get_task(db, task_id, owner_id)
+    if task.status == "cancelled":
+        return
+
+    total = max(2, count_convert_model_units(manuscript, payload.optimize_audio) + 2)
+    current = 1
+    state = task.model_copy(
+        update={
+            "status": "processing",
+            "progress": TaskProgress(stage="llm_parse", current=current, total=total, message="正在分析手稿处理单元"),
+            "updated_at": utcnow(),
+        }
+    )
+    await db.save_task(owner_id, state)
+
+    async def advance_progress(message: str) -> None:
+        nonlocal current, state
+        current = min(total - 1, current + 1)
+        state = state.model_copy(
+            update={
+                "progress": TaskProgress(stage="llm_parse", current=current, total=total, message=message),
+                "updated_at": utcnow(),
+            }
+        )
+        await db.save_task(owner_id, state)
+
+    try:
+        blocks, warnings = await build_document_blocks_from_manuscript(
+            db,
+            manuscript,
+            task_id,
+            payload.client_id,
+            payload.optimize_audio,
+            provider,
+            text_provider,
+            advance_progress,
+        )
+        latest = await get_task(db, task_id, owner_id)
+        if latest.status == "cancelled":
+            return
+
+        state = state.model_copy(
+            update={
+                "progress": TaskProgress(stage="document_build", current=total - 1, total=total, message="正在组装文档"),
+                "updated_at": utcnow(),
+            }
+        )
+        await db.save_task(owner_id, state)
+
+        now = utcnow()
+        derived_from = DerivedFrom(manuscript_id=manuscript.id, task_id=task_id, mode=payload.mode, converted_at=now)
+        document = Document(
+            id=new_id("doc"),
+            title=payload.title,
+            owner_id=owner_id,
+            source_manuscript_ids=[manuscript.id],
+            derived_from=derived_from,
+            revision=1,
+            blocks=blocks,
+            permission="owner",
+            created_at=now,
+            updated_at=now,
+        )
+        await db.save_document(document)
+        await db.create_document_version(document, "Converted from manuscript")
+        result: dict[str, Any] = {"document_id": document.id}
+        if warnings:
+            result["warnings"] = warnings
+        completed = state.model_copy(
+            update={
+                "status": "succeeded",
+                "progress": TaskProgress(stage="completed", current=total, total=total, message="转换完成"),
+                "result": result,
+                "error": None,
+                "updated_at": now,
+            }
+        )
+        await db.save_task(owner_id, completed)
+    except APIError as exc:
+        failed = state.model_copy(
+            update={
+                "status": "failed",
+                "progress": TaskProgress(stage="completed", current=current, total=total, message="转换失败"),
+                "error": TaskError(code=exc.code, message=exc.message, retryable=False),
+                "updated_at": utcnow(),
+            }
+        )
+        await db.save_task(owner_id, failed)
+    except Exception:
+        failed = state.model_copy(
+            update={
+                "status": "failed",
+                "progress": TaskProgress(stage="completed", current=current, total=total, message="转换失败"),
+                "error": TaskError(code="internal_error", message="Manuscript conversion failed.", retryable=True),
+                "updated_at": utcnow(),
+            }
+        )
+        await db.save_task(owner_id, failed)
 
 
 app = FastAPI(
@@ -3569,6 +4017,7 @@ async def download_group_document(
 @router.post("/tasks/convert-manuscript", response_model=Task, status_code=status.HTTP_202_ACCEPTED, dependencies=IDEMPOTENT_WRITE_DEPENDENCIES)
 async def convert_manuscript(
     request: Request,
+    background_tasks: BackgroundTasks,
     payload: ConvertManuscriptRequest,
     ctx: AuthContext = Depends(auth_context),
     db: PostgresRepository = Depends(get_repository),
@@ -3579,36 +4028,20 @@ async def convert_manuscript(
         return await idempotent_json_response(db, idem, None, status.HTTP_202_ACCEPTED)
     manuscript = await get_manuscript(db, payload.manuscript_id, ctx.user_id)
     now = utcnow()
-    task_id = new_id("task")
-    blocks = await build_document_blocks_from_manuscript(db, manuscript, task_id, client_id)
-    derived_from = DerivedFrom(manuscript_id=manuscript.id, task_id=task_id, mode=payload.mode, converted_at=now)
-    document = Document(
-        id=new_id("doc"),
-        title=payload.title,
-        owner_id=ctx.user_id,
-        source_manuscript_ids=[manuscript.id],
-        derived_from=derived_from,
-        revision=1,
-        blocks=blocks,
-        permission="owner",
-        created_at=now,
-        updated_at=now,
-    )
-    await db.save_document(document)
-    await db.create_document_version(document, "Converted from manuscript")
     task = Task(
-        id=task_id,
+        id=new_id("task"),
         type="convert_manuscript",
-        status="succeeded",
-        progress=TaskProgress(stage="completed", current=1, total=1, message="Conversion completed."),
-        result={"document_id": document.id},
+        status="queued",
+        progress=TaskProgress(stage="queued", current=0, total=1, message="转换任务已创建"),
+        result=None,
         error=None,
         retry_count=0,
         billing=None,
         created_at=now,
         updated_at=now,
     )
-    await db.save_task(ctx.user_id, task)
+    await db.save_task(ctx.user_id, task, task_input=payload.model_dump(mode="json"))
+    background_tasks.add_task(process_convert_task, db, ctx.user_id, task.id, manuscript.model_copy(deep=True), payload, get_vision_provider(request), get_text_provider(request))
     return await idempotent_json_response(db, idem, task, status.HTTP_202_ACCEPTED)
 
 
