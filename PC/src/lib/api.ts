@@ -1,6 +1,7 @@
 import type { Document } from "../types/document";
 import type { Manuscript } from "../types/manuscript";
 import type { DocumentBlock, ManuscriptBlock } from "../types/block";
+import type { GroupDocumentMessage, GroupSummary } from "../types/group";
 
 type Platform = "windows" | "mac" | "web";
 
@@ -40,6 +41,28 @@ type RemoteDocument = {
   updated_at: string;
   blocks: Array<Record<string, unknown>>;
   derived_from?: { manuscript_id?: string } | null;
+};
+
+type RemoteGroupSummary = {
+  id: string;
+  name: string;
+  invite_code: string;
+  invite_code_expires_at: string;
+  member_count: number;
+  role: "owner" | "member";
+  created_at: string;
+  updated_at: string;
+};
+
+type RemoteGroupDocumentMessage = {
+  id: string;
+  group_id: string;
+  sender_id: string;
+  sender_name: string;
+  document_id: string;
+  document_title: string;
+  document_revision: number;
+  sent_at: string;
 };
 
 type Task = {
@@ -314,6 +337,83 @@ class PcApiClient {
 
   async deleteManuscript(id: string): Promise<void> {
     await this.request<void>(`/manuscripts/${id}`, { method: "DELETE" });
+  }
+
+  async listGroups(): Promise<GroupSummary[]> {
+    const response = await this.request<PagedResponse<RemoteGroupSummary>>("/groups?limit=50");
+    return response.items.map(toGroup);
+  }
+
+  async createGroup(name: string): Promise<GroupSummary> {
+    const remote = await this.request<RemoteGroupSummary>("/groups", {
+      method: "POST",
+      idempotent: true,
+      body: JSON.stringify({ name, client_id: this.clientId }),
+    });
+    return toGroup(remote);
+  }
+
+  async joinGroup(inviteCode: string): Promise<GroupSummary> {
+    const remote = await this.request<RemoteGroupSummary>("/groups/join", {
+      method: "POST",
+      idempotent: true,
+      body: JSON.stringify({ invite_code: inviteCode, client_id: this.clientId }),
+    });
+    return toGroup(remote);
+  }
+
+  async listGroupMessages(groupId: string): Promise<GroupDocumentMessage[]> {
+    const response = await this.request<PagedResponse<RemoteGroupDocumentMessage>>(
+      `/groups/${groupId}/messages?limit=50`,
+    );
+    return response.items.map(toGroupMessage);
+  }
+
+  async sendDocumentToGroup(
+    groupId: string,
+    documentId: string,
+  ): Promise<GroupDocumentMessage> {
+    const remote = await this.request<RemoteGroupDocumentMessage>(`/groups/${groupId}/documents`, {
+      method: "POST",
+      idempotent: true,
+      body: JSON.stringify({ document_id: documentId, client_id: this.clientId }),
+    });
+    return toGroupMessage(remote);
+  }
+
+  async downloadGroupDocument(
+    groupId: string,
+    messageId: string,
+    format: "pdf" | "docx" = "docx",
+  ): Promise<Blob> {
+    if (!this.session) throw new ApiError(401, "请先登录服务器");
+    const accessToken = this.session.access_token;
+    const response = await this.fetchGroupDocument(groupId, messageId, format);
+    if (response.ok) return response.blob();
+    if (response.status !== 401) throw await responseToApiError(response);
+
+    await this.refreshSession(accessToken);
+    const retryResponse = await this.fetchGroupDocument(groupId, messageId, format);
+    if (!retryResponse.ok) throw await responseToApiError(retryResponse);
+    return retryResponse.blob();
+  }
+
+  private async fetchGroupDocument(
+    groupId: string,
+    messageId: string,
+    format: "pdf" | "docx",
+  ): Promise<Response> {
+    if (!this.session) throw new ApiError(401, "请先登录服务器");
+    return fetch(
+      `${API_BASE_URL}/groups/${groupId}/documents/${messageId}/download?format=${format}`,
+      {
+        headers: {
+          Authorization: `Bearer ${this.session.access_token}`,
+          "X-Client-Id": this.clientId,
+          "X-Request-Id": crypto.randomUUID(),
+        },
+      },
+    );
   }
 
   async convertManuscript(
@@ -809,6 +909,32 @@ function toDocument(remote: RemoteDocument): Document {
     blocks: remote.blocks
       .filter((block) => block.deleted !== true)
       .map(toDocumentBlock),
+  };
+}
+
+function toGroup(remote: RemoteGroupSummary): GroupSummary {
+  return {
+    id: remote.id,
+    name: remote.name,
+    inviteCode: remote.invite_code,
+    inviteCodeExpiresAt: remote.invite_code_expires_at,
+    memberCount: remote.member_count,
+    role: remote.role,
+    createdAt: remote.created_at,
+    updatedAt: remote.updated_at,
+  };
+}
+
+function toGroupMessage(remote: RemoteGroupDocumentMessage): GroupDocumentMessage {
+  return {
+    id: remote.id,
+    groupId: remote.group_id,
+    senderId: remote.sender_id,
+    senderName: remote.sender_name,
+    documentId: remote.document_id,
+    documentTitle: remote.document_title,
+    documentRevision: remote.document_revision,
+    sentAt: remote.sent_at,
   };
 }
 
