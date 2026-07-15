@@ -27,6 +27,14 @@ interface ManuscriptEditorProps {
 
 type MenuState = { blockId: string | null; x: number; y: number; selectedStrokeIds: string[] } | null;
 type PendingOp = SyncOperation<ManuscriptBlock>;
+type PendingAudio = {
+  id: string;
+  afterBlockId: string | null;
+  durationMs: number;
+  objectUrl: string;
+  status: "uploading" | "failed";
+  error?: string;
+};
 
 export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEditorProps) {
   const [manuscript, setManuscript] = useState<Manuscript | null>(null);
@@ -40,6 +48,7 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
   const [selected, setSelected] = useState<{ blockId: string; strokeIds: string[] } | null>(null);
   const [syncState, setSyncState] = useState("未同步");
   const [recording, setRecording] = useState<{ recorder: MediaRecorder; startedAt: number; afterBlockId: string | null } | null>(null);
+  const [pendingAudios, setPendingAudios] = useState<PendingAudio[]>([]);
   const [task, setTask] = useState<Task | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [blockHeights, setBlockHeights] = useState<Record<string, number>>({});
@@ -203,15 +212,25 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
 
   async function finishAudio(blob: Blob, durationMs: number, afterBlockId: string | null) {
     if (!userId) return;
+    const pendingId = crypto.randomUUID?.() ?? `pending-${Date.now()}`;
+    const objectUrl = URL.createObjectURL(blob);
+    setPendingAudios((current) => [...current, { id: pendingId, afterBlockId, durationMs, objectUrl, status: "uploading" }]);
     setSyncState("上传录音");
     try {
       const asset = await api.uploadAsset(blob, { kind: "audio", filename: `recording-${Date.now()}.webm`, contentType: blob.type || "audio/webm", durationMs });
       const block = createAudioBlock(userId, asset.id, durationMs);
+      setPendingAudios((current) => {
+        const target = current.find((item) => item.id === pendingId);
+        if (target) URL.revokeObjectURL(target.objectUrl);
+        return current.filter((item) => item.id !== pendingId);
+      });
       insertBlockRespectingSelection(block, afterBlockId);
       const asrTask = await api.asrAudio(asset.id);
       setTask(asrTask);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "录音上传失败");
+      const message = err instanceof Error ? err.message : "录音上传失败";
+      setPendingAudios((current) => current.map((item) => (item.id === pendingId ? { ...item, status: "failed", error: message } : item)));
+      setError(message);
     }
   }
 
@@ -333,45 +352,48 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
 
       <article className="waterfall-paper" onPointerCancel={cancelLongPress} onPointerLeave={cancelLongPress} onPointerUp={cancelLongPress}>
         {visibleBlocks.map((block, index) => (
-          <div
-            className={activeBlockId === block.id ? "paper-block active" : "paper-block"}
-            key={block.id}
-            onPointerDown={(event) => startLongPress(block.id, event)}
-            onPointerMove={cancelLongPress}
-          >
-            {block.type === "text" && <textarea onChange={(event) => handleTextInput(block, event.target.value)} placeholder="输入文字" value={block.props.content} />}
-            {block.type === "audio" && (
-              <div className="audio-block">
-                <AudioAsset assetId={block.props.asset_id} />
-                <div>
-                  <span>{formatDuration(block.props.duration_ms)}</span>
-                  <p>{block.props.transcript || "录音已保存，ASR 完成后会写回转写文本。"}</p>
+          <div key={block.id}>
+            <div
+              className={activeBlockId === block.id ? "paper-block active" : "paper-block"}
+              onPointerDown={(event) => startLongPress(block.id, event)}
+              onPointerMove={cancelLongPress}
+            >
+              {block.type === "text" && <textarea onChange={(event) => handleTextInput(block, event.target.value)} placeholder="输入文字" value={block.props.content} />}
+              {block.type === "audio" && (
+                <div className="audio-block">
+                  <AudioAsset assetId={block.props.asset_id} />
+                  <div>
+                    <span>{formatDuration(block.props.duration_ms)}</span>
+                    <p>{block.props.transcript || "录音已保存，ASR 完成后会写回转写文本。"}</p>
+                  </div>
                 </div>
-              </div>
-            )}
-            {block.type === "image" && (
-              <figure className="image-block">
-                <AssetImage alt={block.props.caption || "手稿图片"} assetId={block.props.asset_id} />
-                <figcaption>{block.props.caption || "图片"}</figcaption>
-              </figure>
-            )}
-            {block.type === "handwriting" && (
-              <HandwritingCanvas
-                blockId={block.id}
-                brushWidth={brushWidth}
-                color={color}
-                height={blockHeights[block.id] ?? estimateStrokeHeight(block.props.strokes)}
-                isLast={index === visibleBlocks.length - 1}
-                onChange={(strokes) => updateHandwriting(block, strokes)}
-                onResize={(height) => resizeHandwriting(block.id, height)}
-                onSelectionChange={(blockId, strokeIds) => setSelected({ blockId, strokeIds })}
-                showBoundary={activeBlockId === block.id}
-                strokes={block.props.strokes}
-                tool={tool}
-              />
-            )}
+              )}
+              {block.type === "image" && (
+                <figure className="image-block">
+                  <AssetImage alt={block.props.caption || "手稿图片"} assetId={block.props.asset_id} />
+                  <figcaption>{block.props.caption || "图片"}</figcaption>
+                </figure>
+              )}
+              {block.type === "handwriting" && (
+                <HandwritingCanvas
+                  blockId={block.id}
+                  brushWidth={brushWidth}
+                  color={color}
+                  height={blockHeights[block.id] ?? estimateStrokeHeight(block.props.strokes)}
+                  isLast={index === visibleBlocks.length - 1}
+                  onChange={(strokes) => updateHandwriting(block, strokes)}
+                  onResize={(height) => resizeHandwriting(block.id, height)}
+                  onSelectionChange={(blockId, strokeIds) => setSelected({ blockId, strokeIds })}
+                  showBoundary={activeBlockId === block.id}
+                  strokes={block.props.strokes}
+                  tool={tool}
+                />
+              )}
+            </div>
+            {pendingAudios.filter((audio) => audio.afterBlockId === block.id).map((audio) => <PendingAudioBlock audio={audio} key={audio.id} />)}
           </div>
         ))}
+        {pendingAudios.filter((audio) => audio.afterBlockId === null || !visibleBlocks.some((block) => block.id === audio.afterBlockId)).map((audio) => <PendingAudioBlock audio={audio} key={audio.id} />)}
         <div className="blank-paper-zone" onPointerDown={(event) => startLongPress(visibleBlocks.at(-1)?.id ?? null, event)} onPointerMove={cancelLongPress}>
           <BlankHandwritingCanvas brushWidth={brushWidth} color={color} onCommit={commitBlankHandwriting} tool={tool} />
         </div>
@@ -387,6 +409,18 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
         </div>
       )}
     </section>
+  );
+}
+
+function PendingAudioBlock({ audio }: { audio: PendingAudio }) {
+  return (
+    <div className={audio.status === "failed" ? "paper-block pending-audio failed" : "paper-block pending-audio"}>
+      <audio controls preload="metadata" src={audio.objectUrl} />
+      <div>
+        <span>{formatDuration(audio.durationMs)} · {audio.status === "failed" ? "上传失败" : "上传中"}</span>
+        <p>{audio.error ?? "录音已在本机保留，上传完成后会写入手稿并开始 ASR。"}</p>
+      </div>
+    </div>
   );
 }
 

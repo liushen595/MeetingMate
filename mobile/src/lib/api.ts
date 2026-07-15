@@ -207,13 +207,20 @@ export class ApiClient {
     for (const part of upload.parts) {
       const start = (part.part_number - 1) * partSize;
       const end = Math.min(file.size, start + partSize);
-      const response = await fetch(part.upload_url, {
-        method: "PUT",
-        headers: part.headers,
-        body: file.slice(start, end, params.contentType),
-      });
-      if (!response.ok) throw new Error(`上传第 ${part.part_number} 片失败`);
+      const uploadUrl = this.resolveUploadUrl(part.upload_url);
+      let response: Response;
+      try {
+        response = await fetch(uploadUrl, {
+          method: "PUT",
+          headers: part.headers,
+          body: file.slice(start, end, params.contentType),
+        });
+      } catch (error) {
+        throw new Error(`无法直传到预签名地址：${uploadUrl}。请确认该 URL 在手机/浏览器可访问，并且对象存储允许 PUT/CORS。`);
+      }
+      if (!response.ok) throw new Error(`上传第 ${part.part_number} 片失败：${response.status} ${response.statusText}`);
       const etag = response.headers.get("ETag")?.replaceAll('"', "") ?? response.headers.get("etag")?.replaceAll('"', "");
+      if (!etag) throw new Error("上传成功但无法读取 ETag。对象存储 CORS 需要 expose_headers 包含 ETag。");
       uploadedParts.push({ part_number: part.part_number, etag: etag ?? "", size_bytes: end - start });
     }
 
@@ -291,6 +298,10 @@ export class ApiClient {
     const text = await response.text();
     const payload = text ? (JSON.parse(text) as ApiErrorPayload) : null;
     return new ApiError(response.status, payload, response.statusText);
+  }
+
+  private resolveUploadUrl(uploadUrl: string) {
+    return new URL(uploadUrl, `${this.baseUrl}/`).toString();
   }
 }
 

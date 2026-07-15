@@ -48,7 +48,7 @@ export function createImageBlock(authorId: string, assetId: string, width: numbe
 }
 
 export function createHandwritingBlock(authorId: string, strokes: Stroke[] = []): ManuscriptHandwritingBlock {
-  return { id: makeId("block"), type: "handwriting", ...base(authorId), props: { strokes, image_asset_id: null, ai_text: "" } };
+  return { id: makeId("block"), type: "handwriting", ...base(authorId), props: { strokes, ai_text: "" } };
 }
 
 export function createParagraphBlock(authorId: string, content = ""): DocumentBlock {
@@ -72,15 +72,31 @@ export function createDocumentImageBlock(authorId: string, assetId: string, widt
 }
 
 export function upsertOperation<TBlock extends ManuscriptBlock | DocumentBlock>(block: TBlock, afterBlockId: string | null = null): SyncOperation<TBlock> {
+  const apiBlock = block.type === "handwriting" ? ({ ...block, props: { ...block.props, strokes: normalizeStrokesForApi(block.props.strokes) } } as TBlock) : block;
   return {
     op_id: makeId("op"),
     type: "upsert_block",
-    block,
+    block: apiBlock,
     block_id: null,
     before_block_id: null,
     after_block_id: afterBlockId,
     created_at: nowIso(),
   };
+}
+
+function normalizeStrokesForApi(strokes: Stroke[]) {
+  return strokes.map((stroke) => ({
+    ...stroke,
+    // 后端 MVP 契约只规定了可持久化 stroke.tool 为 pen；套索/橡皮是端侧工具，不进入 strokes。
+    tool: "pen" as const,
+    width: Math.max(1, Math.round(stroke.width)),
+    points: stroke.points.map((point, index) => ({
+      x: Number(point.x.toFixed(2)),
+      y: Number(point.y.toFixed(2)),
+      t: Math.max(0, Math.round(point.t || index * 16)),
+      pressure: Number((point.pressure || 0.5).toFixed(2)),
+    })),
+  }));
 }
 
 export function replaceBlock<TBlock extends { id: string }>(blocks: TBlock[], next: TBlock) {

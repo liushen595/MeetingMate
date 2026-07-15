@@ -525,14 +525,37 @@ select {
   padding: 12px 0;
 }
 
+.pending-audio {
+  display: grid;
+  gap: 10px;
+  padding-top: 12px;
+  padding-bottom: 12px;
+  background: rgba(255, 245, 224, 0.45);
+}
+
+.pending-audio.failed {
+  background: rgba(179, 54, 36, 0.08);
+}
+
 .audio-block audio {
   width: 100%;
 }
 
+.pending-audio audio {
+  width: 100%;
+}
+
 .audio-block p,
-.audio-block span {
+.audio-block span,
+.pending-audio p,
+.pending-audio span {
   margin: 0;
   color: #554530;
+}
+
+.pending-audio.failed p,
+.pending-audio.failed span {
+  color: #9c321f;
 }
 
 .image-block {
