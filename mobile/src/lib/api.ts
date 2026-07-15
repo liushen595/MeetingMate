@@ -302,6 +302,9 @@ export class ApiClient {
 
   private getProxyUploadParams(uploadUrl: string) {
     const url = new URL(uploadUrl, `${this.baseUrl}/`);
+    if (!url.pathname.includes("/assets/") || !url.pathname.includes("/upload-parts/")) {
+      throw new Error("移动端当前只支持后端 API 上传代理 URL。请确认后端 ASSET_UPLOAD_URL_MODE=api，不要返回 object storage 直传 URL。");
+    }
     const expiresAt = url.searchParams.get("expires_at");
     const signature = url.searchParams.get("signature");
     if (!expiresAt || !signature) {

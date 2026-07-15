@@ -13,7 +13,7 @@ import {
   touchBlock,
   upsertOperation,
 } from "../lib/blocks";
-import { captureImageFromCamera, formatDuration, normalizeRecordedAudio, readImageFile } from "../lib/media";
+import { captureImageFromCamera, createPcmRecorder, formatDuration, normalizeRecordedAudio, readImageFile, type PcmRecorder } from "../lib/media";
 import { readAsrSse } from "../lib/sse";
 import type { ConvertMode, Manuscript, ManuscriptBlock, ManuscriptHandwritingBlock, Stroke, StrokeTool, SyncOperation, Task } from "../types/api";
 import { AssetImage } from "../components/AssetImage";
@@ -38,18 +38,27 @@ type PendingAudio = {
   error?: string;
 };
 
+const PEN_COLORS = ["#1f1b14", "#111827", "#2563eb", "#dc2626", "#16a34a", "#7c3aed"];
+const HIGHLIGHTER_COLORS = ["#fef08a", "#fde68a", "#bbf7d0", "#bfdbfe", "#fecdd3", "#ddd6fe"];
+const PEN_COLOR_KEY = "meetingmate.mobile.pen.color";
+const PEN_WIDTH_KEY = "meetingmate.mobile.pen.width";
+const HIGHLIGHTER_COLOR_KEY = "meetingmate.mobile.highlighter.color";
+const HIGHLIGHTER_WIDTH_KEY = "meetingmate.mobile.highlighter.width";
+
 export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEditorProps) {
   const [manuscript, setManuscript] = useState<Manuscript | null>(null);
   const [revision, setRevision] = useState(0);
   const [blocks, setBlocks] = useState<ManuscriptBlock[]>([]);
   const [tool, setTool] = useState<StrokeTool>("pen");
-  const [color, setColor] = useState("#1f1b14");
-  const [brushWidth, setBrushWidth] = useState(2.8);
+  const [penColor, setPenColorState] = useState(() => localStorage.getItem(PEN_COLOR_KEY) ?? "#1f1b14");
+  const [penWidth, setPenWidthState] = useState(() => readStoredNumber(PEN_WIDTH_KEY, 3));
+  const [highlighterColor, setHighlighterColorState] = useState(() => localStorage.getItem(HIGHLIGHTER_COLOR_KEY) ?? "#fef08a");
+  const [highlighterWidth, setHighlighterWidthState] = useState(() => readStoredNumber(HIGHLIGHTER_WIDTH_KEY, 6));
   const [menu, setMenu] = useState<MenuState>(null);
   const [activeBlockId, setActiveBlockId] = useState<string | null>(null);
   const [selected, setSelected] = useState<{ blockId: string; strokeIds: string[] } | null>(null);
   const [syncState, setSyncState] = useState("未同步");
-  const [recording, setRecording] = useState<{ recorder: MediaRecorder; startedAt: number; afterBlockId: string | null } | null>(null);
+  const [recording, setRecording] = useState<{ recorder: PcmRecorder; startedAt: number; afterBlockId: string | null } | null>(null);
   const [pendingAudios, setPendingAudios] = useState<PendingAudio[]>([]);
   const [localAudioUrls, setLocalAudioUrls] = useState<Record<string, string>>({});
   const [task, setTask] = useState<Task | null>(null);
@@ -63,6 +72,10 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
 
   const userId = api.currentSession?.user.id ?? "";
   const visibleBlocks = useMemo(() => blocks.filter((block) => !block.deleted), [blocks]);
+  const isColorTool = tool === "pen" || tool === "highlighter";
+  const color = tool === "highlighter" ? highlighterColor : penColor;
+  const brushWidth = tool === "highlighter" ? highlighterWidth : penWidth;
+  const palette = tool === "highlighter" ? HIGHLIGHTER_COLORS : PEN_COLORS;
 
   useEffect(() => {
     setError(null);
@@ -125,8 +138,8 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
     syncTimerRef.current = window.setTimeout(() => void flushOps(), 700);
   }
 
-  async function flushOps() {
-    if (pendingOpsRef.current.length === 0) return;
+  async function flushOps(options: { throwOnError?: boolean } = {}) {
+    if (pendingOpsRef.current.length === 0) return null;
     const ops = pendingOpsRef.current;
     pendingOpsRef.current = [];
     setSyncState("自动保存中");
@@ -135,10 +148,14 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
       setRevision(response.revision);
       setBlocks((current) => mergeServerBlocks(current, response.blocks));
       setSyncState(response.conflicts.length > 0 ? "有冲突，已保留本地内容" : "已保存");
+      return response;
     } catch (err) {
       pendingOpsRef.current = [...ops, ...pendingOpsRef.current];
       setSyncState("保存失败，将重试");
-      setError(err instanceof Error ? err.message : "保存失败");
+      const message = err instanceof Error ? err.message : "保存失败";
+      setError(message);
+      if (options.throwOnError) throw new Error(message);
+      return null;
     }
   }
 
@@ -243,27 +260,17 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
   async function startRecording(afterBlockId: string | null = null) {
     setMenu(null);
     if (recording) return;
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    const recorder = new MediaRecorder(stream, { mimeType: pickAudioMimeType() });
-    const chunks: BlobPart[] = [];
     const startedAt = Date.now();
-    recorder.ondataavailable = (event) => {
-      if (event.data.size > 0) chunks.push(event.data);
-    };
-    recorder.onstop = () => {
-      const blob = new Blob(chunks, { type: recorder.mimeType || "audio/webm" });
-      const duration = Date.now() - startedAt;
-      stream.getTracks().forEach((track) => track.stop());
-      void finishAudio(blob, duration, afterBlockId);
-    };
-    recorder.start(1000);
+    const recorder = await createPcmRecorder();
     setRecording({ recorder, startedAt, afterBlockId });
   }
 
-  function stopRecording() {
+  async function stopRecording() {
     if (!recording) return;
-    recording.recorder.stop();
+    const current = recording;
     setRecording(null);
+    const audio = await current.recorder.stop();
+    void finishAudio(audio.blob, audio.durationMs || Date.now() - current.startedAt, current.afterBlockId);
   }
 
   async function finishAudio(blob: Blob, durationMs: number, afterBlockId: string | null) {
@@ -281,7 +288,8 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
       });
       setLocalAudioUrls((current) => ({ ...current, [asset.id]: objectUrl }));
       insertBlockRespectingSelection(block, afterBlockId);
-      await flushOps();
+      const syncResult = await flushOps({ throwOnError: true });
+      if (!syncResult) throw new Error("音频块尚未同步到服务器，已暂停 ASR。请稍后重试。");
       await startAsrStream(asset.id);
     } catch (err) {
       const message = err instanceof Error ? err.message : "录音上传失败";
@@ -425,6 +433,29 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
     setMenu(null);
   }
 
+  function setActiveColor(nextColor: string) {
+    if (tool === "highlighter") {
+      setHighlighterColorState(nextColor);
+      localStorage.setItem(HIGHLIGHTER_COLOR_KEY, nextColor);
+      return;
+    }
+
+    setPenColorState(nextColor);
+    localStorage.setItem(PEN_COLOR_KEY, nextColor);
+  }
+
+  function setActiveWidth(nextWidth: number) {
+    const normalizedWidth = Math.max(1, Math.min(tool === "highlighter" ? 18 : 9, Math.round(nextWidth)));
+    if (tool === "highlighter") {
+      setHighlighterWidthState(normalizedWidth);
+      localStorage.setItem(HIGHLIGHTER_WIDTH_KEY, String(normalizedWidth));
+      return;
+    }
+
+    setPenWidthState(normalizedWidth);
+    localStorage.setItem(PEN_WIDTH_KEY, String(normalizedWidth));
+  }
+
   async function convert(mode: ConvertMode) {
     if (!manuscript) return;
     await flushOps();
@@ -455,8 +486,27 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
         <button className={tool === "highlighter" ? "active" : ""} onClick={() => setTool("highlighter")} type="button">荧光</button>
         <button className={tool === "eraser" ? "active" : ""} onClick={() => setTool("eraser")} type="button">橡皮</button>
         <button className={tool === "lasso" ? "active" : ""} onClick={() => setTool("lasso")} type="button">套索</button>
-        <input aria-label="画笔颜色" onChange={(event) => setColor(event.target.value)} type="color" value={color} />
-        <input aria-label="画笔粗细" max="9" min="1" onChange={(event) => setBrushWidth(Number(event.target.value))} type="range" value={brushWidth} />
+        {isColorTool && (
+          <div className="brush-palette">
+            <span>{tool === "highlighter" ? "荧光笔" : "签字笔"}</span>
+            {palette.map((item) => (
+              <button
+                aria-label={`选择颜色 ${item}`}
+                className={color.toLowerCase() === item.toLowerCase() ? "color-swatch active" : "color-swatch"}
+                key={item}
+                onClick={() => setActiveColor(item)}
+                style={{ backgroundColor: item }}
+                type="button"
+              />
+            ))}
+            <label className="palette-picker">
+              调色盘
+              <input aria-label="调色盘" onChange={(event) => setActiveColor(event.target.value)} type="color" value={color} />
+            </label>
+            <strong>{brushWidth}px</strong>
+            <input aria-label="画笔粗细" max={tool === "highlighter" ? "18" : "9"} min="1" onChange={(event) => setActiveWidth(Number(event.target.value))} type="range" value={brushWidth} />
+          </div>
+        )}
       </div>
 
       <article className="waterfall-paper" onPointerCancel={cancelLongPress} onPointerLeave={cancelLongPress} onPointerUp={cancelLongPress}>
@@ -579,4 +629,9 @@ function normalizeStrokesToTop(strokes: Stroke[]) {
 
 function appendStrokesAtOffset(existing: Stroke[], incoming: Stroke[], offsetY: number) {
   return [...existing, ...incoming.map((stroke) => ({ ...stroke, points: stroke.points.map((point) => ({ ...point, y: point.y + offsetY })) }))];
+}
+
+function readStoredNumber(key: string, fallback: number) {
+  const value = Number(localStorage.getItem(key));
+  return Number.isFinite(value) && value > 0 ? value : fallback;
 }
