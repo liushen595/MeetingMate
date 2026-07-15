@@ -37,6 +37,7 @@ type Task = {
   type: string;
   status: "queued" | "processing" | "succeeded" | "failed" | "cancelled";
   result: Record<string, unknown> | null;
+  error?: { message?: string } | null;
 };
 
 type AssetUploadResponse = {
@@ -211,11 +212,10 @@ class PcApiClient {
       idempotent: true,
       body: JSON.stringify({ asset_id: assetId, language: "zh-CN", enable_diarization: true, client_id: this.clientId })
     });
-    if (task.status === "succeeded") {
-      const transcript = task.result?.transcript;
-      if (typeof transcript === "string") return transcript;
-    }
-    throw new Error(`服务器已接收音频，但 ASR 任务尚未返回文本（task: ${task.id}, status: ${task.status}）`);
+    const completedTask = await this.waitForTask(task);
+    const transcript = extractTranscript(completedTask.result);
+    if (transcript) return transcript;
+    throw new Error(`ASR 任务已完成，但服务器返回了空转写文本。请检查服务器 ASR 服务是否成功读取音频内容、音频格式是否受支持，以及 assets.content/part_contents 是否有实际文件内容。（task: ${completedTask.id}, result: ${JSON.stringify(completedTask.result ?? {})}）`);
   }
 
   async recognizeImage(file: SelectedFile): Promise<string> {
@@ -302,6 +302,18 @@ class PcApiClient {
     });
 
     return upload.asset_id;
+  }
+
+  private async waitForTask(task: Task): Promise<Task> {
+    let current = task;
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      if (current.status === "succeeded") return current;
+      if (current.status === "failed") throw new Error(current.error?.message ?? `任务执行失败（task: ${current.id}）`);
+      if (current.status === "cancelled") throw new Error(`任务已取消（task: ${current.id}）`);
+      await sleep(2000);
+      current = await this.request<Task>(`/tasks/${current.id}`);
+    }
+    throw new Error(`服务器已接收音频，但 ASR 任务超时未返回文本（task: ${current.id}, status: ${current.status}）`);
   }
 
   private async authenticate(path: string, body: unknown, persistSession: boolean): Promise<Session> {
@@ -461,6 +473,33 @@ function nullableNumber(value: unknown): number | null {
 function toAbsoluteUploadUrl(uploadUrl: string): string {
   if (/^https?:\/\//i.test(uploadUrl)) return uploadUrl;
   return new URL(uploadUrl, `${API_BASE_URL}/`).toString();
+}
+
+function extractTranscript(result: Record<string, unknown> | null): string {
+  if (!result) return "";
+  const candidates = [
+    result.transcript,
+    result.text,
+    result.content,
+    result.asr_text,
+    isRecord(result.asr_audio) ? result.asr_audio.transcript : undefined,
+    isRecord(result.data) ? result.data.transcript ?? result.data.text : undefined,
+    isRecord(result.result) ? result.result.transcript ?? result.result.text : undefined
+  ];
+  const direct = candidates.find((value): value is string => typeof value === "string" && value.trim().length > 0);
+  if (direct) return direct.trim();
+  const segments = result.speaker_segments ?? result.segments ?? (isRecord(result.asr_audio) ? result.asr_audio.speaker_segments : undefined);
+  if (Array.isArray(segments)) {
+    return segments
+      .map((segment) => (isRecord(segment) && typeof segment.text === "string" ? segment.text.trim() : ""))
+      .filter(Boolean)
+      .join("\n");
+  }
+  return "";
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
 function getClientId(): string {
