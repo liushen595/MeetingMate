@@ -72,8 +72,60 @@ export async function normalizeRecordedAudio(blob: Blob, fallbackDurationMs: num
   }
 }
 
+export interface PcmRecorder {
+  stop: () => Promise<{ blob: Blob; contentType: string; extension: string; durationMs: number }>;
+}
+
+export async function createPcmRecorder(): Promise<PcmRecorder> {
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: {
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+      channelCount: 1,
+    },
+  });
+  const AudioContextCtor = window.AudioContext ?? (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+  const audioContext = new AudioContextCtor();
+  const source = audioContext.createMediaStreamSource(stream);
+  const processor = audioContext.createScriptProcessor(4096, 1, 1);
+  const chunks: Float32Array[] = [];
+  let active = true;
+
+  processor.onaudioprocess = (event) => {
+    if (!active) return;
+    const input = event.inputBuffer.getChannelData(0);
+    chunks.push(new Float32Array(input));
+  };
+
+  source.connect(processor);
+  processor.connect(audioContext.destination);
+
+  return {
+    async stop() {
+      active = false;
+      source.disconnect();
+      processor.disconnect();
+      stream.getTracks().forEach((track) => track.stop());
+      const samples = mergeAudioChunks(chunks);
+      const durationMs = Math.max(1, Math.round((samples.length / audioContext.sampleRate) * 1000));
+      const wav = encodeWavFromSamples(samples, audioContext.sampleRate, 16000);
+      await audioContext.close();
+      return { blob: wav, contentType: "audio/wav", extension: "wav", durationMs };
+    },
+  };
+}
+
 function encodeWavFromAudioBuffer(buffer: AudioBuffer, targetSampleRate: number) {
   const samples = downmixAndResample(buffer, targetSampleRate);
+  return encodeWavSamples(samples, targetSampleRate);
+}
+
+function encodeWavFromSamples(samples: Float32Array, sourceSampleRate: number, targetSampleRate: number) {
+  return encodeWavSamples(resampleSamples(samples, sourceSampleRate, targetSampleRate), targetSampleRate);
+}
+
+function encodeWavSamples(samples: Float32Array, targetSampleRate: number) {
   const dataLength = samples.length * 2;
   const arrayBuffer = new ArrayBuffer(44 + dataLength);
   const view = new DataView(arrayBuffer);
@@ -101,6 +153,17 @@ function encodeWavFromAudioBuffer(buffer: AudioBuffer, targetSampleRate: number)
   return new Blob([arrayBuffer], { type: "audio/wav" });
 }
 
+function mergeAudioChunks(chunks: Float32Array[]) {
+  const length = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+  const merged = new Float32Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return merged;
+}
+
 function downmixAndResample(buffer: AudioBuffer, targetSampleRate: number) {
   const sourceLength = buffer.length;
   const sourceSampleRate = buffer.sampleRate;
@@ -114,6 +177,13 @@ function downmixAndResample(buffer: AudioBuffer, targetSampleRate: number) {
 
   if (sourceSampleRate === targetSampleRate) return mono;
 
+  return resampleSamples(mono, sourceSampleRate, targetSampleRate);
+}
+
+function resampleSamples(mono: Float32Array, sourceSampleRate: number, targetSampleRate: number) {
+  if (sourceSampleRate === targetSampleRate) return mono;
+  const sourceLength = mono.length;
+  const targetLength = Math.max(1, Math.round((sourceLength * targetSampleRate) / sourceSampleRate));
   const resampled = new Float32Array(targetLength);
   for (let index = 0; index < targetLength; index += 1) {
     const sourceIndex = (index * (sourceLength - 1)) / Math.max(1, targetLength - 1);
