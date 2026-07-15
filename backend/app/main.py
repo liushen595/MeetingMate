@@ -6,25 +6,37 @@ import hashlib
 import io
 import json
 import math
+import os
 import secrets
 import uuid
 import zipfile
-from dataclasses import dataclass
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field as dataclass_field
 from datetime import datetime, timedelta, timezone
-from typing import Annotated, Any, Literal
+from pathlib import Path
+from typing import Annotated, Any, AsyncIterator, Literal
+from urllib.parse import quote, urlencode
 
-from fastapi import Depends, FastAPI, Header, Query, Request, Response, status
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, Query, Request, Response, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.routing import APIRouter
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.websockets import WebSocket, WebSocketDisconnect
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
+from dotenv import load_dotenv
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, TypeAdapter, model_validator
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.middleware.cors import CORSMiddleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
+from starlette.requests import HTTPConnection
+
+from app.asr import AsrProvider, AsrProviderError, AsrResult, provider_from_environment, result_from_text, stream_delta
+from app.database import DatabaseSettings, DatabaseState, check_database, close_database, connect_database, load_database_settings
 
 
 API_PREFIX = "/api/v1"
+BACKEND_ROOT = Path(__file__).resolve().parents[1]
 ACCESS_TOKEN_SECONDS = 30 * 60
 REFRESH_TOKEN_SECONDS = 30 * 24 * 60 * 60
 IDEMPOTENCY_SECONDS = 24 * 60 * 60
@@ -69,6 +81,12 @@ class ErrorResponse(StrictModel):
     error: ErrorBody
 
 
+class HealthResponse(StrictModel):
+    status: Literal["ok", "degraded"]
+    database: Literal["ok", "unavailable"]
+    pgvector: Literal["enabled", "disabled"] | None = None
+
+
 class APIError(Exception):
     def __init__(
         self,
@@ -87,6 +105,64 @@ class ContractJSONResponse(JSONResponse):
     media_type = "application/json; charset=utf-8"
 
 
+@dataclass(frozen=True)
+class AppSettings:
+    cors_origins: list[str]
+    cors_origin_regex: str | None
+    allowed_hosts: list[str]
+    object_storage_public_base_url: str | None
+    object_storage_bucket: str | None
+    asset_upload_url_mode: str | None
+    api_public_base_url: str | None
+    asr_provider: str
+    database: DatabaseSettings
+
+
+def parse_env_list(name: str) -> list[str]:
+    raw = os.getenv(name, "")
+    if not raw:
+        return []
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        value = raw.split(",")
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def load_settings() -> AppSettings:
+    if os.getenv("MEETINGMATE_SKIP_DOTENV") != "1":
+        load_dotenv(BACKEND_ROOT / ".env")
+    return AppSettings(
+        cors_origins=parse_env_list("CORS_ORIGINS"),
+        cors_origin_regex=os.getenv("CORS_ORIGIN_REGEX") or None,
+        allowed_hosts=parse_env_list("ALLOWED_HOSTS"),
+        object_storage_public_base_url=os.getenv("OBJECT_STORAGE_PUBLIC_BASE_URL") or None,
+        object_storage_bucket=os.getenv("OBJECT_STORAGE_BUCKET") or None,
+        asset_upload_url_mode=os.getenv("ASSET_UPLOAD_URL_MODE") or None,
+        api_public_base_url=os.getenv("API_PUBLIC_BASE_URL") or None,
+        asr_provider=os.getenv("ASR_PROVIDER") or "dashscope",
+        database=load_database_settings(),
+    )
+
+
+settings = load_settings()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.database = await connect_database(settings.database)
+    app.state.repository = PostgresRepository(app.state.database)
+    app.state.asr_provider = build_asr_provider()
+    try:
+        yield
+    finally:
+        await close_database(app.state.database)
+
+
 def utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(microsecond=0)
 
@@ -97,6 +173,18 @@ def new_id(prefix: str) -> str:
 
 def make_token(prefix: str) -> str:
     return f"{prefix}_{secrets.token_urlsafe(32)}"
+
+
+def build_asr_provider() -> AsrProvider:
+    return provider_from_environment(settings.asr_provider)
+
+
+def get_asr_provider(request: Request) -> AsrProvider:
+    provider = getattr(request.app.state, "asr_provider", None)
+    if provider is None:
+        provider = build_asr_provider()
+        request.app.state.asr_provider = provider
+    return provider
 
 
 def password_hash(password: str) -> str:
@@ -116,6 +204,49 @@ def verify_password(password: str, encoded: str) -> bool:
 
 def hash_request_body(body: bytes) -> str:
     return hashlib.sha256(body).hexdigest()
+
+
+def make_object_storage_url(*path_parts: str, expires_seconds: int = 900) -> str:
+    if not settings.object_storage_public_base_url or not settings.object_storage_bucket:
+        raise APIError(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "Object storage public URL is not configured.",
+        )
+    base_url = settings.object_storage_public_base_url.rstrip("/")
+    bucket = quote(settings.object_storage_bucket.strip("/"), safe="")
+    encoded_parts = [quote(part.strip("/"), safe="") for part in path_parts]
+    object_path = "/".join([bucket, *encoded_parts])
+    expires_at = int((utcnow() + timedelta(seconds=expires_seconds)).timestamp())
+    signature = hashlib.sha256(f"{object_path}:{expires_at}".encode("utf-8")).hexdigest()[:32]
+    return f"{base_url}/{object_path}?expires_at={expires_at}&signature={signature}"
+
+
+def public_api_base_url(request: Request) -> str:
+    if settings.api_public_base_url:
+        return settings.api_public_base_url.rstrip("/")
+    return str(request.base_url).rstrip("/")
+
+
+def upload_part_signature(asset_id: str, upload_id: str, part_number: int, expires_at: int) -> str:
+    payload = f"{asset_id}:{upload_id}:{part_number}:{expires_at}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
+
+
+def make_api_upload_url(request: Request, asset_id: str, upload_id: str, part_number: int, expires_at: datetime) -> str:
+    expires_at_ts = int(expires_at.timestamp())
+    query = urlencode(
+        {
+            "upload_id": upload_id,
+            "expires_at": str(expires_at_ts),
+            "signature": upload_part_signature(asset_id, upload_id, part_number, expires_at_ts),
+        }
+    )
+    return f"{public_api_base_url(request)}{API_PREFIX}/assets/{quote(asset_id, safe='')}/upload-parts/{part_number}?{query}"
+
+
+def make_asset_stream_url(request: Request, asset_id: str) -> str:
+    return f"{public_api_base_url(request)}{API_PREFIX}/assets/{quote(asset_id, safe='')}/stream"
 
 
 def encode_cursor(offset: int) -> str:
@@ -791,6 +922,7 @@ class AssetRecord:
     part_size_bytes: int
     uploaded_parts: list[UploadedPart]
     content: bytes | None = None
+    part_contents: dict[int, bytes] = dataclass_field(default_factory=dict)
 
 
 @dataclass
@@ -826,81 +958,627 @@ class AuthContext:
     access_token: str
 
 
-class Store:
-    def __init__(self) -> None:
-        self.users_by_id: dict[str, UserRecord] = {}
-        self.user_id_by_email: dict[str, str] = {}
-        self.devices_by_user: dict[str, dict[str, Device]] = {}
-        self.access_tokens: dict[str, TokenSession] = {}
-        self.refresh_tokens: dict[str, TokenSession] = {}
-        self.idempotency: dict[tuple[str, str, str, str], IdempotencyRecord] = {}
-        self.assets: dict[str, AssetRecord] = {}
-        self.manuscripts: dict[str, Manuscript] = {}
-        self.documents: dict[str, Document] = {}
-        self.document_versions: dict[str, list[DocumentVersionRecord]] = {}
-        self.tasks: dict[str, tuple[str, Task]] = {}
-        self.exports: dict[str, ExportRecord] = {}
-        self.share_links: dict[str, ShareLinkRecord] = {}
+ManuscriptBlockListAdapter = TypeAdapter(list[ManuscriptBlock])
+DocumentBlockListAdapter = TypeAdapter(list[DocumentBlock])
+UploadedPartListAdapter = TypeAdapter(list[UploadedPart])
+StringListAdapter = TypeAdapter(list[str])
 
-    def create_tokens(self, user_id: str, client_id: str) -> AuthResponse:
-        user = self.users_by_id[user_id].user
+
+def jsonb(value: Any) -> str:
+    return json.dumps(jsonable_encoder(value), ensure_ascii=False, separators=(",", ":"))
+
+
+def parse_jsonb(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return json.loads(value)
+    return value
+
+
+class PostgresRepository:
+    def __init__(self, database: DatabaseState) -> None:
+        if database.pool is None:
+            raise RuntimeError("PostgreSQL is required for API data access.")
+        self.pool = database.pool
+
+    async def get_user_record(self, user_id: str) -> UserRecord | None:
+        row = await self.pool.fetchrow(
+            "SELECT id, email, name, avatar_url, password_hash, created_at FROM users WHERE id = $1",
+            user_id,
+        )
+        return user_record_from_row(row) if row else None
+
+    async def get_user_record_by_email(self, email: str) -> UserRecord | None:
+        row = await self.pool.fetchrow(
+            "SELECT id, email, name, avatar_url, password_hash, created_at FROM users WHERE email = $1",
+            email.lower(),
+        )
+        return user_record_from_row(row) if row else None
+
+    async def create_user(self, user: User, encoded_password: str) -> None:
+        await self.pool.execute(
+            """
+            INSERT INTO users(id, email, name, avatar_url, password_hash, created_at)
+            VALUES($1, $2, $3, $4, $5, $6)
+            """,
+            user.id,
+            str(user.email).lower(),
+            user.name,
+            user.avatar_url,
+            encoded_password,
+            user.created_at,
+        )
+
+    async def create_tokens(self, user_id: str, client_id: str) -> AuthResponse:
+        user_record = await self.get_user_record(user_id)
+        if not user_record:
+            raise APIError(status.HTTP_401_UNAUTHORIZED, "unauthorized", "Access token is missing, expired, or invalid.")
         access_token = make_token("access")
         refresh_token = make_token("refresh")
         now = utcnow()
-        self.access_tokens[access_token] = TokenSession(user_id, client_id, now + timedelta(seconds=ACCESS_TOKEN_SECONDS))
-        self.refresh_tokens[refresh_token] = TokenSession(user_id, client_id, now + timedelta(seconds=REFRESH_TOKEN_SECONDS))
+        await self.pool.executemany(
+            """
+            INSERT INTO auth_tokens(token, token_type, user_id, client_id, expires_at, created_at)
+            VALUES($1, $2, $3, $4, $5, $6)
+            """,
+            [
+                (access_token, "access", user_id, client_id, now + timedelta(seconds=ACCESS_TOKEN_SECONDS), now),
+                (refresh_token, "refresh", user_id, client_id, now + timedelta(seconds=REFRESH_TOKEN_SECONDS), now),
+            ],
+        )
         return AuthResponse(
             access_token=access_token,
             access_token_expires_in=ACCESS_TOKEN_SECONDS,
             refresh_token=refresh_token,
             refresh_token_expires_in=REFRESH_TOKEN_SECONDS,
-            user=user,
+            user=user_record.user,
         )
 
-    def upsert_device(self, user_id: str, device_input: DeviceInput) -> Device:
+    async def get_token_session(self, token: str, token_type: str) -> TokenSession | None:
+        row = await self.pool.fetchrow(
+            """
+            SELECT user_id, client_id, expires_at
+            FROM auth_tokens
+            WHERE token = $1 AND token_type = $2
+            """,
+            token,
+            token_type,
+        )
+        return TokenSession(user_id=row["user_id"], client_id=row["client_id"], expires_at=row["expires_at"]) if row else None
+
+    async def delete_token(self, token: str) -> None:
+        await self.pool.execute("DELETE FROM auth_tokens WHERE token = $1", token)
+
+    async def delete_tokens_for_client(self, user_id: str, client_id: str) -> None:
+        await self.pool.execute("DELETE FROM auth_tokens WHERE user_id = $1 AND client_id = $2", user_id, client_id)
+
+    async def upsert_device(self, user_id: str, device_input: DeviceInput) -> Device:
         now = utcnow()
-        devices = self.devices_by_user.setdefault(user_id, {})
-        existing = devices.get(device_input.client_id)
-        created_at = existing.created_at if existing else now
+        row = await self.pool.fetchrow(
+            "SELECT created_at FROM devices WHERE user_id = $1 AND client_id = $2",
+            user_id,
+            device_input.client_id,
+        )
         device = Device(
             id=device_input.client_id,
             platform=device_input.platform,
             app_version=device_input.app_version,
             name=device_input.name,
             last_seen_at=now,
-            created_at=created_at,
+            created_at=row["created_at"] if row else now,
         )
-        devices[device.id] = device
+        await self.pool.execute(
+            """
+            INSERT INTO devices(user_id, client_id, platform, app_version, name, last_seen_at, created_at)
+            VALUES($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (user_id, client_id) DO UPDATE SET
+                platform = EXCLUDED.platform,
+                app_version = EXCLUDED.app_version,
+                name = EXCLUDED.name,
+                last_seen_at = EXCLUDED.last_seen_at
+            """,
+            user_id,
+            device.id,
+            device.platform,
+            device.app_version,
+            device.name,
+            device.last_seen_at,
+            device.created_at,
+        )
         return device
 
-    def touch_device(self, user_id: str, client_id: str) -> None:
-        device = self.devices_by_user.get(user_id, {}).get(client_id)
-        if device:
-            self.devices_by_user[user_id][client_id] = device.model_copy(update={"last_seen_at": utcnow()})
+    async def touch_device(self, user_id: str, client_id: str) -> None:
+        await self.pool.execute(
+            "UPDATE devices SET last_seen_at = $1 WHERE user_id = $2 AND client_id = $3",
+            utcnow(),
+            user_id,
+            client_id,
+        )
+
+    async def list_devices(self, user_id: str) -> list[Device]:
+        rows = await self.pool.fetch(
+            """
+            SELECT client_id, platform, app_version, name, last_seen_at, created_at
+            FROM devices
+            WHERE user_id = $1
+            ORDER BY last_seen_at DESC, client_id DESC
+            """,
+            user_id,
+        )
+        return [device_from_row(row) for row in rows]
+
+    async def delete_device(self, user_id: str, client_id: str) -> bool:
+        result = await self.pool.execute("DELETE FROM devices WHERE user_id = $1 AND client_id = $2", user_id, client_id)
+        await self.delete_tokens_for_client(user_id, client_id)
+        return result.endswith("1")
+
+    async def get_idempotency(self, scope: tuple[str, str, str, str]) -> IdempotencyRecord | None:
+        row = await self.pool.fetchrow(
+            """
+            SELECT request_hash, response_body, status_code, expires_at
+            FROM idempotency_records
+            WHERE user_id = $1 AND method = $2 AND path = $3 AND idempotency_key = $4
+            """,
+            *scope,
+        )
+        if not row:
+            return None
+        return IdempotencyRecord(
+            request_hash=row["request_hash"],
+            response_body=parse_jsonb(row["response_body"]),
+            status_code=row["status_code"],
+            expires_at=row["expires_at"],
+        )
+
+    async def save_idempotency(self, scope: tuple[str, str, str, str], record: IdempotencyRecord) -> None:
+        await self.pool.execute(
+            """
+            INSERT INTO idempotency_records(user_id, method, path, idempotency_key, request_hash, response_body, status_code, expires_at)
+            VALUES($1, $2, $3, $4, $5, $6::jsonb, $7, $8)
+            ON CONFLICT (user_id, method, path, idempotency_key) DO UPDATE SET
+                request_hash = EXCLUDED.request_hash,
+                response_body = EXCLUDED.response_body,
+                status_code = EXCLUDED.status_code,
+                expires_at = EXCLUDED.expires_at,
+                created_at = now()
+            """,
+            *scope,
+            record.request_hash,
+            jsonb(record.response_body),
+            record.status_code,
+            record.expires_at,
+        )
+
+    async def save_asset(self, record: AssetRecord) -> None:
+        asset = record.asset
+        await self.pool.execute(
+            """
+            INSERT INTO assets(
+                id, owner_id, kind, filename, content_type, size_bytes, checksum_sha256,
+                duration_ms, width, height, status, upload_id, part_size_bytes,
+                uploaded_parts, content, created_at, updated_at
+            )
+            VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::jsonb, $15, $16, $17)
+            ON CONFLICT (id) DO UPDATE SET
+                kind = EXCLUDED.kind,
+                filename = EXCLUDED.filename,
+                content_type = EXCLUDED.content_type,
+                size_bytes = EXCLUDED.size_bytes,
+                checksum_sha256 = EXCLUDED.checksum_sha256,
+                duration_ms = EXCLUDED.duration_ms,
+                width = EXCLUDED.width,
+                height = EXCLUDED.height,
+                status = EXCLUDED.status,
+                upload_id = EXCLUDED.upload_id,
+                part_size_bytes = EXCLUDED.part_size_bytes,
+                uploaded_parts = EXCLUDED.uploaded_parts,
+                content = EXCLUDED.content,
+                updated_at = EXCLUDED.updated_at
+            """,
+            asset.id,
+            record.owner_id,
+            asset.kind,
+            asset.filename,
+            asset.content_type,
+            asset.size_bytes,
+            asset.checksum_sha256,
+            asset.duration_ms,
+            asset.width,
+            asset.height,
+            asset.status,
+            record.upload_id,
+            record.part_size_bytes,
+            jsonb(record.uploaded_parts),
+            record.content,
+            asset.created_at,
+            asset.updated_at,
+        )
+
+    async def get_asset_record(self, asset_id: str) -> AssetRecord | None:
+        row = await self.pool.fetchrow("SELECT * FROM assets WHERE id = $1", asset_id)
+        return asset_record_from_row(row) if row else None
+
+    async def delete_asset(self, asset_id: str) -> None:
+        await self.pool.execute("DELETE FROM assets WHERE id = $1", asset_id)
+
+    async def asset_is_referenced(self, owner_id: str, asset_id: str) -> bool:
+        manuscripts = await self.list_manuscripts(owner_id, include_deleted=True)
+        for manuscript in manuscripts:
+            for block in manuscript.blocks:
+                if isinstance(block, (ManuscriptAudioBlock, ManuscriptImageBlock)) and block.props.asset_id == asset_id:
+                    return True
+                if isinstance(block, ManuscriptHandwritingBlock) and block.props.image_asset_id == asset_id:
+                    return True
+        documents = await self.list_documents(owner_id)
+        for document in documents:
+            for block in document.blocks:
+                if isinstance(block, DocumentImageBlock) and block.props.asset_id == asset_id:
+                    return True
+        return False
+
+    async def list_manuscripts(self, owner_id: str, include_deleted: bool = False) -> list[Manuscript]:
+        rows = await self.pool.fetch(
+            """
+            SELECT * FROM manuscripts
+            WHERE owner_id = $1 AND ($2::boolean OR NOT deleted)
+            ORDER BY updated_at DESC, id DESC
+            """,
+            owner_id,
+            include_deleted,
+        )
+        return [manuscript_from_row(row) for row in rows]
+
+    async def get_manuscript(self, manuscript_id: str) -> Manuscript | None:
+        row = await self.pool.fetchrow("SELECT * FROM manuscripts WHERE id = $1", manuscript_id)
+        return manuscript_from_row(row) if row else None
+
+    async def save_manuscript(self, manuscript: Manuscript) -> None:
+        await self.pool.execute(
+            """
+            INSERT INTO manuscripts(id, owner_id, title, revision, blocks, deleted, deleted_at, created_at, updated_at)
+            VALUES($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9)
+            ON CONFLICT (id) DO UPDATE SET
+                title = EXCLUDED.title,
+                revision = EXCLUDED.revision,
+                blocks = EXCLUDED.blocks,
+                deleted = EXCLUDED.deleted,
+                deleted_at = EXCLUDED.deleted_at,
+                updated_at = EXCLUDED.updated_at
+            """,
+            manuscript.id,
+            manuscript.owner_id,
+            manuscript.title,
+            manuscript.revision,
+            jsonb(manuscript.blocks),
+            manuscript.deleted,
+            manuscript.deleted_at,
+            manuscript.created_at,
+            manuscript.updated_at,
+        )
+
+    async def list_documents(self, owner_id: str) -> list[Document]:
+        rows = await self.pool.fetch(
+            "SELECT * FROM documents WHERE owner_id = $1 ORDER BY updated_at DESC, id DESC",
+            owner_id,
+        )
+        return [document_from_row(row) for row in rows]
+
+    async def get_document(self, document_id: str) -> Document | None:
+        row = await self.pool.fetchrow("SELECT * FROM documents WHERE id = $1", document_id)
+        return document_from_row(row) if row else None
+
+    async def save_document(self, document: Document) -> None:
+        await self.pool.execute(
+            """
+            INSERT INTO documents(
+                id, owner_id, title, source_manuscript_ids, derived_from,
+                revision, blocks, permission, created_at, updated_at
+            )
+            VALUES($1, $2, $3, $4::jsonb, $5::jsonb, $6, $7::jsonb, $8, $9, $10)
+            ON CONFLICT (id) DO UPDATE SET
+                title = EXCLUDED.title,
+                source_manuscript_ids = EXCLUDED.source_manuscript_ids,
+                derived_from = EXCLUDED.derived_from,
+                revision = EXCLUDED.revision,
+                blocks = EXCLUDED.blocks,
+                permission = EXCLUDED.permission,
+                updated_at = EXCLUDED.updated_at
+            """,
+            document.id,
+            document.owner_id,
+            document.title,
+            jsonb(document.source_manuscript_ids),
+            jsonb(document.derived_from) if document.derived_from else None,
+            document.revision,
+            jsonb(document.blocks),
+            document.permission,
+            document.created_at,
+            document.updated_at,
+        )
+
+    async def delete_document(self, document_id: str) -> None:
+        await self.pool.execute("DELETE FROM documents WHERE id = $1", document_id)
+
+    async def create_document_version(self, document: Document, title: str) -> None:
+        version = DocumentVersion(
+            id=new_id("ver"),
+            document_id=document.id,
+            revision=document.revision,
+            title=title,
+            created_by=document.owner_id,
+            created_at=utcnow(),
+        )
+        await self.pool.execute(
+            """
+            INSERT INTO document_versions(id, document_id, revision, title, created_by, snapshot, created_at)
+            VALUES($1, $2, $3, $4, $5, $6::jsonb, $7)
+            """,
+            version.id,
+            version.document_id,
+            version.revision,
+            version.title,
+            version.created_by,
+            jsonb(document),
+            version.created_at,
+        )
+
+    async def list_document_versions(self, document_id: str) -> list[DocumentVersion]:
+        rows = await self.pool.fetch(
+            """
+            SELECT id, document_id, revision, title, created_by, created_at
+            FROM document_versions
+            WHERE document_id = $1
+            ORDER BY created_at DESC, id DESC
+            """,
+            document_id,
+        )
+        return [document_version_from_row(row) for row in rows]
+
+    async def find_document_version(self, document_id: str, version_id: str) -> DocumentVersionRecord | None:
+        row = await self.pool.fetchrow(
+            "SELECT * FROM document_versions WHERE document_id = $1 AND id = $2",
+            document_id,
+            version_id,
+        )
+        return document_version_record_from_row(row) if row else None
+
+    async def save_task(self, owner_id: str, task: Task, task_input: dict[str, Any] | None = None) -> None:
+        await self.pool.execute(
+            """
+            INSERT INTO tasks(id, owner_id, type, status, input, progress, result, error, retry_count, billing, created_at, updated_at)
+            VALUES($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7::jsonb, $8::jsonb, $9, $10::jsonb, $11, $12)
+            ON CONFLICT (id) DO UPDATE SET
+                status = EXCLUDED.status,
+                input = COALESCE(EXCLUDED.input, tasks.input),
+                progress = EXCLUDED.progress,
+                result = EXCLUDED.result,
+                error = EXCLUDED.error,
+                retry_count = EXCLUDED.retry_count,
+                billing = EXCLUDED.billing,
+                updated_at = EXCLUDED.updated_at
+            """,
+            task.id,
+            owner_id,
+            task.type,
+            task.status,
+            jsonb(task_input) if task_input is not None else None,
+            jsonb(task.progress),
+            jsonb(task.result) if task.result is not None else None,
+            jsonb(task.error) if task.error is not None else None,
+            task.retry_count,
+            jsonb(task.billing) if task.billing is not None else None,
+            task.created_at,
+            task.updated_at,
+        )
+
+    async def get_task_record(self, task_id: str) -> tuple[str, Task] | None:
+        row = await self.pool.fetchrow("SELECT * FROM tasks WHERE id = $1", task_id)
+        return task_record_from_row(row) if row else None
+
+    async def save_export(self, record: ExportRecord) -> None:
+        await self.pool.execute(
+            """
+            INSERT INTO exports(id, owner_id, asset_id, document_id, document_revision, format, snapshot, created_at)
+            VALUES($1, $2, $3, $4, $5, $6, $7::jsonb, $8)
+            ON CONFLICT (id) DO UPDATE SET
+                asset_id = EXCLUDED.asset_id,
+                document_id = EXCLUDED.document_id,
+                document_revision = EXCLUDED.document_revision,
+                format = EXCLUDED.format,
+                snapshot = EXCLUDED.snapshot
+            """,
+            record.export_id,
+            record.owner_id,
+            record.asset_id,
+            record.document_id,
+            record.document_revision,
+            record.format,
+            jsonb(record.snapshot),
+            record.created_at,
+        )
+
+    async def get_export_record(self, export_id: str) -> ExportRecord | None:
+        row = await self.pool.fetchrow("SELECT * FROM exports WHERE id = $1", export_id)
+        return export_record_from_row(row) if row else None
+
+    async def save_share_link(self, record: ShareLinkRecord) -> None:
+        await self.pool.execute(
+            """
+            INSERT INTO share_links(id, document_id, permission, url, token, expires_at, created_at)
+            VALUES($1, $2, $3, $4, $5, $6, $7)
+            """,
+            record.link.id,
+            record.document_id,
+            record.link.permission,
+            record.link.url,
+            record.token,
+            record.link.expires_at,
+            record.link.created_at,
+        )
+
+    async def get_share_link_record(self, share_id: str) -> ShareLinkRecord | None:
+        row = await self.pool.fetchrow("SELECT * FROM share_links WHERE id = $1", share_id)
+        return share_link_record_from_row(row) if row else None
 
 
-store = Store()
+def user_record_from_row(row: Any) -> UserRecord:
+    user = User(id=row["id"], email=row["email"], name=row["name"], avatar_url=row["avatar_url"], created_at=row["created_at"])
+    return UserRecord(user=user, password_hash=row["password_hash"])
+
+
+def device_from_row(row: Any) -> Device:
+    return Device(
+        id=row["client_id"],
+        platform=row["platform"],
+        app_version=row["app_version"],
+        name=row["name"],
+        last_seen_at=row["last_seen_at"],
+        created_at=row["created_at"],
+    )
+
+
+def asset_record_from_row(row: Any) -> AssetRecord:
+    asset = Asset(
+        id=row["id"],
+        kind=row["kind"],
+        filename=row["filename"],
+        content_type=row["content_type"],
+        size_bytes=row["size_bytes"],
+        checksum_sha256=row["checksum_sha256"],
+        duration_ms=row["duration_ms"],
+        width=row["width"],
+        height=row["height"],
+        status=row["status"],
+        url=None,
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+    return AssetRecord(
+        owner_id=row["owner_id"],
+        asset=asset,
+        upload_id=row["upload_id"],
+        part_size_bytes=row["part_size_bytes"],
+        uploaded_parts=UploadedPartListAdapter.validate_python(parse_jsonb(row["uploaded_parts"])),
+        content=row["content"],
+        part_contents={int(part_number): base64.b64decode(content) for part_number, content in (parse_jsonb(row["part_contents"]) or {}).items()},
+    )
+
+
+def manuscript_from_row(row: Any) -> Manuscript:
+    return Manuscript(
+        id=row["id"],
+        title=row["title"],
+        owner_id=row["owner_id"],
+        revision=row["revision"],
+        blocks=ManuscriptBlockListAdapter.validate_python(parse_jsonb(row["blocks"])),
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        deleted=row["deleted"],
+        deleted_at=row["deleted_at"],
+    )
+
+
+def document_from_row(row: Any) -> Document:
+    derived_from = parse_jsonb(row["derived_from"])
+    return Document(
+        id=row["id"],
+        title=row["title"],
+        owner_id=row["owner_id"],
+        source_manuscript_ids=StringListAdapter.validate_python(parse_jsonb(row["source_manuscript_ids"])),
+        derived_from=DerivedFrom.model_validate(derived_from) if derived_from else None,
+        revision=row["revision"],
+        blocks=DocumentBlockListAdapter.validate_python(parse_jsonb(row["blocks"])),
+        permission=row["permission"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def document_version_from_row(row: Any) -> DocumentVersion:
+    return DocumentVersion(
+        id=row["id"],
+        document_id=row["document_id"],
+        revision=row["revision"],
+        title=row["title"],
+        created_by=row["created_by"],
+        created_at=row["created_at"],
+    )
+
+
+def document_version_record_from_row(row: Any) -> DocumentVersionRecord:
+    return DocumentVersionRecord(
+        version=document_version_from_row(row),
+        snapshot=Document.model_validate(parse_jsonb(row["snapshot"])),
+    )
+
+
+def task_record_from_row(row: Any) -> tuple[str, Task]:
+    error = parse_jsonb(row["error"])
+    task = Task(
+        id=row["id"],
+        type=row["type"],
+        status=row["status"],
+        progress=TaskProgress.model_validate(parse_jsonb(row["progress"])),
+        result=parse_jsonb(row["result"]),
+        error=TaskError.model_validate(error) if error else None,
+        retry_count=row["retry_count"],
+        billing=parse_jsonb(row["billing"]),
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+    return row["owner_id"], task
+
+
+def export_record_from_row(row: Any) -> ExportRecord:
+    return ExportRecord(
+        owner_id=row["owner_id"],
+        export_id=row["id"],
+        asset_id=row["asset_id"],
+        document_id=row["document_id"],
+        document_revision=row["document_revision"],
+        format=row["format"],
+        snapshot=Document.model_validate(parse_jsonb(row["snapshot"])),
+        created_at=row["created_at"],
+    )
+
+
+def share_link_record_from_row(row: Any) -> ShareLinkRecord:
+    link = ShareLink(
+        id=row["id"],
+        document_id=row["document_id"],
+        permission=row["permission"],
+        url=row["url"],
+        expires_at=row["expires_at"],
+        created_at=row["created_at"],
+    )
+    return ShareLinkRecord(link=link, token=row["token"], document_id=row["document_id"])
+
+
 bearer_scheme = HTTPBearer(auto_error=False)
 
 
-def get_store() -> Store:
-    return store
+def get_repository(connection: HTTPConnection) -> PostgresRepository:
+    repository = getattr(connection.app.state, "repository", None)
+    if repository is None:
+        raise APIError(status.HTTP_500_INTERNAL_SERVER_ERROR, "internal_error", "PostgreSQL repository is not initialized.")
+    return repository
 
 
 async def auth_context(
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)] = None,
-    db: Store = Depends(get_store),
+    db: PostgresRepository = Depends(get_repository),
 ) -> AuthContext:
     if not credentials or credentials.scheme.lower() != "bearer":
         raise APIError(status.HTTP_401_UNAUTHORIZED, "unauthorized", "Authorization bearer token is required.")
     token = credentials.credentials.strip()
-    session = db.access_tokens.get(token)
+    session = await db.get_token_session(token, "access")
     if not session or session.expires_at <= utcnow():
         raise APIError(status.HTTP_401_UNAUTHORIZED, "unauthorized", "Access token is missing, expired, or invalid.")
-    user_record = db.users_by_id.get(session.user_id)
+    user_record = await db.get_user_record(session.user_id)
     if not user_record:
         raise APIError(status.HTTP_401_UNAUTHORIZED, "unauthorized", "Access token is missing, expired, or invalid.")
-    db.touch_device(session.user_id, session.client_id)
+    await db.touch_device(session.user_id, session.client_id)
     return AuthContext(user_id=session.user_id, client_id=session.client_id, user=user_record.user, access_token=token)
 
 
@@ -948,14 +1626,14 @@ def require_idempotency_header(request: Request) -> str:
     return key
 
 
-async def require_idempotency(request: Request, ctx: AuthContext, db: Store) -> tuple[tuple[str, str, str, str], str, IdempotencyRecord | None]:
+async def require_idempotency(request: Request, ctx: AuthContext, db: PostgresRepository) -> tuple[tuple[str, str, str, str], str, IdempotencyRecord | None]:
     key = request.headers.get("Idempotency-Key")
     if not key:
         raise validation_error("Idempotency-Key header is required for this write request.")
     body = await request.body()
     request_hash = hash_request_body(body)
     scope = (ctx.user_id, request.method.upper(), request.url.path, key)
-    existing = db.idempotency.get(scope)
+    existing = await db.get_idempotency(scope)
     if existing and existing.expires_at > utcnow():
         if existing.request_hash != request_hash:
             raise APIError(
@@ -967,16 +1645,17 @@ async def require_idempotency(request: Request, ctx: AuthContext, db: Store) -> 
     return scope, request_hash, None
 
 
-def idempotent_json_response(db: Store, idem: tuple[tuple[str, str, str, str], str, IdempotencyRecord | None], body: Any, status_code: int) -> JSONResponse:
+async def idempotent_json_response(db: PostgresRepository, idem: tuple[tuple[str, str, str, str], str, IdempotencyRecord | None], body: Any, status_code: int) -> JSONResponse:
     scope, request_hash, existing = idem
     if existing:
         return ContractJSONResponse(content=jsonable_encoder(existing.response_body), status_code=existing.status_code)
-    db.idempotency[scope] = IdempotencyRecord(
+    record = IdempotencyRecord(
         request_hash=request_hash,
         response_body=jsonable_encoder(body),
         status_code=status_code,
         expires_at=utcnow() + timedelta(seconds=IDEMPOTENCY_SECONDS),
     )
+    await db.save_idempotency(scope, record)
     return ContractJSONResponse(content=jsonable_encoder(body), status_code=status_code)
 
 
@@ -991,32 +1670,32 @@ def assert_owner(user_id: str, owner_id: str) -> None:
         raise APIError(status.HTTP_403_FORBIDDEN, "forbidden", "You do not have access to this resource.")
 
 
-def get_asset_record(db: Store, asset_id: str, user_id: str) -> AssetRecord:
-    record = db.assets.get(asset_id)
+async def get_asset_record(db: PostgresRepository, asset_id: str, user_id: str) -> AssetRecord:
+    record = await db.get_asset_record(asset_id)
     if not record:
         raise APIError(status.HTTP_404_NOT_FOUND, "not_found", "Asset not found.")
     assert_owner(user_id, record.owner_id)
     return record
 
 
-def get_manuscript(db: Store, manuscript_id: str, user_id: str) -> Manuscript:
-    manuscript = db.manuscripts.get(manuscript_id)
+async def get_manuscript(db: PostgresRepository, manuscript_id: str, user_id: str) -> Manuscript:
+    manuscript = await db.get_manuscript(manuscript_id)
     if not manuscript or manuscript.deleted:
         raise APIError(status.HTTP_404_NOT_FOUND, "not_found", "Manuscript not found.")
     assert_owner(user_id, manuscript.owner_id)
     return manuscript
 
 
-def get_document(db: Store, document_id: str, user_id: str) -> Document:
-    document = db.documents.get(document_id)
+async def get_document(db: PostgresRepository, document_id: str, user_id: str) -> Document:
+    document = await db.get_document(document_id)
     if not document:
         raise APIError(status.HTTP_404_NOT_FOUND, "not_found", "Document not found.")
     assert_owner(user_id, document.owner_id)
     return document
 
 
-def get_task(db: Store, task_id: str, user_id: str) -> Task:
-    record = db.tasks.get(task_id)
+async def get_task(db: PostgresRepository, task_id: str, user_id: str) -> Task:
+    record = await db.get_task_record(task_id)
     if not record:
         raise APIError(status.HTTP_404_NOT_FOUND, "not_found", "Task not found.")
     owner_id, task = record
@@ -1024,8 +1703,8 @@ def get_task(db: Store, task_id: str, user_id: str) -> Task:
     return task
 
 
-def get_export_record(db: Store, export_id: str, user_id: str) -> ExportRecord:
-    record = db.exports.get(export_id)
+async def get_export_record(db: PostgresRepository, export_id: str, user_id: str) -> ExportRecord:
+    record = await db.get_export_record(export_id)
     if not record:
         raise APIError(status.HTTP_404_NOT_FOUND, "not_found", "Export not found.")
     assert_owner(user_id, record.owner_id)
@@ -1050,23 +1729,23 @@ def validate_block_payload(block: BaseBlock) -> None:
             raise APIError(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "payload_too_large", "Handwriting block exceeds 5000 points.")
 
 
-def ensure_asset_ready(db: Store, asset_id: str | None, owner_id: str) -> None:
+async def ensure_asset_ready(db: PostgresRepository, asset_id: str | None, owner_id: str) -> None:
     if not asset_id:
         return
-    record = get_asset_record(db, asset_id, owner_id)
+    record = await get_asset_record(db, asset_id, owner_id)
     if record.asset.status != "ready":
         raise validation_error("Block can only reference ready assets.", {"asset_id": asset_id, "status": record.asset.status})
 
 
-def validate_block_asset_refs(db: Store, block: BaseBlock, owner_id: str) -> None:
+async def validate_block_asset_refs(db: PostgresRepository, block: BaseBlock, owner_id: str) -> None:
     if isinstance(block, ManuscriptAudioBlock):
-        ensure_asset_ready(db, block.props.asset_id, owner_id)
+        await ensure_asset_ready(db, block.props.asset_id, owner_id)
     elif isinstance(block, ManuscriptImageBlock):
-        ensure_asset_ready(db, block.props.asset_id, owner_id)
+        await ensure_asset_ready(db, block.props.asset_id, owner_id)
     elif isinstance(block, ManuscriptHandwritingBlock):
-        ensure_asset_ready(db, block.props.image_asset_id, owner_id)
+        await ensure_asset_ready(db, block.props.image_asset_id, owner_id)
     elif isinstance(block, DocumentImageBlock):
-        ensure_asset_ready(db, block.props.asset_id, owner_id)
+        await ensure_asset_ready(db, block.props.asset_id, owner_id)
 
 
 def block_index(blocks: list[BaseBlock], block_id: str) -> int | None:
@@ -1094,8 +1773,8 @@ def insert_or_move_block(blocks: list[Any], block: Any, before_block_id: str | N
         blocks.append(block)
 
 
-def apply_manuscript_operations(
-    db: Store,
+async def apply_manuscript_operations(
+    db: PostgresRepository,
     manuscript: Manuscript,
     payload: ManuscriptSyncRequest,
     ctx: AuthContext,
@@ -1110,7 +1789,7 @@ def apply_manuscript_operations(
         if op.type == "upsert_block" and op.block is not None:
             validate_block_author_and_client(op.block, ctx, client_id)
             validate_block_payload(op.block)
-            validate_block_asset_refs(db, op.block, ctx.user_id)
+            await validate_block_asset_refs(db, op.block, ctx.user_id)
             existing_index = block_index(blocks, op.block.id)
             existing_revision = blocks[existing_index].revision if existing_index is not None else op.block.revision
             block = op.block.model_copy(update={"updated_at": now, "revision": max(existing_revision + 1, op.block.revision)})
@@ -1138,8 +1817,8 @@ def apply_manuscript_operations(
     return changed, applied
 
 
-def apply_document_operations(
-    db: Store,
+async def apply_document_operations(
+    db: PostgresRepository,
     document: Document,
     payload: DocumentSyncRequest,
     ctx: AuthContext,
@@ -1154,7 +1833,7 @@ def apply_document_operations(
         if op.type == "upsert_block" and op.block is not None:
             validate_block_author_and_client(op.block, ctx, client_id)
             validate_block_payload(op.block)
-            validate_block_asset_refs(db, op.block, ctx.user_id)
+            await validate_block_asset_refs(db, op.block, ctx.user_id)
             existing_index = block_index(blocks, op.block.id)
             existing = blocks[existing_index] if existing_index is not None else None
             source_refs = existing.source_refs if existing else []
@@ -1190,18 +1869,24 @@ def apply_document_operations(
     return changed, applied
 
 
-def make_presigned_parts(asset_id: str, upload_id: str, content_type: str, part_size_bytes: int, size_bytes: int) -> list[UploadPart]:
+def make_presigned_parts(request: Request, asset_id: str, upload_id: str, content_type: str, part_size_bytes: int, size_bytes: int) -> list[UploadPart]:
     part_count = max(1, math.ceil(size_bytes / part_size_bytes))
     expires_at = utcnow() + timedelta(minutes=15)
-    return [
-        UploadPart(
-            part_number=part_number,
-            upload_url=f"https://object-storage.local/{asset_id}/{upload_id}/part-{part_number}",
-            headers={"Content-Type": content_type},
-            expires_at=expires_at,
+    parts: list[UploadPart] = []
+    for part_number in range(1, part_count + 1):
+        if settings.asset_upload_url_mode == "object_storage":
+            upload_url = make_object_storage_url(asset_id, upload_id, f"part-{part_number}")
+        else:
+            upload_url = make_api_upload_url(request, asset_id, upload_id, part_number, expires_at)
+        parts.append(
+            UploadPart(
+                part_number=part_number,
+                upload_url=upload_url,
+                headers={"Content-Type": content_type},
+                expires_at=expires_at,
+            )
         )
-        for part_number in range(1, part_count + 1)
-    ]
+    return parts
 
 
 def validate_complete_parts(request: AssetCompleteRequest) -> None:
@@ -1245,17 +1930,21 @@ def manuscript_summary(manuscript: Manuscript) -> ManuscriptSummary:
     )
 
 
-def device_platform(db: Store, user_id: str, client_id: str) -> Platform:
-    return db.devices_by_user.get(user_id, {}).get(client_id, Device(id=client_id, platform="web", app_version="", name="", last_seen_at=utcnow(), created_at=utcnow())).platform
+async def device_platform(db: PostgresRepository, user_id: str, client_id: str) -> Platform:
+    devices = await db.list_devices(user_id)
+    for device in devices:
+        if device.id == client_id:
+            return device.platform
+    return "web"
 
 
 def source_ref(manuscript_id: str, block_id: str, time_range: SourceRange | None = None, region: SourceRegion | None = None) -> list[SourceRef]:
     return [SourceRef(manuscript_id=manuscript_id, block_id=block_id, range=time_range, region=region)]
 
 
-def build_document_blocks_from_manuscript(db: Store, manuscript: Manuscript, task_id: str, client_id: str) -> list[DocumentBlock]:
+async def build_document_blocks_from_manuscript(db: PostgresRepository, manuscript: Manuscript, task_id: str, client_id: str) -> list[DocumentBlock]:
     now = utcnow()
-    platform = device_platform(db, manuscript.owner_id, client_id)
+    platform = await device_platform(db, manuscript.owner_id, client_id)
     blocks: list[DocumentBlock] = []
     base = {
         "revision": 1,
@@ -1351,25 +2040,6 @@ def build_document_blocks_from_manuscript(db: Store, manuscript: Manuscript, tas
     return blocks
 
 
-def create_document_version(db: Store, document: Document, title: str) -> None:
-    version = DocumentVersion(
-        id=new_id("ver"),
-        document_id=document.id,
-        revision=document.revision,
-        title=title,
-        created_by=document.owner_id,
-        created_at=utcnow(),
-    )
-    db.document_versions.setdefault(document.id, []).append(DocumentVersionRecord(version=version, snapshot=document.model_copy(deep=True)))
-
-
-def find_document_version(db: Store, document_id: str, version_id: str) -> DocumentVersionRecord | None:
-    for record in db.document_versions.get(document_id, []):
-        if record.version.id == version_id:
-            return record
-    return None
-
-
 def document_plain_text(document: Document) -> str:
     parts: list[str] = [document.title]
     for block in document.blocks:
@@ -1408,13 +2078,213 @@ def render_export_content(document: Document, export_format: Literal["pdf", "doc
     return buffer.getvalue()
 
 
+def speaker_segments_from_asr(result: AsrResult) -> list[SpeakerSegment]:
+    return [
+        SpeakerSegment(
+            speaker_id=segment.speaker_id,
+            start_ms=segment.start_ms,
+            end_ms=segment.end_ms,
+            text=segment.text,
+            confidence=segment.confidence,
+        )
+        for segment in result.speaker_segments
+    ]
+
+
+async def apply_asr_result_to_manuscripts(
+    db: PostgresRepository,
+    owner_id: str,
+    asset_id: str,
+    task_id: str,
+    result: AsrResult,
+    generated_at: datetime,
+) -> None:
+    segments = speaker_segments_from_asr(result)
+    manuscripts = await db.list_manuscripts(owner_id, include_deleted=True)
+    for manuscript in manuscripts:
+        changed = False
+        updated_blocks: list[ManuscriptBlock] = []
+        for block in manuscript.blocks:
+            if isinstance(block, ManuscriptAudioBlock) and block.props.asset_id == asset_id:
+                props = block.props.model_copy(
+                    update={
+                        "transcript": result.transcript,
+                        "speaker_segments": segments,
+                        "asr_task_id": task_id,
+                        "asr_generated_at": generated_at,
+                    }
+                )
+                updated_blocks.append(block.model_copy(update={"props": props, "revision": block.revision + 1, "updated_at": generated_at}))
+                changed = True
+            else:
+                updated_blocks.append(block)
+        if changed:
+            manuscript.blocks = updated_blocks
+            manuscript.revision += 1
+            manuscript.updated_at = generated_at
+            await db.save_manuscript(manuscript)
+
+
+async def save_failed_asr_task(db: PostgresRepository, owner_id: str, task: Task, message: str, retryable: bool) -> None:
+    failed = task.model_copy(
+        update={
+            "status": "failed",
+            "progress": TaskProgress(stage="completed", current=0, total=1, message="ASR task failed."),
+            "error": TaskError(code="ai_unavailable" if retryable else "validation_error", message=message, retryable=retryable),
+            "updated_at": utcnow(),
+        }
+    )
+    await db.save_task(owner_id, failed)
+
+
+def asr_task_error_code(retryable: bool) -> str:
+    return "ai_unavailable" if retryable else "validation_error"
+
+
+def sse_event(event: str, data: dict[str, Any]) -> str:
+    return f"event: {event}\ndata: {json.dumps(jsonable_encoder(data), ensure_ascii=False)}\n\n"
+
+
+async def process_asr_task(
+    db: PostgresRepository,
+    owner_id: str,
+    task_id: str,
+    payload: AsrAudioRequest,
+    provider: AsrProvider,
+) -> None:
+    task = await get_task(db, task_id, owner_id)
+    if task.status == "cancelled":
+        return
+
+    processing = task.model_copy(
+        update={
+            "status": "processing",
+            "progress": TaskProgress(stage="asr", current=0, total=1, message="ASR task processing."),
+            "updated_at": utcnow(),
+        }
+    )
+    await db.save_task(owner_id, processing)
+
+    try:
+        asset_record = await get_asset_record(db, payload.asset_id, owner_id)
+        if asset_record.asset.kind != "audio" or asset_record.asset.status != "ready":
+            raise validation_error("ASR requires a ready audio asset.")
+        content = asset_record.content or b""
+        result = await provider.transcribe(
+            filename=asset_record.asset.filename,
+            content_type=asset_record.asset.content_type,
+            content=content,
+            duration_ms=asset_record.asset.duration_ms,
+            language=payload.language,
+            enable_diarization=payload.enable_diarization,
+        )
+        generated_at = utcnow()
+        await apply_asr_result_to_manuscripts(db, owner_id, payload.asset_id, task_id, result, generated_at)
+        completed = processing.model_copy(
+            update={
+                "status": "succeeded",
+                "progress": TaskProgress(stage="completed", current=1, total=1, message="ASR task completed."),
+                "result": {
+                    "asset_id": payload.asset_id,
+                    "transcript": result.transcript,
+                    "speaker_segments": [segment.model_dump(mode="json") for segment in speaker_segments_from_asr(result)],
+                },
+                "error": None,
+                "updated_at": generated_at,
+            }
+        )
+        await db.save_task(owner_id, completed)
+    except APIError as exc:
+        await save_failed_asr_task(db, owner_id, processing, exc.message, retryable=False)
+    except AsrProviderError as exc:
+        await save_failed_asr_task(db, owner_id, processing, exc.message, retryable=exc.retryable)
+    except Exception:
+        await save_failed_asr_task(db, owner_id, processing, "ASR service is temporarily unavailable.", retryable=True)
+
+
+async def stream_asr_task_events(
+    db: PostgresRepository,
+    owner_id: str,
+    task: Task,
+    payload: AsrAudioRequest,
+    provider: AsrProvider,
+) -> AsyncIterator[str]:
+    yield sse_event("task", {"task": task})
+    processing = task.model_copy(
+        update={
+            "status": "processing",
+            "progress": TaskProgress(stage="asr", current=0, total=1, message="ASR task processing."),
+            "updated_at": utcnow(),
+        }
+    )
+    await db.save_task(owner_id, processing)
+    yield sse_event("task", {"task": processing})
+    try:
+        asset_record = await get_asset_record(db, payload.asset_id, owner_id)
+        if asset_record.asset.kind != "audio" or asset_record.asset.status != "ready":
+            raise validation_error("ASR requires a ready audio asset.")
+        current_text = ""
+        async for chunk in provider.stream_transcribe(
+            filename=asset_record.asset.filename,
+            content_type=asset_record.asset.content_type,
+            content=asset_record.content or b"",
+            duration_ms=asset_record.asset.duration_ms,
+            language=payload.language,
+            enable_diarization=payload.enable_diarization,
+        ):
+            current_text, delta = stream_delta(current_text, chunk)
+            if delta:
+                yield sse_event("delta", {"task_id": task.id, "text": delta, "transcript": current_text})
+
+        result = result_from_text(current_text, asset_record.asset.duration_ms, payload.enable_diarization)
+        generated_at = utcnow()
+        await apply_asr_result_to_manuscripts(db, owner_id, payload.asset_id, task.id, result, generated_at)
+        completed = processing.model_copy(
+            update={
+                "status": "succeeded",
+                "progress": TaskProgress(stage="completed", current=1, total=1, message="ASR task completed."),
+                "result": {
+                    "asset_id": payload.asset_id,
+                    "transcript": result.transcript,
+                    "speaker_segments": [segment.model_dump(mode="json") for segment in speaker_segments_from_asr(result)],
+                },
+                "error": None,
+                "updated_at": generated_at,
+            }
+        )
+        await db.save_task(owner_id, completed)
+        yield sse_event("done", {"task": completed})
+    except APIError as exc:
+        await save_failed_asr_task(db, owner_id, processing, exc.message, retryable=False)
+        yield sse_event("error", {"code": "validation_error", "message": exc.message})
+    except AsrProviderError as exc:
+        await save_failed_asr_task(db, owner_id, processing, exc.message, retryable=exc.retryable)
+        yield sse_event("error", {"code": asr_task_error_code(exc.retryable), "message": exc.message})
+    except Exception:
+        message = "ASR service is temporarily unavailable."
+        await save_failed_asr_task(db, owner_id, processing, message, retryable=True)
+        yield sse_event("error", {"code": "ai_unavailable", "message": message})
+
+
 app = FastAPI(
     title="MeetingMate Backend",
     version="0.1.0",
     description="FastAPI/Pydantic API contract implementation for MeetingMate MVP.",
     openapi_version="3.1.0",
     default_response_class=ContractJSONResponse,
+    lifespan=lifespan,
 )
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,
+    allow_origin_regex=settings.cors_origin_regex,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["X-Request-Id"],
+)
+if settings.allowed_hosts:
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.allowed_hosts)
 router = APIRouter(prefix=API_PREFIX, responses=ERROR_RESPONSES)
 
 
@@ -1453,45 +2323,53 @@ async def unhandled_error_handler(request: Request, exc: Exception) -> JSONRespo
     return make_error_response(request, status.HTTP_500_INTERNAL_SERVER_ERROR, "internal_error", "Internal server error.")
 
 
-@app.get("/healthz")
-async def healthz() -> dict[str, str]:
-    return {"status": "ok"}
+@app.get("/healthz", response_model=HealthResponse)
+async def healthz() -> HealthResponse | JSONResponse:
+    database_state: DatabaseState = getattr(app.state, "database", DatabaseState())
+    if not await check_database(database_state):
+        return ContractJSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"status": "degraded", "database": "unavailable", "pgvector": None},
+        )
+    return HealthResponse(
+        status="ok",
+        database="ok",
+        pgvector="enabled" if database_state.vector_enabled else "disabled",
+    )
 
 
 @router.post("/auth/register", response_model=AuthResponse, status_code=status.HTTP_201_CREATED)
-async def register(payload: RegisterRequest, db: Store = Depends(get_store)) -> AuthResponse:
+async def register(payload: RegisterRequest, db: PostgresRepository = Depends(get_repository)) -> AuthResponse:
     email = str(payload.email).lower()
-    if email in db.user_id_by_email:
+    if await db.get_user_record_by_email(email):
         raise APIError(status.HTTP_409_CONFLICT, "resource_conflict", "Email is already registered.")
     now = utcnow()
-    user = User(id=new_id("u"), email=payload.email, name=payload.name, avatar_url=None, created_at=now)
-    db.users_by_id[user.id] = UserRecord(user=user, password_hash=password_hash(payload.password))
-    db.user_id_by_email[email] = user.id
-    db.upsert_device(user.id, payload.device)
-    return db.create_tokens(user.id, payload.device.client_id)
+    user = User(id=new_id("u"), email=email, name=payload.name, avatar_url=None, created_at=now)
+    await db.create_user(user, password_hash(payload.password))
+    await db.upsert_device(user.id, payload.device)
+    return await db.create_tokens(user.id, payload.device.client_id)
 
 
 @router.post("/auth/login", response_model=AuthResponse)
-async def login(payload: LoginRequest, db: Store = Depends(get_store)) -> AuthResponse:
+async def login(payload: LoginRequest, db: PostgresRepository = Depends(get_repository)) -> AuthResponse:
     email = str(payload.email).lower()
-    user_id = db.user_id_by_email.get(email)
-    if not user_id:
+    user_record = await db.get_user_record_by_email(email)
+    if not user_record:
         raise APIError(status.HTTP_401_UNAUTHORIZED, "unauthorized", "Email or password is invalid.")
-    user_record = db.users_by_id[user_id]
     if not verify_password(payload.password, user_record.password_hash):
         raise APIError(status.HTTP_401_UNAUTHORIZED, "unauthorized", "Email or password is invalid.")
-    db.upsert_device(user_id, payload.device)
-    return db.create_tokens(user_id, payload.device.client_id)
+    await db.upsert_device(user_record.user.id, payload.device)
+    return await db.create_tokens(user_record.user.id, payload.device.client_id)
 
 
 @router.post("/auth/refresh", response_model=AuthResponse)
-async def refresh_token(payload: RefreshRequest, db: Store = Depends(get_store)) -> AuthResponse:
-    session = db.refresh_tokens.get(payload.refresh_token)
+async def refresh_token(payload: RefreshRequest, db: PostgresRepository = Depends(get_repository)) -> AuthResponse:
+    session = await db.get_token_session(payload.refresh_token, "refresh")
     if not session or session.expires_at <= utcnow() or session.client_id != payload.client_id:
         raise APIError(status.HTTP_401_UNAUTHORIZED, "unauthorized", "Refresh token is missing, expired, or invalid.")
-    del db.refresh_tokens[payload.refresh_token]
-    db.touch_device(session.user_id, session.client_id)
-    return db.create_tokens(session.user_id, session.client_id)
+    await db.delete_token(payload.refresh_token)
+    await db.touch_device(session.user_id, session.client_id)
+    return await db.create_tokens(session.user_id, session.client_id)
 
 
 @router.post("/auth/logout", status_code=status.HTTP_204_NO_CONTENT, dependencies=CLIENT_HEADER_DEPENDENCIES)
@@ -1499,15 +2377,10 @@ async def logout(
     request: Request,
     payload: LogoutRequest,
     ctx: AuthContext = Depends(auth_context),
-    db: Store = Depends(get_store),
+    db: PostgresRepository = Depends(get_repository),
 ) -> Response:
     require_client_header(request, ctx, payload.client_id)
-    session = db.refresh_tokens.get(payload.refresh_token)
-    if session and session.user_id == ctx.user_id and session.client_id == payload.client_id:
-        del db.refresh_tokens[payload.refresh_token]
-    for token, active_session in list(db.access_tokens.items()):
-        if active_session.user_id == ctx.user_id and active_session.client_id == payload.client_id:
-            del db.access_tokens[token]
+    await db.delete_tokens_for_client(ctx.user_id, payload.client_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -1516,10 +2389,10 @@ async def list_devices(
     limit: Annotated[int, Query(ge=1, le=MAX_LIMIT)] = DEFAULT_LIMIT,
     cursor: str | None = None,
     ctx: AuthContext = Depends(auth_context),
-    db: Store = Depends(get_store),
+    db: PostgresRepository = Depends(get_repository),
 ) -> DeviceListResponse:
-    devices = sorted(db.devices_by_user.get(ctx.user_id, {}).values(), key=lambda item: (item.last_seen_at, item.id), reverse=True)
-    page, next_cursor = paginate(list(devices), limit, cursor)
+    devices = await db.list_devices(ctx.user_id)
+    page, next_cursor = paginate(devices, limit, cursor)
     return DeviceListResponse(items=page, next_cursor=next_cursor)
 
 
@@ -1528,19 +2401,11 @@ async def revoke_device(
     device_id: str,
     request: Request,
     ctx: AuthContext = Depends(auth_context),
-    db: Store = Depends(get_store),
+    db: PostgresRepository = Depends(get_repository),
 ) -> Response:
     require_client_header(request, ctx)
-    devices = db.devices_by_user.get(ctx.user_id, {})
-    if device_id not in devices:
+    if not await db.delete_device(ctx.user_id, device_id):
         raise APIError(status.HTTP_404_NOT_FOUND, "not_found", "Device not found.")
-    del devices[device_id]
-    for token, session in list(db.access_tokens.items()):
-        if session.user_id == ctx.user_id and session.client_id == device_id:
-            del db.access_tokens[token]
-    for token, session in list(db.refresh_tokens.items()):
-        if session.user_id == ctx.user_id and session.client_id == device_id:
-            del db.refresh_tokens[token]
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -1549,12 +2414,12 @@ async def create_asset_upload(
     request: Request,
     payload: AssetUploadRequest,
     ctx: AuthContext = Depends(auth_context),
-    db: Store = Depends(get_store),
+    db: PostgresRepository = Depends(get_repository),
 ) -> JSONResponse:
     require_client_header(request, ctx)
     idem = await require_idempotency(request, ctx, db)
     if idem[2]:
-        return idempotent_json_response(db, idem, None, status.HTTP_201_CREATED)
+        return await idempotent_json_response(db, idem, None, status.HTTP_201_CREATED)
     now = utcnow()
     asset_id = new_id("asset")
     upload_id = new_id("upload")
@@ -1573,24 +2438,26 @@ async def create_asset_upload(
         created_at=now,
         updated_at=now,
     )
-    db.assets[asset_id] = AssetRecord(owner_id=ctx.user_id, asset=asset, upload_id=upload_id, part_size_bytes=payload.part_size_bytes, uploaded_parts=[])
+    record = AssetRecord(owner_id=ctx.user_id, asset=asset, upload_id=upload_id, part_size_bytes=payload.part_size_bytes, uploaded_parts=[])
+    await db.save_asset(record)
     response = AssetUploadResponse(
         asset_id=asset_id,
         upload_id=upload_id,
         part_size_bytes=payload.part_size_bytes,
-        parts=make_presigned_parts(asset_id, upload_id, payload.content_type, payload.part_size_bytes, payload.size_bytes),
+        parts=make_presigned_parts(request, asset_id, upload_id, payload.content_type, payload.part_size_bytes, payload.size_bytes),
     )
-    return idempotent_json_response(db, idem, response, status.HTTP_201_CREATED)
+    return await idempotent_json_response(db, idem, response, status.HTTP_201_CREATED)
 
 
 @router.get("/assets/{asset_id}/upload-parts", response_model=AssetUploadPartsResponse)
 async def get_asset_upload_parts(
     asset_id: str,
+    request: Request,
     ctx: AuthContext = Depends(auth_context),
-    db: Store = Depends(get_store),
+    db: PostgresRepository = Depends(get_repository),
 ) -> AssetUploadPartsResponse:
-    record = get_asset_record(db, asset_id, ctx.user_id)
-    all_parts = make_presigned_parts(record.asset.id, record.upload_id, record.asset.content_type, record.part_size_bytes, record.asset.size_bytes)
+    record = await get_asset_record(db, asset_id, ctx.user_id)
+    all_parts = make_presigned_parts(request, record.asset.id, record.upload_id, record.asset.content_type, record.part_size_bytes, record.asset.size_bytes)
     uploaded_numbers = {part.part_number for part in record.uploaded_parts}
     missing = [part for part in all_parts if part.part_number not in uploaded_numbers]
     return AssetUploadPartsResponse(
@@ -1602,30 +2469,92 @@ async def get_asset_upload_parts(
     )
 
 
+@router.put("/assets/{asset_id}/upload-parts/{part_number}")
+async def upload_asset_part(
+    asset_id: str,
+    part_number: int,
+    request: Request,
+    upload_id: str,
+    expires_at: int,
+    signature: str,
+    db: PostgresRepository = Depends(get_repository),
+) -> Response:
+    if expires_at < int(utcnow().timestamp()):
+        raise APIError(status.HTTP_400_BAD_REQUEST, "invalid_request", "Upload URL has expired.")
+    expected_signature = upload_part_signature(asset_id, upload_id, part_number, expires_at)
+    if not secrets.compare_digest(signature, expected_signature):
+        raise APIError(status.HTTP_403_FORBIDDEN, "forbidden", "Upload URL signature is invalid.")
+    record = await db.get_asset_record(asset_id)
+    if not record or record.upload_id != upload_id:
+        raise APIError(status.HTTP_404_NOT_FOUND, "not_found", "Asset upload not found.")
+    if record.asset.status not in {"pending_upload", "uploaded"}:
+        raise APIError(status.HTTP_409_CONFLICT, "resource_conflict", "Asset is not accepting uploads.")
+    expected_part_count = max(1, math.ceil(record.asset.size_bytes / record.part_size_bytes))
+    if part_number < 1 or part_number > expected_part_count:
+        raise validation_error("part_number is outside the expected upload range.")
+
+    content = await request.body()
+    max_part_size = record.part_size_bytes
+    if part_number < expected_part_count and len(content) != max_part_size:
+        raise validation_error("Non-final upload parts must match part_size_bytes.")
+    if part_number == expected_part_count and len(content) > max_part_size:
+        raise validation_error("Final upload part exceeds part_size_bytes.")
+    etag = hashlib.sha256(content).hexdigest()
+    record.part_contents[part_number] = content
+    uploaded_by_number = {part.part_number: part for part in record.uploaded_parts}
+    uploaded_by_number[part_number] = UploadedPart(part_number=part_number, etag=etag, size_bytes=len(content))
+    record.uploaded_parts = [uploaded_by_number[number] for number in sorted(uploaded_by_number)]
+    if len(record.uploaded_parts) == expected_part_count:
+        record.asset = record.asset.model_copy(update={"status": "uploaded", "updated_at": utcnow()})
+    await db.save_asset(record)
+    return Response(status_code=status.HTTP_200_OK, headers={"ETag": etag})
+
+
 @router.post("/assets/{asset_id}/complete", response_model=Asset, dependencies=IDEMPOTENT_WRITE_DEPENDENCIES)
 async def complete_asset_upload(
     asset_id: str,
     request: Request,
     payload: AssetCompleteRequest,
     ctx: AuthContext = Depends(auth_context),
-    db: Store = Depends(get_store),
+    db: PostgresRepository = Depends(get_repository),
 ) -> JSONResponse:
     require_client_header(request, ctx)
     idem = await require_idempotency(request, ctx, db)
     if idem[2]:
-        return idempotent_json_response(db, idem, None, status.HTTP_200_OK)
-    record = get_asset_record(db, asset_id, ctx.user_id)
+        return await idempotent_json_response(db, idem, None, status.HTTP_200_OK)
+    record = await get_asset_record(db, asset_id, ctx.user_id)
     if payload.upload_id != record.upload_id:
         record.asset = record.asset.model_copy(update={"status": "failed", "updated_at": utcnow()})
+        await db.save_asset(record)
         raise validation_error("upload_id does not match asset upload.")
     if payload.size_bytes != record.asset.size_bytes or payload.checksum_sha256 != record.asset.checksum_sha256:
         record.asset = record.asset.model_copy(update={"status": "failed", "updated_at": utcnow()})
+        await db.save_asset(record)
         raise validation_error("size_bytes or checksum_sha256 does not match the upload request.")
     try:
         validate_complete_parts(payload)
     except APIError:
         record.asset = record.asset.model_copy(update={"status": "failed", "updated_at": utcnow()})
+        await db.save_asset(record)
         raise
+    uploaded_by_number = {part.part_number: part for part in record.uploaded_parts}
+    part_contents: list[bytes] = []
+    for part in sorted(payload.parts, key=lambda item: item.part_number):
+        uploaded_part = uploaded_by_number.get(part.part_number)
+        if not uploaded_part or uploaded_part.etag != part.etag or uploaded_part.size_bytes != part.size_bytes:
+            record.asset = record.asset.model_copy(update={"status": "failed", "updated_at": utcnow()})
+            await db.save_asset(record)
+            raise validation_error("Uploaded part metadata does not match the completed parts payload.")
+        content = record.part_contents.get(part.part_number)
+        if content is not None:
+            part_contents.append(content)
+    if part_contents:
+        content = b"".join(part_contents)
+        if len(content) != payload.size_bytes or hashlib.sha256(content).hexdigest() != payload.checksum_sha256:
+            record.asset = record.asset.model_copy(update={"status": "failed", "updated_at": utcnow()})
+            await db.save_asset(record)
+            raise validation_error("Uploaded content does not match size_bytes or checksum_sha256.")
+        record.content = content
     record.uploaded_parts = sorted(payload.parts, key=lambda part: part.part_number)
     record.asset = record.asset.model_copy(
         update={
@@ -1636,19 +2565,28 @@ async def complete_asset_upload(
             "updated_at": utcnow(),
         }
     )
-    return idempotent_json_response(db, idem, record.asset, status.HTTP_200_OK)
+    await db.save_asset(record)
+    return await idempotent_json_response(db, idem, record.asset, status.HTTP_200_OK)
 
 
 @router.get("/assets/{asset_id}", response_model=Asset)
-async def get_asset(asset_id: str, ctx: AuthContext = Depends(auth_context), db: Store = Depends(get_store)) -> Asset:
-    record = get_asset_record(db, asset_id, ctx.user_id)
+async def get_asset(asset_id: str, ctx: AuthContext = Depends(auth_context), db: PostgresRepository = Depends(get_repository)) -> Asset:
+    record = await get_asset_record(db, asset_id, ctx.user_id)
     return record.asset.model_copy(update={"url": None})
 
 
-@router.get("/assets/{asset_id}/stream", status_code=status.HTTP_302_FOUND)
-async def stream_asset(asset_id: str, ctx: AuthContext = Depends(auth_context), db: Store = Depends(get_store)) -> RedirectResponse:
-    record = get_asset_record(db, asset_id, ctx.user_id)
-    return RedirectResponse(url=f"https://object-storage.local/{record.asset.id}/download?expires_in=600", status_code=status.HTTP_302_FOUND)
+@router.get("/assets/{asset_id}/stream")
+async def stream_asset(asset_id: str, ctx: AuthContext = Depends(auth_context), db: PostgresRepository = Depends(get_repository)) -> Response:
+    record = await get_asset_record(db, asset_id, ctx.user_id)
+    if record.content is not None:
+        return Response(
+            content=record.content,
+            media_type=record.asset.content_type,
+            headers={"Content-Disposition": f'inline; filename="{record.asset.filename}"'},
+        )
+    if settings.asset_upload_url_mode == "object_storage":
+        return RedirectResponse(url=make_object_storage_url(record.asset.id, "download", expires_seconds=600), status_code=status.HTTP_302_FOUND)
+    raise APIError(status.HTTP_404_NOT_FOUND, "not_found", "Asset content is not available.")
 
 
 @router.delete("/assets/{asset_id}", status_code=status.HTTP_204_NO_CONTENT, dependencies=CLIENT_HEADER_DEPENDENCIES)
@@ -1656,23 +2594,13 @@ async def delete_asset(
     asset_id: str,
     request: Request,
     ctx: AuthContext = Depends(auth_context),
-    db: Store = Depends(get_store),
+    db: PostgresRepository = Depends(get_repository),
 ) -> Response:
     require_client_header(request, ctx)
-    record = get_asset_record(db, asset_id, ctx.user_id)
-    for manuscript in db.manuscripts.values():
-        if manuscript.owner_id == ctx.user_id:
-            for block in manuscript.blocks:
-                if isinstance(block, (ManuscriptAudioBlock, ManuscriptImageBlock)) and block.props.asset_id == asset_id:
-                    raise APIError(status.HTTP_409_CONFLICT, "resource_conflict", "Asset is still referenced.", {"reason": "still_referenced"})
-                if isinstance(block, ManuscriptHandwritingBlock) and block.props.image_asset_id == asset_id:
-                    raise APIError(status.HTTP_409_CONFLICT, "resource_conflict", "Asset is still referenced.", {"reason": "still_referenced"})
-    for document in db.documents.values():
-        if document.owner_id == ctx.user_id:
-            for block in document.blocks:
-                if isinstance(block, DocumentImageBlock) and block.props.asset_id == asset_id:
-                    raise APIError(status.HTTP_409_CONFLICT, "resource_conflict", "Asset is still referenced.", {"reason": "still_referenced"})
-    del db.assets[record.asset.id]
+    record = await get_asset_record(db, asset_id, ctx.user_id)
+    if await db.asset_is_referenced(ctx.user_id, asset_id):
+        raise APIError(status.HTTP_409_CONFLICT, "resource_conflict", "Asset is still referenced.", {"reason": "still_referenced"})
+    await db.delete_asset(record.asset.id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -1681,10 +2609,9 @@ async def list_manuscripts(
     limit: Annotated[int, Query(ge=1, le=MAX_LIMIT)] = DEFAULT_LIMIT,
     cursor: str | None = None,
     ctx: AuthContext = Depends(auth_context),
-    db: Store = Depends(get_store),
+    db: PostgresRepository = Depends(get_repository),
 ) -> ManuscriptListResponse:
-    manuscripts = [item for item in db.manuscripts.values() if item.owner_id == ctx.user_id and not item.deleted]
-    manuscripts.sort(key=lambda item: (item.updated_at, item.id), reverse=True)
+    manuscripts = await db.list_manuscripts(ctx.user_id)
     summaries = [manuscript_summary(item) for item in manuscripts]
     page, next_cursor = paginate(summaries, limit, cursor)
     return ManuscriptListResponse(items=page, next_cursor=next_cursor)
@@ -1695,18 +2622,18 @@ async def create_manuscript(
     request: Request,
     payload: ManuscriptCreateRequest,
     ctx: AuthContext = Depends(auth_context),
-    db: Store = Depends(get_store),
+    db: PostgresRepository = Depends(get_repository),
 ) -> JSONResponse:
     client_id = require_client_header(request, ctx, payload.client_id)
     idem = await require_idempotency(request, ctx, db)
     if idem[2]:
-        return idempotent_json_response(db, idem, None, status.HTTP_201_CREATED)
+        return await idempotent_json_response(db, idem, None, status.HTTP_201_CREATED)
     now = utcnow()
     blocks: list[ManuscriptBlock] = []
     for block in payload.initial_blocks:
         validate_block_author_and_client(block, ctx, client_id)
         validate_block_payload(block)
-        validate_block_asset_refs(db, block, ctx.user_id)
+        await validate_block_asset_refs(db, block, ctx.user_id)
         blocks.append(block.model_copy(update={"updated_at": now}))
     manuscript = Manuscript(
         id=new_id("m"),
@@ -1717,13 +2644,13 @@ async def create_manuscript(
         created_at=now,
         updated_at=now,
     )
-    db.manuscripts[manuscript.id] = manuscript
-    return idempotent_json_response(db, idem, manuscript, status.HTTP_201_CREATED)
+    await db.save_manuscript(manuscript)
+    return await idempotent_json_response(db, idem, manuscript, status.HTTP_201_CREATED)
 
 
 @router.get("/manuscripts/{manuscript_id}", response_model=Manuscript)
-async def get_manuscript_route(manuscript_id: str, ctx: AuthContext = Depends(auth_context), db: Store = Depends(get_store)) -> Manuscript:
-    return get_manuscript(db, manuscript_id, ctx.user_id)
+async def get_manuscript_route(manuscript_id: str, ctx: AuthContext = Depends(auth_context), db: PostgresRepository = Depends(get_repository)) -> Manuscript:
+    return await get_manuscript(db, manuscript_id, ctx.user_id)
 
 
 @router.get("/manuscripts/{manuscript_id}/blocks", response_model=ManuscriptBlockListResponse)
@@ -1732,9 +2659,9 @@ async def list_manuscript_blocks(
     limit: Annotated[int, Query(ge=1, le=MAX_LIMIT)] = MAX_LIMIT,
     cursor: str | None = None,
     ctx: AuthContext = Depends(auth_context),
-    db: Store = Depends(get_store),
+    db: PostgresRepository = Depends(get_repository),
 ) -> ManuscriptBlockListResponse:
-    manuscript = get_manuscript(db, manuscript_id, ctx.user_id)
+    manuscript = await get_manuscript(db, manuscript_id, ctx.user_id)
     page, next_cursor = paginate(manuscript.blocks, limit, cursor)
     return ManuscriptBlockListResponse(items=page, next_cursor=next_cursor, revision=manuscript.revision)
 
@@ -1745,13 +2672,13 @@ async def sync_manuscript_blocks(
     request: Request,
     payload: ManuscriptSyncRequest,
     ctx: AuthContext = Depends(auth_context),
-    db: Store = Depends(get_store),
+    db: PostgresRepository = Depends(get_repository),
 ) -> JSONResponse:
     client_id = require_client_header(request, ctx, payload.client_id)
     idem = await require_idempotency(request, ctx, db)
     if idem[2]:
-        return idempotent_json_response(db, idem, None, status.HTTP_200_OK)
-    manuscript = get_manuscript(db, manuscript_id, ctx.user_id)
+        return await idempotent_json_response(db, idem, None, status.HTTP_200_OK)
+    manuscript = await get_manuscript(db, manuscript_id, ctx.user_id)
     if payload.base_revision != manuscript.revision:
         raise APIError(
             status.HTTP_409_CONFLICT,
@@ -1759,9 +2686,10 @@ async def sync_manuscript_blocks(
             "Manuscript revision is outdated.",
             {"server_revision": manuscript.revision, "client_revision": payload.base_revision, "latest_blocks": [dump_model(block) for block in manuscript.blocks]},
         )
-    changed, applied = apply_manuscript_operations(db, manuscript, payload, ctx, client_id)
+    changed, applied = await apply_manuscript_operations(db, manuscript, payload, ctx, client_id)
+    await db.save_manuscript(manuscript)
     response = ManuscriptSyncResponse(resource_id=manuscript.id, revision=manuscript.revision, applied_op_ids=applied, conflicts=[], blocks=changed)
-    return idempotent_json_response(db, idem, response, status.HTTP_200_OK)
+    return await idempotent_json_response(db, idem, response, status.HTTP_200_OK)
 
 
 @router.delete("/manuscripts/{manuscript_id}", response_model=DeletedManuscriptResponse, dependencies=CLIENT_HEADER_DEPENDENCIES)
@@ -1769,15 +2697,16 @@ async def delete_manuscript(
     manuscript_id: str,
     request: Request,
     ctx: AuthContext = Depends(auth_context),
-    db: Store = Depends(get_store),
+    db: PostgresRepository = Depends(get_repository),
 ) -> DeletedManuscriptResponse:
     require_client_header(request, ctx)
-    manuscript = get_manuscript(db, manuscript_id, ctx.user_id)
+    manuscript = await get_manuscript(db, manuscript_id, ctx.user_id)
     now = utcnow()
     manuscript.deleted = True
     manuscript.deleted_at = now
     manuscript.updated_at = now
     manuscript.revision += 1
+    await db.save_manuscript(manuscript)
     return DeletedManuscriptResponse(id=manuscript.id, deleted=True, deleted_at=now)
 
 
@@ -1786,10 +2715,9 @@ async def list_documents(
     limit: Annotated[int, Query(ge=1, le=MAX_LIMIT)] = DEFAULT_LIMIT,
     cursor: str | None = None,
     ctx: AuthContext = Depends(auth_context),
-    db: Store = Depends(get_store),
+    db: PostgresRepository = Depends(get_repository),
 ) -> DocumentListResponse:
-    documents = [item for item in db.documents.values() if item.owner_id == ctx.user_id]
-    documents.sort(key=lambda item: (item.updated_at, item.id), reverse=True)
+    documents = await db.list_documents(ctx.user_id)
     summaries = [document_summary(item) for item in documents]
     page, next_cursor = paginate(summaries, limit, cursor)
     return DocumentListResponse(items=page, next_cursor=next_cursor)
@@ -1800,22 +2728,22 @@ async def create_document(
     request: Request,
     payload: DocumentCreateRequest,
     ctx: AuthContext = Depends(auth_context),
-    db: Store = Depends(get_store),
+    db: PostgresRepository = Depends(get_repository),
 ) -> JSONResponse:
     client_id = require_client_header(request, ctx, payload.client_id)
     idem = await require_idempotency(request, ctx, db)
     if idem[2]:
-        return idempotent_json_response(db, idem, None, status.HTTP_201_CREATED)
+        return await idempotent_json_response(db, idem, None, status.HTTP_201_CREATED)
     if payload.derived_from is not None:
         raise validation_error("derived_from is server-managed and must be null for manual document creation.")
     now = utcnow()
     for manuscript_id in payload.source_manuscript_ids:
-        get_manuscript(db, manuscript_id, ctx.user_id)
+        await get_manuscript(db, manuscript_id, ctx.user_id)
     blocks: list[DocumentBlock] = []
     for block in payload.initial_blocks:
         validate_block_author_and_client(block, ctx, client_id)
         validate_block_payload(block)
-        validate_block_asset_refs(db, block, ctx.user_id)
+        await validate_block_asset_refs(db, block, ctx.user_id)
         blocks.append(block.model_copy(update={"updated_at": now, "source_refs": []}))
     document = Document(
         id=new_id("doc"),
@@ -1829,14 +2757,14 @@ async def create_document(
         created_at=now,
         updated_at=now,
     )
-    db.documents[document.id] = document
-    create_document_version(db, document, "Initial version")
-    return idempotent_json_response(db, idem, document, status.HTTP_201_CREATED)
+    await db.save_document(document)
+    await db.create_document_version(document, "Initial version")
+    return await idempotent_json_response(db, idem, document, status.HTTP_201_CREATED)
 
 
 @router.get("/documents/{document_id}", response_model=Document)
-async def get_document_route(document_id: str, ctx: AuthContext = Depends(auth_context), db: Store = Depends(get_store)) -> Document:
-    return get_document(db, document_id, ctx.user_id)
+async def get_document_route(document_id: str, ctx: AuthContext = Depends(auth_context), db: PostgresRepository = Depends(get_repository)) -> Document:
+    return await get_document(db, document_id, ctx.user_id)
 
 
 @router.get("/documents/{document_id}/blocks", response_model=DocumentBlockListResponse)
@@ -1845,9 +2773,9 @@ async def list_document_blocks(
     limit: Annotated[int, Query(ge=1, le=MAX_LIMIT)] = MAX_LIMIT,
     cursor: str | None = None,
     ctx: AuthContext = Depends(auth_context),
-    db: Store = Depends(get_store),
+    db: PostgresRepository = Depends(get_repository),
 ) -> DocumentBlockListResponse:
-    document = get_document(db, document_id, ctx.user_id)
+    document = await get_document(db, document_id, ctx.user_id)
     page, next_cursor = paginate(document.blocks, limit, cursor)
     return DocumentBlockListResponse(items=page, next_cursor=next_cursor, revision=document.revision)
 
@@ -1858,13 +2786,13 @@ async def sync_document_blocks(
     request: Request,
     payload: DocumentSyncRequest,
     ctx: AuthContext = Depends(auth_context),
-    db: Store = Depends(get_store),
+    db: PostgresRepository = Depends(get_repository),
 ) -> JSONResponse:
     client_id = require_client_header(request, ctx, payload.client_id)
     idem = await require_idempotency(request, ctx, db)
     if idem[2]:
-        return idempotent_json_response(db, idem, None, status.HTTP_200_OK)
-    document = get_document(db, document_id, ctx.user_id)
+        return await idempotent_json_response(db, idem, None, status.HTTP_200_OK)
+    document = await get_document(db, document_id, ctx.user_id)
     if payload.base_revision != document.revision:
         raise APIError(
             status.HTTP_409_CONFLICT,
@@ -1872,10 +2800,11 @@ async def sync_document_blocks(
             "Document revision is outdated.",
             {"server_revision": document.revision, "client_revision": payload.base_revision, "latest_blocks": [dump_model(block) for block in document.blocks]},
         )
-    changed, applied = apply_document_operations(db, document, payload, ctx, client_id)
-    create_document_version(db, document, "Automatic version")
+    changed, applied = await apply_document_operations(db, document, payload, ctx, client_id)
+    await db.save_document(document)
+    await db.create_document_version(document, "Automatic version")
     response = DocumentSyncResponse(resource_id=document.id, revision=document.revision, applied_op_ids=applied, conflicts=[], blocks=changed)
-    return idempotent_json_response(db, idem, response, status.HTTP_200_OK)
+    return await idempotent_json_response(db, idem, response, status.HTTP_200_OK)
 
 
 @router.get("/documents/{document_id}/versions", response_model=DocumentVersionListResponse)
@@ -1884,10 +2813,10 @@ async def list_document_versions(
     limit: Annotated[int, Query(ge=1, le=MAX_LIMIT)] = DEFAULT_LIMIT,
     cursor: str | None = None,
     ctx: AuthContext = Depends(auth_context),
-    db: Store = Depends(get_store),
+    db: PostgresRepository = Depends(get_repository),
 ) -> DocumentVersionListResponse:
-    get_document(db, document_id, ctx.user_id)
-    versions = sorted((record.version for record in db.document_versions.get(document_id, [])), key=lambda item: (item.created_at, item.id), reverse=True)
+    await get_document(db, document_id, ctx.user_id)
+    versions = await db.list_document_versions(document_id)
     page, next_cursor = paginate(versions, limit, cursor)
     return DocumentVersionListResponse(items=page, next_cursor=next_cursor)
 
@@ -1899,13 +2828,13 @@ async def restore_document_version(
     request: Request,
     payload: RestoreVersionRequest,
     ctx: AuthContext = Depends(auth_context),
-    db: Store = Depends(get_store),
+    db: PostgresRepository = Depends(get_repository),
 ) -> Document:
     require_client_header(request, ctx, payload.client_id)
-    document = get_document(db, document_id, ctx.user_id)
+    document = await get_document(db, document_id, ctx.user_id)
     if payload.base_revision != document.revision:
         raise APIError(status.HTTP_409_CONFLICT, "revision_conflict", "Document revision is outdated.", {"server_revision": document.revision, "client_revision": payload.base_revision})
-    version_record = find_document_version(db, document_id, version_id)
+    version_record = await db.find_document_version(document_id, version_id)
     if not version_record:
         raise APIError(status.HTTP_404_NOT_FOUND, "not_found", "Document version not found.")
     restored = version_record.snapshot.model_copy(deep=True)
@@ -1915,7 +2844,8 @@ async def restore_document_version(
     document.blocks = restored.blocks
     document.revision += 1
     document.updated_at = utcnow()
-    create_document_version(db, document, "Restored version")
+    await db.save_document(document)
+    await db.create_document_version(document, "Restored version")
     return document
 
 
@@ -1925,10 +2855,10 @@ async def create_share_link(
     request: Request,
     payload: ShareLinkRequest,
     ctx: AuthContext = Depends(auth_context),
-    db: Store = Depends(get_store),
+    db: PostgresRepository = Depends(get_repository),
 ) -> ShareLink:
     require_client_header(request, ctx)
-    get_document(db, document_id, ctx.user_id)
+    await get_document(db, document_id, ctx.user_id)
     share_id = new_id("share")
     token = secrets.token_urlsafe(32)
     link = ShareLink(
@@ -1939,18 +2869,18 @@ async def create_share_link(
         expires_at=payload.expires_at,
         created_at=utcnow(),
     )
-    db.share_links[share_id] = ShareLinkRecord(link=link, token=token, document_id=document_id)
+    await db.save_share_link(ShareLinkRecord(link=link, token=token, document_id=document_id))
     return link
 
 
 @router.get("/share/{share_id}", response_model=Document)
-async def get_share_link(share_id: str, token: str, db: Store = Depends(get_store)) -> Document:
-    record = db.share_links.get(share_id)
+async def get_share_link(share_id: str, token: str, db: PostgresRepository = Depends(get_repository)) -> Document:
+    record = await db.get_share_link_record(share_id)
     if not record or record.token != token:
         raise APIError(status.HTTP_404_NOT_FOUND, "not_found", "Share link not found.")
     if record.link.expires_at <= utcnow():
         raise APIError(status.HTTP_403_FORBIDDEN, "forbidden", "Share link has expired.")
-    document = db.documents.get(record.document_id)
+    document = await db.get_document(record.document_id)
     if not document:
         raise APIError(status.HTTP_404_NOT_FOUND, "not_found", "Document not found.")
     return document.model_copy(update={"permission": record.link.permission})
@@ -1961,11 +2891,11 @@ async def delete_document(
     document_id: str,
     request: Request,
     ctx: AuthContext = Depends(auth_context),
-    db: Store = Depends(get_store),
+    db: PostgresRepository = Depends(get_repository),
 ) -> Response:
     require_client_header(request, ctx)
-    document = get_document(db, document_id, ctx.user_id)
-    del db.documents[document.id]
+    document = await get_document(db, document_id, ctx.user_id)
+    await db.delete_document(document.id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -1974,16 +2904,16 @@ async def convert_manuscript(
     request: Request,
     payload: ConvertManuscriptRequest,
     ctx: AuthContext = Depends(auth_context),
-    db: Store = Depends(get_store),
+    db: PostgresRepository = Depends(get_repository),
 ) -> JSONResponse:
     client_id = require_client_header(request, ctx, payload.client_id)
     idem = await require_idempotency(request, ctx, db)
     if idem[2]:
-        return idempotent_json_response(db, idem, None, status.HTTP_202_ACCEPTED)
-    manuscript = get_manuscript(db, payload.manuscript_id, ctx.user_id)
+        return await idempotent_json_response(db, idem, None, status.HTTP_202_ACCEPTED)
+    manuscript = await get_manuscript(db, payload.manuscript_id, ctx.user_id)
     now = utcnow()
     task_id = new_id("task")
-    blocks = build_document_blocks_from_manuscript(db, manuscript, task_id, client_id)
+    blocks = await build_document_blocks_from_manuscript(db, manuscript, task_id, client_id)
     derived_from = DerivedFrom(manuscript_id=manuscript.id, task_id=task_id, mode=payload.mode, converted_at=now)
     document = Document(
         id=new_id("doc"),
@@ -1997,8 +2927,8 @@ async def convert_manuscript(
         created_at=now,
         updated_at=now,
     )
-    db.documents[document.id] = document
-    create_document_version(db, document, "Converted from manuscript")
+    await db.save_document(document)
+    await db.create_document_version(document, "Converted from manuscript")
     task = Task(
         id=task_id,
         type="convert_manuscript",
@@ -2011,22 +2941,23 @@ async def convert_manuscript(
         created_at=now,
         updated_at=now,
     )
-    db.tasks[task.id] = (ctx.user_id, task)
-    return idempotent_json_response(db, idem, task, status.HTTP_202_ACCEPTED)
+    await db.save_task(ctx.user_id, task)
+    return await idempotent_json_response(db, idem, task, status.HTTP_202_ACCEPTED)
 
 
 @router.post("/tasks/asr-audio", response_model=Task, status_code=status.HTTP_202_ACCEPTED, dependencies=IDEMPOTENT_WRITE_DEPENDENCIES)
 async def asr_audio(
     request: Request,
+    background_tasks: BackgroundTasks,
     payload: AsrAudioRequest,
     ctx: AuthContext = Depends(auth_context),
-    db: Store = Depends(get_store),
+    db: PostgresRepository = Depends(get_repository),
 ) -> JSONResponse:
     require_client_header(request, ctx, payload.client_id)
     idem = await require_idempotency(request, ctx, db)
     if idem[2]:
-        return idempotent_json_response(db, idem, None, status.HTTP_202_ACCEPTED)
-    asset_record = get_asset_record(db, payload.asset_id, ctx.user_id)
+        return await idempotent_json_response(db, idem, None, status.HTTP_202_ACCEPTED)
+    asset_record = await get_asset_record(db, payload.asset_id, ctx.user_id)
     if asset_record.asset.kind != "audio" or asset_record.asset.status != "ready":
         raise validation_error("ASR requires a ready audio asset.")
     now = utcnow()
@@ -2039,13 +2970,44 @@ async def asr_audio(
         created_at=now,
         updated_at=now,
     )
-    db.tasks[task.id] = (ctx.user_id, task)
-    return idempotent_json_response(db, idem, task, status.HTTP_202_ACCEPTED)
+    task_input = payload.model_dump(mode="json")
+    await db.save_task(ctx.user_id, task, task_input=task_input)
+    background_tasks.add_task(process_asr_task, db, ctx.user_id, task.id, payload, get_asr_provider(request))
+    return await idempotent_json_response(db, idem, task, status.HTTP_202_ACCEPTED)
+
+
+@router.post("/tasks/asr-audio/stream", dependencies=IDEMPOTENT_WRITE_DEPENDENCIES)
+async def asr_audio_stream(
+    request: Request,
+    payload: AsrAudioRequest,
+    ctx: AuthContext = Depends(auth_context),
+    db: PostgresRepository = Depends(get_repository),
+) -> StreamingResponse:
+    require_client_header(request, ctx, payload.client_id)
+    require_idempotency_header(request)
+    asset_record = await get_asset_record(db, payload.asset_id, ctx.user_id)
+    if asset_record.asset.kind != "audio" or asset_record.asset.status != "ready":
+        raise validation_error("ASR requires a ready audio asset.")
+    now = utcnow()
+    task = Task(
+        id=new_id("task"),
+        type="asr_audio",
+        status="queued",
+        progress=TaskProgress(stage="queued", current=0, total=1, message="ASR task queued."),
+        result=None,
+        created_at=now,
+        updated_at=now,
+    )
+    await db.save_task(ctx.user_id, task, task_input=payload.model_dump(mode="json"))
+    return StreamingResponse(
+        stream_asr_task_events(db, ctx.user_id, task, payload, get_asr_provider(request)),
+        media_type="text/event-stream",
+    )
 
 
 @router.get("/tasks/{task_id}", response_model=Task)
-async def get_task_route(task_id: str, ctx: AuthContext = Depends(auth_context), db: Store = Depends(get_store)) -> Task:
-    return get_task(db, task_id, ctx.user_id)
+async def get_task_route(task_id: str, ctx: AuthContext = Depends(auth_context), db: PostgresRepository = Depends(get_repository)) -> Task:
+    return await get_task(db, task_id, ctx.user_id)
 
 
 @router.post("/tasks/{task_id}/cancel", response_model=Task, dependencies=IDEMPOTENT_WRITE_DEPENDENCIES)
@@ -2053,13 +3015,13 @@ async def cancel_task(
     task_id: str,
     request: Request,
     ctx: AuthContext = Depends(auth_context),
-    db: Store = Depends(get_store),
+    db: PostgresRepository = Depends(get_repository),
 ) -> JSONResponse:
     require_client_header(request, ctx)
     idem = await require_idempotency(request, ctx, db)
     if idem[2]:
-        return idempotent_json_response(db, idem, None, status.HTTP_200_OK)
-    task = get_task(db, task_id, ctx.user_id)
+        return await idempotent_json_response(db, idem, None, status.HTTP_200_OK)
+    task = await get_task(db, task_id, ctx.user_id)
     if task.status not in {"queued", "processing"}:
         raise APIError(status.HTTP_409_CONFLICT, "resource_conflict", "Only queued or processing tasks can be cancelled.")
     cancelled = task.model_copy(
@@ -2070,8 +3032,8 @@ async def cancel_task(
             "updated_at": utcnow(),
         }
     )
-    db.tasks[task_id] = (ctx.user_id, cancelled)
-    return idempotent_json_response(db, idem, cancelled, status.HTTP_200_OK)
+    await db.save_task(ctx.user_id, cancelled)
+    return await idempotent_json_response(db, idem, cancelled, status.HTTP_200_OK)
 
 
 @router.post("/exports", response_model=Task, status_code=status.HTTP_202_ACCEPTED, dependencies=IDEMPOTENT_WRITE_DEPENDENCIES)
@@ -2079,13 +3041,13 @@ async def create_export(
     request: Request,
     payload: ExportRequest,
     ctx: AuthContext = Depends(auth_context),
-    db: Store = Depends(get_store),
+    db: PostgresRepository = Depends(get_repository),
 ) -> JSONResponse:
     require_client_header(request, ctx, payload.client_id)
     idem = await require_idempotency(request, ctx, db)
     if idem[2]:
-        return idempotent_json_response(db, idem, None, status.HTTP_202_ACCEPTED)
-    document = get_document(db, payload.document_id, ctx.user_id)
+        return await idempotent_json_response(db, idem, None, status.HTTP_202_ACCEPTED)
+    document = await get_document(db, payload.document_id, ctx.user_id)
     now = utcnow()
     export_id = new_id("export")
     asset_id = new_id("asset")
@@ -2105,8 +3067,8 @@ async def create_export(
         created_at=now,
         updated_at=now,
     )
-    db.assets[asset_id] = AssetRecord(owner_id=ctx.user_id, asset=asset, upload_id=new_id("upload"), part_size_bytes=1, uploaded_parts=[], content=content)
-    db.exports[export_id] = ExportRecord(
+    await db.save_asset(AssetRecord(owner_id=ctx.user_id, asset=asset, upload_id=new_id("upload"), part_size_bytes=1, uploaded_parts=[], content=content))
+    export_record = ExportRecord(
         owner_id=ctx.user_id,
         export_id=export_id,
         asset_id=asset_id,
@@ -2116,6 +3078,7 @@ async def create_export(
         snapshot=document.model_copy(deep=True),
         created_at=now,
     )
+    await db.save_export(export_record)
     task = Task(
         id=new_id("task"),
         type="export_document",
@@ -2131,16 +3094,21 @@ async def create_export(
         created_at=now,
         updated_at=now,
     )
-    db.tasks[task.id] = (ctx.user_id, task)
-    return idempotent_json_response(db, idem, task, status.HTTP_202_ACCEPTED)
+    await db.save_task(ctx.user_id, task)
+    return await idempotent_json_response(db, idem, task, status.HTTP_202_ACCEPTED)
 
 
 @router.get("/exports/{export_id}/download", response_model=ExportDownloadResponse)
-async def download_export(export_id: str, ctx: AuthContext = Depends(auth_context), db: Store = Depends(get_store)) -> ExportDownloadResponse:
-    record = get_export_record(db, export_id, ctx.user_id)
-    get_document(db, record.document_id, ctx.user_id)
+async def download_export(
+    export_id: str,
+    request: Request,
+    ctx: AuthContext = Depends(auth_context),
+    db: PostgresRepository = Depends(get_repository),
+) -> ExportDownloadResponse:
+    record = await get_export_record(db, export_id, ctx.user_id)
+    await get_document(db, record.document_id, ctx.user_id)
     return ExportDownloadResponse(
-        download_url=f"https://object-storage.local/{record.asset_id}/download?expires_in=600",
+        download_url=make_asset_stream_url(request, record.asset_id),
         expires_at=utcnow() + timedelta(minutes=15),
     )
 
@@ -2151,11 +3119,11 @@ async def ai_agent_chat(
     payload: AiChatRequest,
     last_event_id: Annotated[str | None, Header(alias="Last-Event-ID")] = None,
     ctx: AuthContext = Depends(auth_context),
-    db: Store = Depends(get_store),
+    db: PostgresRepository = Depends(get_repository),
 ) -> StreamingResponse:
     require_client_header(request, ctx, payload.client_id)
     require_idempotency_header(request)
-    get_document(db, payload.document_id, ctx.user_id)
+    await get_document(db, payload.document_id, ctx.user_id)
     resume_after = 0
     if last_event_id:
         try:
@@ -2177,8 +3145,8 @@ async def ai_agent_chat(
 
 
 @router.websocket("/ai/handwriting/complete")
-async def handwriting_complete(websocket: WebSocket, access_token: str, client_id: str, db: Store = Depends(get_store)) -> None:
-    session = db.access_tokens.get(access_token)
+async def handwriting_complete(websocket: WebSocket, access_token: str, client_id: str, db: PostgresRepository = Depends(get_repository)) -> None:
+    session = await db.get_token_session(access_token, "access")
     if not session or session.expires_at <= utcnow() or session.client_id != client_id:
         await websocket.close(code=1008)
         return
