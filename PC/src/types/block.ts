@@ -1,6 +1,6 @@
 export type ManuscriptBlockType = "audio" | "image" | "handwriting" | "text";
 
-export type DocumentBlockType = "heading" | "paragraph" | "list" | "quote" | "action";
+export type DocumentBlockType = "heading" | "paragraph" | "list" | "quote" | "action" | "image";
 
 export type ManuscriptBlock = {
   id: string;
@@ -22,4 +22,5 @@ export type DocumentBlock = {
   updatedAt?: string;
   content: string;
   items?: string[];
+  props?: Record<string, unknown>;
 };
