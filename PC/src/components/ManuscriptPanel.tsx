@@ -2,14 +2,16 @@ import {
   useEffect,
   useRef,
   useState,
+  type FormEvent,
   type MouseEvent,
   type PointerEvent as ReactPointerEvent,
 } from "react";
 import { Layer, Line, Rect, Stage } from "react-konva";
 import type { KonvaEventObject } from "konva/lib/Node";
-import { pcApi, type AudioTranscription } from "../lib/api";
+import { pcApi, type AudioTranscription, type ImageRecognitionResult, type Task } from "../lib/api";
 import { useWorkspaceStore } from "../stores/workspaceStore";
 import type { ManuscriptBlock } from "../types/block";
+import type { Manuscript } from "../types/manuscript";
 
 type StrokeTool = "pen" | "highlighter" | "eraser" | "lasso";
 type StrokePoint = { x: number; y: number; t: number; pressure: number };
@@ -44,6 +46,11 @@ type MenuState = {
   selectedStrokeIds: string[];
 } | null;
 type RenameDialogState = { manuscriptId: string; title: string };
+type ConvertDialogState = {
+  title: string;
+  optimizeAudio: boolean;
+  submitting: boolean;
+};
 type UiPointEvent = MouseEvent<Element> | ReactPointerEvent<Element>;
 type DrawingState =
   | { mode: "none" }
@@ -116,7 +123,14 @@ export function ManuscriptPanel(): React.JSX.Element {
   const [renameDialog, setRenameDialog] = useState<RenameDialogState | null>(
     null,
   );
+  const [convertDialog, setConvertDialog] = useState<ConvertDialogState | null>(
+    null,
+  );
+  const [convertTask, setConvertTask] = useState<Task | null>(null);
+  const [convertError, setConvertError] = useState<string | null>(null);
   const longPressTimerRef = useRef<number | null>(null);
+  const autoSaveTimerRef = useRef<number | null>(null);
+  const openedDocumentTaskRef = useRef<string | null>(null);
   const lastSavedBlocksRef = useRef("");
   const isColorTool = tool === "pen" || tool === "highlighter";
   const color = tool === "highlighter" ? highlighterColor : penColor;
@@ -137,7 +151,8 @@ export function ManuscriptPanel(): React.JSX.Element {
     const serialized = JSON.stringify(blocks);
     if (serialized === lastSavedBlocksRef.current) return;
 
-    const timeoutId = window.setTimeout(() => {
+    if (autoSaveTimerRef.current) window.clearTimeout(autoSaveTimerRef.current);
+    autoSaveTimerRef.current = window.setTimeout(() => {
       setSaveStatus("自动保存中");
       pcApi
         .saveManuscript({ ...manuscript, blocks })
@@ -149,8 +164,55 @@ export function ManuscriptPanel(): React.JSX.Element {
         .catch(() => setSaveStatus("保存失败，将重试"));
     }, 700);
 
-    return () => window.clearTimeout(timeoutId);
+    return () => {
+      if (autoSaveTimerRef.current) window.clearTimeout(autoSaveTimerRef.current);
+    };
   }, [blocks, manuscript, updateManuscript]);
+
+  useEffect(() => {
+    if (!convertTask) return;
+    if (
+      convertTask.status === "succeeded" &&
+      convertTask.result?.document_id &&
+      openedDocumentTaskRef.current !== convertTask.id
+    ) {
+      openedDocumentTaskRef.current = convertTask.id;
+      let active = true;
+      pcApi
+        .getDocument(convertTask.result.document_id)
+        .then((document) => {
+          if (!active) return;
+          addDocument(document);
+          openDocumentEditor(document.id);
+        })
+        .catch((error) => {
+          if (active)
+            setConvertError(
+              error instanceof Error ? error.message : "生成文档加载失败",
+            );
+        });
+      return () => {
+        active = false;
+      };
+    }
+    if (
+      convertTask.status === "succeeded" ||
+      convertTask.status === "failed" ||
+      convertTask.status === "cancelled"
+    )
+      return;
+    const timer = window.setInterval(() => {
+      pcApi
+        .getTask(convertTask.id)
+        .then(setConvertTask)
+        .catch((error) =>
+          setConvertError(
+            error instanceof Error ? error.message : "转换任务状态刷新失败",
+          ),
+        );
+    }, 1800);
+    return () => window.clearInterval(timer);
+  }, [addDocument, convertTask, openDocumentEditor]);
 
   const createManuscript = async (): Promise<void> => {
     const nextManuscript = await pcApi.createManuscript("未命名手稿");
@@ -183,15 +245,65 @@ export function ManuscriptPanel(): React.JSX.Element {
     removeManuscript(manuscript.id);
   };
 
-  const convertToDocument = async (): Promise<void> => {
+  async function persistBlocksNow(): Promise<Manuscript> {
+    if (!manuscript) throw new Error("请先选择手稿");
+    if (autoSaveTimerRef.current) window.clearTimeout(autoSaveTimerRef.current);
+    const serialized = JSON.stringify(blocks);
+    if (serialized === lastSavedBlocksRef.current) return manuscript;
+    setSaveStatus("保存中");
+    const savedManuscript = await pcApi.saveManuscript({ ...manuscript, blocks });
+    lastSavedBlocksRef.current = JSON.stringify(savedManuscript.blocks);
+    setBlocks(savedManuscript.blocks);
+    updateManuscript(savedManuscript);
+    setSaveStatus("已保存");
+    return savedManuscript;
+  }
+
+  const openConvertDialog = (): void => {
     if (!manuscript) return;
-    const document = await pcApi.convertManuscript(
-      manuscript.id,
-      `${manuscript.title} 文档`,
+    setConvertError(null);
+    setConvertDialog({
+      title: defaultDocumentTitle(manuscript.title),
+      optimizeAudio: false,
+      submitting: false,
+    });
+  };
+
+  const submitConvertDialog = async (event: FormEvent): Promise<void> => {
+    event.preventDefault();
+    if (!manuscript || !convertDialog) return;
+    const title = convertDialog.title.trim();
+    if (!title) {
+      setConvertError("文档标题不能为空");
+      return;
+    }
+    const hasAudioWithoutTranscript = blocks.some(
+      (block) =>
+        block.type === "audio" &&
+        !String(block.props.transcript ?? block.summary ?? "").trim(),
     );
-    if (document) {
-      addDocument(document);
-      openDocumentEditor(document.id);
+    if (
+      hasAudioWithoutTranscript &&
+      !window.confirm(
+        "存在尚未完成 ASR 的录音。继续转换会跳过或降级这些录音，是否继续？",
+      )
+    )
+      return;
+    setConvertDialog({ ...convertDialog, submitting: true });
+    setConvertError(null);
+    try {
+      const savedManuscript = await persistBlocksNow();
+      const task = await pcApi.convertManuscript(
+        savedManuscript.id,
+        title,
+        convertDialog.optimizeAudio,
+      );
+      openedDocumentTaskRef.current = null;
+      setConvertTask(task);
+      setConvertDialog(null);
+    } catch (error) {
+      setConvertError(error instanceof Error ? error.message : "转文档失败");
+      setConvertDialog({ ...convertDialog, submitting: false });
     }
   };
 
@@ -550,13 +662,24 @@ export function ManuscriptPanel(): React.JSX.Element {
           </div>
           <button
             className="rounded-xl bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50"
-            disabled={!manuscript}
-            onClick={convertToDocument}
+            disabled={!manuscript || isConvertTaskRunning(convertTask)}
+            onClick={openConvertDialog}
             type="button"
           >
-            转文档
+            {isConvertTaskRunning(convertTask) ? "转换中" : "转文档"}
           </button>
         </header>
+
+        {convertTask ? <ConvertTaskBanner task={convertTask} /> : null}
+        {convertError ? (
+          <button
+            className="mx-auto mb-4 block max-w-4xl rounded-2xl bg-red-50 px-4 py-3 text-left text-sm text-red-700"
+            onClick={() => setConvertError(null)}
+            type="button"
+          >
+            {convertError}
+          </button>
+        ) : null}
 
         <div className="sticky top-4 z-40 mx-auto mb-4 flex w-fit flex-wrap items-center gap-2 rounded-2xl border border-[#e4d7c4] bg-[#fffaf0]/95 p-2 shadow-2xl backdrop-blur">
           {(["pen", "highlighter", "eraser", "lasso"] as StrokeTool[]).map(
@@ -877,6 +1000,114 @@ export function ManuscriptPanel(): React.JSX.Element {
           </div>
         </div>
       )}
+
+      {convertDialog && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/30 px-4"
+          onClick={() => !convertDialog.submitting && setConvertDialog(null)}
+        >
+          <form
+            className="w-full max-w-md rounded-3xl border border-slate-200 bg-white p-6 shadow-2xl"
+            onClick={(event) => event.stopPropagation()}
+            onSubmit={submitConvertDialog}
+          >
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <p className="text-xs font-semibold uppercase tracking-[0.18em] text-blue-600">
+                  Convert Manuscript
+                </p>
+                <h3 className="mt-1 text-lg font-semibold text-slate-950">
+                  转为文档
+                </h3>
+              </div>
+              <button
+                className="rounded-full bg-slate-100 px-3 py-1.5 text-sm text-slate-600 hover:bg-slate-200 disabled:opacity-50"
+                disabled={convertDialog.submitting}
+                onClick={() => setConvertDialog(null)}
+                type="button"
+              >
+                关闭
+              </button>
+            </div>
+            <label className="mt-5 block text-sm font-medium text-slate-700">
+              文档标题
+              <input
+                autoFocus
+                className="mt-2 w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-blue-300 focus:ring-4 focus:ring-blue-100"
+                onChange={(event) =>
+                  setConvertDialog({
+                    ...convertDialog,
+                    title: event.target.value,
+                  })
+                }
+                required
+                value={convertDialog.title}
+              />
+            </label>
+            <label className="mt-4 flex items-center justify-between gap-4 rounded-2xl bg-slate-50 p-4 text-sm text-slate-700">
+              <span>
+                <strong className="block text-slate-950">启用录音内容优化</strong>
+                <small className="mt-1 block leading-5 text-slate-500">
+                  由后端清理口水词和无意义重复，客户端只提交开关。
+                </small>
+              </span>
+              <input
+                checked={convertDialog.optimizeAudio}
+                className="h-5 w-5"
+                onChange={(event) =>
+                  setConvertDialog({
+                    ...convertDialog,
+                    optimizeAudio: event.target.checked,
+                  })
+                }
+                type="checkbox"
+              />
+            </label>
+            <button
+              className="mt-5 w-full rounded-xl bg-blue-600 px-4 py-3 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50"
+              disabled={convertDialog.submitting}
+              type="submit"
+            >
+              {convertDialog.submitting ? "正在提交" : "开始转换"}
+            </button>
+          </form>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ConvertTaskBanner({ task }: { task: Task }): React.JSX.Element {
+  const total = Math.max(1, task.progress?.total || 1);
+  const current = Math.max(0, Math.min(task.progress?.current || 0, total));
+  const percent = Math.round((current / total) * 100);
+  return (
+    <div className="mx-auto mb-4 max-w-4xl rounded-2xl bg-slate-950 px-4 py-3 text-sm text-white shadow-sm">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <strong className="block">{task.progress?.message || "转换任务已创建"}</strong>
+          <span className="mt-1 block text-xs text-slate-300">
+            {task.status} · {task.progress?.stage || "queued"} · {current}/{total}
+          </span>
+        </div>
+        <span className="rounded-full bg-white/10 px-2 py-1 text-xs">
+          {percent}%
+        </span>
+      </div>
+      <div className="mt-3 h-2 overflow-hidden rounded-full bg-white/10">
+        <div
+          className="h-full rounded-full bg-blue-400 transition-[width]"
+          style={{ width: `${percent}%` }}
+        />
+      </div>
+      {task.result?.warnings?.length ? (
+        <p className="mt-2 text-xs text-amber-200">
+          部分内容已降级处理：{task.result.warnings.length} 项
+        </p>
+      ) : null}
+      {task.error?.message ? (
+        <p className="mt-2 text-xs text-red-200">{task.error.message}</p>
+      ) : null}
     </div>
   );
 }
@@ -1320,12 +1551,7 @@ function createAudioBlock(audio: AudioTranscription): ManuscriptBlock {
     },
   };
 }
-function createImageBlock(result: {
-  assetId: string;
-  text: string;
-  width: number | null;
-  height: number | null;
-}): ManuscriptBlock {
+function createImageBlock(result: ImageRecognitionResult): ManuscriptBlock {
   return {
     id: makeId("block"),
     type: "image",
@@ -1335,9 +1561,10 @@ function createImageBlock(result: {
     props: {
       asset_id: result.assetId,
       caption: result.text,
-      ocrText: result.text,
       width: result.width,
       height: result.height,
+      recognition_task_id: result.taskId,
+      recognition_generated_at: result.generatedAt,
     },
   };
 }
@@ -1481,4 +1708,19 @@ function getEyeDropper() {
   const candidate = (window as Window & { EyeDropper?: EyeDropperConstructor })
     .EyeDropper;
   return candidate ? new candidate() : null;
+}
+
+function defaultDocumentTitle(manuscriptTitle: string): string {
+  const trimmed = manuscriptTitle.trim();
+  if (!trimmed) return "未命名文档";
+  return trimmed.endsWith("手稿") ? trimmed.replace(/手稿$/, "文档") : `${trimmed} 文档`;
+}
+
+function isConvertTaskRunning(task: Task | null): boolean {
+  return Boolean(
+    task &&
+      task.status !== "succeeded" &&
+      task.status !== "failed" &&
+      task.status !== "cancelled",
+  );
 }

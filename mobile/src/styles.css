@@ -695,6 +695,39 @@ select {
   color: #241d15;
 }
 
+.mobile-form label {
+  display: grid;
+  gap: 6px;
+  color: #5a4a35;
+  font-size: 0.86rem;
+  font-weight: 800;
+}
+
+.switch-row {
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  border-radius: 16px;
+  padding: 12px;
+  background: rgba(255, 255, 255, 0.64);
+}
+
+.switch-row strong,
+.switch-row small {
+  display: block;
+}
+
+.switch-row small {
+  margin-top: 4px;
+  color: #786955;
+  font-weight: 500;
+  line-height: 1.5;
+}
+
+.switch-row input {
+  width: 22px;
+  height: 22px;
+}
+
 .mobile-form textarea {
   min-height: 92px;
   resize: vertical;
@@ -1025,6 +1058,22 @@ select {
 .task-banner strong,
 .task-banner small {
   display: block;
+}
+
+.task-progress {
+  overflow: hidden;
+  height: 7px;
+  margin: 9px 0 7px;
+  border-radius: 999px;
+  background: rgba(255, 240, 221, 0.18);
+}
+
+.task-progress i {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: #ffd89f;
+  transition: width 180ms ease;
 }
 
 .toast {

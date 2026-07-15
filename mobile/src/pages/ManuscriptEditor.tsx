@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ChangeEvent, type PointerEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type ChangeEvent, type FormEvent, type PointerEvent } from "react";
 import { Haptics, ImpactStyle } from "@capacitor/haptics";
 import { api } from "../lib/api";
 import {
@@ -15,7 +15,7 @@ import {
 } from "../lib/blocks";
 import { captureImageFromCamera, createPcmRecorder, formatDuration, normalizeRecordedAudio, readImageFile, type PcmRecorder } from "../lib/media";
 import { readAsrSse } from "../lib/sse";
-import type { ConvertMode, Manuscript, ManuscriptBlock, ManuscriptHandwritingBlock, Stroke, StrokeTool, SyncOperation, Task } from "../types/api";
+import type { Manuscript, ManuscriptBlock, ManuscriptHandwritingBlock, Stroke, StrokeTool, SyncOperation, Task } from "../types/api";
 import { AssetImage } from "../components/AssetImage";
 import { AudioAsset } from "../components/AudioAsset";
 import { BlankHandwritingCanvas } from "../components/BlankHandwritingCanvas";
@@ -36,6 +36,11 @@ type PendingAudio = {
   objectUrl: string;
   status: "uploading" | "failed";
   error?: string;
+};
+type ConvertDialogState = {
+  title: string;
+  optimizeAudio: boolean;
+  submitting: boolean;
 };
 
 const PEN_COLORS = ["#1f1b14", "#111827", "#2563eb", "#dc2626", "#16a34a", "#7c3aed"];
@@ -62,6 +67,8 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
   const [pendingAudios, setPendingAudios] = useState<PendingAudio[]>([]);
   const [localAudioUrls, setLocalAudioUrls] = useState<Record<string, string>>({});
   const [task, setTask] = useState<Task | null>(null);
+  const [convertTask, setConvertTask] = useState<Task | null>(null);
+  const [convertDialog, setConvertDialog] = useState<ConvertDialogState | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [blockHeights, setBlockHeights] = useState<Record<string, number>>({});
   const pendingOpsRef = useRef<PendingOp[]>([]);
@@ -69,6 +76,7 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
   const longPressTimerRef = useRef<number | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const imageAfterBlockIdRef = useRef<string | null>(null);
+  const openedDocumentTaskRef = useRef<string | null>(null);
 
   const userId = api.currentSession?.user.id ?? "";
   const visibleBlocks = useMemo(() => blocks.filter((block) => !block.deleted), [blocks]);
@@ -92,12 +100,30 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
   }
 
   useEffect(() => {
+    if (!convertTask) return;
+    if (convertTask.status === "succeeded" && convertTask.result?.document_id && openedDocumentTaskRef.current !== convertTask.id) {
+      openedDocumentTaskRef.current = convertTask.id;
+      onOpenDocument(convertTask.result.document_id);
+      return;
+    }
+    if (convertTask.status === "failed" || convertTask.status === "cancelled" || convertTask.status === "succeeded") return;
+    const timer = window.setInterval(async () => {
+      try {
+        const next = await api.getTask(convertTask.id);
+        setConvertTask(next);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "转换任务状态刷新失败");
+      }
+    }, 1600);
+    return () => window.clearInterval(timer);
+  }, [convertTask, onOpenDocument]);
+
+  useEffect(() => {
     if (!task || task.status === "succeeded" || task.status === "failed" || task.status === "cancelled") return;
-    if (task.type === "asr_audio") return;
+    if (task.type !== "asr_audio") return;
     const timer = window.setInterval(async () => {
       const next = await api.getTask(task.id);
       setTask(next);
-      if (next.status === "succeeded" && next.result?.document_id) onOpenDocument(next.result.document_id);
       if (next.status === "succeeded" && next.result?.asset_id && typeof next.result.transcript === "string") {
         const block = blocks.find((item): item is Extract<ManuscriptBlock, { type: "audio" }> => item.type === "audio" && item.props.asset_id === next.result?.asset_id);
         if (block) {
@@ -117,7 +143,7 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
       }
     }, 1600);
     return () => window.clearInterval(timer);
-  }, [task, onOpenDocument, blocks]);
+  }, [task, blocks]);
 
   function queueOperation(op: PendingOp) {
     if (op.type === "upsert_block" && op.block) {
@@ -456,11 +482,47 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
     localStorage.setItem(PEN_WIDTH_KEY, String(normalizedWidth));
   }
 
-  async function convert(mode: ConvertMode) {
+  function openConvertDialog() {
     if (!manuscript) return;
-    await flushOps();
-    const taskResult = await api.convertManuscript(manuscript.id, mode, manuscript.title.replace(/手稿$/, "文档"));
-    setTask(taskResult);
+    setError(null);
+    setConvertDialog({ title: defaultDocumentTitle(manuscript.title), optimizeAudio: false, submitting: false });
+  }
+
+  async function submitConvertDialog(event: FormEvent) {
+    event.preventDefault();
+    if (!manuscript || !convertDialog) return;
+    const title = convertDialog.title.trim();
+    if (!title) {
+      setError("文档标题不能为空");
+      return;
+    }
+    if (recording) {
+      setError("录音仍在进行，请先停止录音再转换。");
+      return;
+    }
+    if (pendingAudios.some((audio) => audio.status === "uploading")) {
+      setError("仍有录音正在上传，请上传完成后再转换。");
+      return;
+    }
+    const hasAudioWithoutTranscript = blocks.some((block) => block.type === "audio" && !block.props.transcript.trim());
+    if (hasAudioWithoutTranscript && !window.confirm("存在尚未完成 ASR 的录音。继续转换会跳过或降级这些录音，是否继续？")) return;
+
+    setConvertDialog({ ...convertDialog, submitting: true });
+    setError(null);
+    try {
+      await flushOps({ throwOnError: true });
+      const taskResult = await api.convertManuscript(manuscript.id, "meeting_minutes", title, convertDialog.optimizeAudio);
+      openedDocumentTaskRef.current = null;
+      setConvertTask(taskResult);
+      setConvertDialog(null);
+      if (taskResult.status === "succeeded" && taskResult.result?.document_id) {
+        openedDocumentTaskRef.current = taskResult.id;
+        onOpenDocument(taskResult.result.document_id);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "转文档失败");
+      setConvertDialog({ ...convertDialog, submitting: false });
+    }
   }
 
   if (error && !manuscript) return <EditorMessage title="手稿加载失败" message={error} onBack={onBack} />;
@@ -475,9 +537,10 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
           <h1>{manuscript.title}</h1>
           <p>{syncState}</p>
         </div>
-        <button className="primary-small" onClick={() => convert("meeting_minutes")} type="button">转文档</button>
+        <button className="primary-small" disabled={isConvertTaskRunning(convertTask)} onClick={openConvertDialog} type="button">转文档</button>
       </header>
 
+      {convertTask && <TaskBanner task={convertTask} />}
       {task && <TaskBanner task={task} />}
       {error && <button className="toast inline" onClick={() => setError(null)} type="button">{error}</button>}
 
@@ -574,6 +637,33 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
           <button onClick={() => setMenu(null)} type="button">关闭</button>
         </div>
       )}
+      {convertDialog && (
+        <div className="mobile-dialog-backdrop" onClick={() => !convertDialog.submitting && setConvertDialog(null)}>
+          <section className="mobile-dialog" onClick={(event) => event.stopPropagation()}>
+            <div className="mobile-dialog-head">
+              <div>
+                <p className="eyebrow">Convert Manuscript</p>
+                <h3>转为文档</h3>
+              </div>
+              <button className="dialog-close" disabled={convertDialog.submitting} onClick={() => setConvertDialog(null)} type="button">关闭</button>
+            </div>
+            <form className="mobile-form" onSubmit={submitConvertDialog}>
+              <label>
+                文档标题
+                <input autoFocus onChange={(event) => setConvertDialog({ ...convertDialog, title: event.target.value })} required value={convertDialog.title} />
+              </label>
+              <label className="switch-row">
+                <span>
+                  <strong>启用录音内容优化</strong>
+                  <small>由后端清理口水词和无意义重复，不在端侧改写内容。</small>
+                </span>
+                <input checked={convertDialog.optimizeAudio} onChange={(event) => setConvertDialog({ ...convertDialog, optimizeAudio: event.target.checked })} type="checkbox" />
+              </label>
+              <button className="primary-button" disabled={convertDialog.submitting} type="submit">{convertDialog.submitting ? "正在提交" : "开始转换"}</button>
+            </form>
+          </section>
+        </div>
+      )}
     </section>
   );
 }
@@ -591,13 +681,31 @@ function PendingAudioBlock({ audio }: { audio: PendingAudio }) {
 }
 
 function TaskBanner({ task }: { task: Task }) {
+  const total = Math.max(1, task.progress.total || 1);
+  const current = Math.max(0, Math.min(task.progress.current || 0, total));
+  const percent = Math.round((current / total) * 100);
   return (
     <div className="task-banner">
       <span>{task.status}</span>
       <strong>{task.progress.message || task.type}</strong>
-      <small>{task.progress.stage} · {task.progress.current}/{task.progress.total}</small>
+      <div className="task-progress" aria-label="任务进度" aria-valuemax={total} aria-valuemin={0} aria-valuenow={current} role="progressbar">
+        <i style={{ width: `${percent}%` }} />
+      </div>
+      <small>{task.progress.stage} · {current}/{total}</small>
+      {task.result?.warnings?.length ? <small>部分内容已降级处理：{task.result.warnings.length} 项</small> : null}
+      {task.error?.message ? <small>{task.error.message}</small> : null}
     </div>
   );
+}
+
+function defaultDocumentTitle(manuscriptTitle: string) {
+  const trimmed = manuscriptTitle.trim();
+  if (!trimmed) return "未命名文档";
+  return trimmed.endsWith("手稿") ? trimmed.replace(/手稿$/, "文档") : `${trimmed} 文档`;
+}
+
+function isConvertTaskRunning(task: Task | null) {
+  return Boolean(task && task.type === "convert_manuscript" && task.status !== "succeeded" && task.status !== "failed" && task.status !== "cancelled");
 }
 
 function EditorMessage({ title, message, onBack }: { title: string; message: string; onBack: () => void }) {

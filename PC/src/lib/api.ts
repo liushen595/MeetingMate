@@ -14,6 +14,39 @@ type PagedResponse<T> = {
   items: T[];
 };
 
+export type ConvertMode = "meeting_minutes" | "todo_list" | "article_draft";
+
+export type ConvertWarning = {
+  block_id: string;
+  code:
+    | "audio_transcript_missing"
+    | "audio_optimization_failed"
+    | "image_caption_failed"
+    | "handwriting_empty"
+    | "handwriting_render_failed"
+    | "handwriting_recognition_failed";
+  message: string;
+};
+
+export type Task = {
+  id: string;
+  type: "convert_manuscript" | "asr_audio" | "export_document" | "ai_rewrite" | string;
+  status: "queued" | "processing" | "succeeded" | "failed" | "cancelled";
+  progress: { stage: string; current: number; total: number; message: string };
+  result: {
+    document_id?: string;
+    asset_id?: string;
+    transcript?: string;
+    speaker_segments?: unknown[];
+    export_id?: string;
+    warnings?: ConvertWarning[];
+    [key: string]: unknown;
+  } | null;
+  error?: { code?: string; message?: string; retryable?: boolean } | null;
+  created_at?: string;
+  updated_at?: string;
+};
+
 type RemoteManuscript = {
   id: string;
   title: string;
@@ -30,14 +63,6 @@ type RemoteDocument = {
   updated_at: string;
   blocks: Array<Record<string, unknown>>;
   derived_from?: { manuscript_id?: string } | null;
-};
-
-type Task = {
-  id: string;
-  type: string;
-  status: "queued" | "processing" | "succeeded" | "failed" | "cancelled";
-  result: Record<string, unknown> | null;
-  error?: { message?: string } | null;
 };
 
 type AssetUploadResponse = {
@@ -63,6 +88,8 @@ export type ImageRecognitionResult = {
   text: string;
   width: number | null;
   height: number | null;
+  taskId: string;
+  generatedAt: string | null;
 };
 
 export type SelectedFile = {
@@ -255,21 +282,27 @@ class PcApiClient {
     await this.request<void>(`/manuscripts/${id}`, { method: "DELETE" });
   }
 
-  async convertManuscript(id: string, title: string): Promise<Document> {
-    const task = await this.request<Task>("/tasks/convert-manuscript", {
+  async convertManuscript(
+    id: string,
+    title: string,
+    optimizeAudio: boolean,
+    mode: ConvertMode = "meeting_minutes",
+  ): Promise<Task> {
+    return this.request<Task>("/tasks/convert-manuscript", {
       method: "POST",
       idempotent: true,
       body: JSON.stringify({
         manuscript_id: id,
-        mode: "meeting_minutes",
+        mode,
         title,
         client_id: this.clientId,
+        optimize_audio: optimizeAudio,
       }),
     });
-    const documentId = task.result?.document_id;
-    if (typeof documentId !== "string")
-      throw new Error("转换任务未返回 document_id");
-    return this.getDocument(documentId);
+  }
+
+  async getTask(id: string): Promise<Task> {
+    return this.request<Task>(`/tasks/${id}`);
   }
 
   async exportDocument(
@@ -353,6 +386,8 @@ class PcApiClient {
         text,
         width: asset.width ?? null,
         height: asset.height ?? null,
+        taskId: completedTask.id,
+        generatedAt: completedTask.updated_at ?? null,
       };
     throw new Error(
       `图片识别任务已完成，但服务器返回了空文本。（task: ${completedTask.id}, result: ${JSON.stringify(completedTask.result ?? {})}）`,
@@ -408,10 +443,19 @@ class PcApiClient {
     });
     lines.push(`同步手稿 Block：revision ${savedManuscript.revision}`);
 
-    const document = await this.convertManuscript(
+    const convertTask = await this.convertManuscript(
       savedManuscript.id,
       "PC API Smoke Document",
+      false,
     );
+    const completedConvertTask = await this.waitForTask(
+      convertTask,
+      "手稿转文档任务超时未完成",
+    );
+    const documentId = completedConvertTask.result?.document_id;
+    if (typeof documentId !== "string")
+      throw new Error("转换任务未返回 document_id");
+    const document = await this.getDocument(documentId);
     lines.push(`手稿转文档：${document.id}`);
 
     const savedDocument = await this.saveDocument({
@@ -489,7 +533,7 @@ class PcApiClient {
       if (current.status === "cancelled")
         throw new Error(`任务已取消（task: ${current.id}）`);
       await sleep(2000);
-      current = await this.request<Task>(`/tasks/${current.id}`);
+      current = await this.getTask(current.id);
     }
     throw new Error(
       `${timeoutMessage}（task: ${current.id}, status: ${current.status}）`,
@@ -705,6 +749,14 @@ function toRemoteManuscriptBlock(
         ),
         width: nullableNumber(block.props.width),
         height: nullableNumber(block.props.height),
+        recognition_task_id:
+          typeof block.props.recognition_task_id === "string"
+            ? block.props.recognition_task_id
+            : null,
+        recognition_generated_at:
+          typeof block.props.recognition_generated_at === "string"
+            ? block.props.recognition_generated_at
+            : null,
       },
     };
   return {

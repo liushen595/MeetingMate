@@ -121,9 +121,11 @@ export interface ManuscriptImageBlock extends BaseBlock {
   type: "image";
   props: {
     asset_id: string;
-    caption: string;
-    width: number;
-    height: number;
+    caption: string | null;
+    width: number | null;
+    height: number | null;
+    recognition_task_id: string | null;
+    recognition_generated_at: string | null;
   };
 }
 
@@ -276,6 +278,18 @@ export type TaskStage =
   | "completed";
 export type ConvertMode = "meeting_minutes" | "todo_list" | "article_draft";
 
+export interface ConvertWarning {
+  block_id: string;
+  code:
+    | "audio_transcript_missing"
+    | "audio_optimization_failed"
+    | "image_caption_failed"
+    | "handwriting_empty"
+    | "handwriting_render_failed"
+    | "handwriting_recognition_failed";
+  message: string;
+}
+
 export interface Task {
   id: string;
   type: TaskType;
@@ -291,6 +305,7 @@ export interface Task {
     format?: "pdf" | "docx";
     message_id?: string;
     text?: string;
+    warnings?: ConvertWarning[];
   };
   error: null | { code: string; message: string; retryable: boolean };
   retry_count: number;
