@@ -8,7 +8,7 @@ import {
 } from "react";
 import { Layer, Line, Rect, Stage } from "react-konva";
 import type { KonvaEventObject } from "konva/lib/Node";
-import { pcApi, type AudioTranscription, type ImageRecognitionResult } from "../lib/api";
+import { pcApi, type AudioTranscription, type ConvertWarning, type ImageRecognitionResult } from "../lib/api";
 import { useWorkspaceStore } from "../stores/workspaceStore";
 import type { ManuscriptBlock } from "../types/block";
 import type { Manuscript } from "../types/manuscript";
@@ -93,6 +93,7 @@ export function ManuscriptPanel(): React.JSX.Element {
     removeManuscript,
     selectedManuscriptId,
     selectManuscript,
+    setConversionNotice,
     updateManuscript,
   } = useWorkspaceStore();
   const manuscript = manuscripts.find(
@@ -123,6 +124,8 @@ export function ManuscriptPanel(): React.JSX.Element {
   const [recognizingImageAssetIds, setRecognizingImageAssetIds] = useState<string[]>([]);
   const [localImageUrls, setLocalImageUrls] = useState<Record<string, string>>({});
   const [convertDialog, setConvertDialog] = useState<{ title: string; optimizeAudio: boolean } | null>(null);
+  const [isConverting, setIsConverting] = useState(false);
+  const [convertWarnings, setConvertWarnings] = useState<ConvertWarning[]>([]);
   const [renameDialog, setRenameDialog] = useState<RenameDialogState | null>(
     null,
   );
@@ -248,33 +251,42 @@ export function ManuscriptPanel(): React.JSX.Element {
     removeManuscript(manuscript.id);
   };
 
-  async function persistBlocksNow(): Promise<Manuscript> {
-    if (!manuscript) throw new Error("请先选择手稿");
-    if (autoSaveTimerRef.current) window.clearTimeout(autoSaveTimerRef.current);
-    const serialized = JSON.stringify(blocks);
-    if (serialized === lastSavedBlocksRef.current) return manuscript;
-    setSaveStatus("保存中");
-    const savedManuscript = await pcApi.saveManuscript({ ...manuscript, blocks });
-    lastSavedBlocksRef.current = JSON.stringify(savedManuscript.blocks);
-    setBlocks(savedManuscript.blocks);
-    updateManuscript(savedManuscript);
-    setSaveStatus("已保存");
-    return savedManuscript;
-  }
-
-  const openConvertDialog = (): void => {
-    if (!manuscript) return;
-    const title = convertDialog?.title.trim() || `${manuscript.title} 文档`;
-    if (!title) return;
-    const document = await pcApi.convertManuscript(
-      manuscript.id,
-      title,
-      convertDialog?.optimizeAudio ?? false,
-    );
-    if (document) {
-      addDocument(document);
-      openDocumentEditor(document.id);
-      setConvertDialog(null);
+  const convertToDocument = async (): Promise<void> => {
+    if (!manuscript || isConverting) return;
+    try {
+      setIsConverting(true);
+      setConvertWarnings([]);
+      const title = convertDialog?.title.trim() || `${manuscript.title} 文档`;
+      if (!title) return;
+      const hasHandwriting = blocks.some((block) => block.type === "handwriting");
+      setSaveStatus(hasHandwriting ? "同步手写内容，准备识别转换" : "同步手稿，准备转换");
+      const savedManuscript = await pcApi.saveManuscript({ ...manuscript, blocks });
+      lastSavedBlocksRef.current = JSON.stringify(savedManuscript.blocks);
+      setBlocks(savedManuscript.blocks);
+      updateManuscript(savedManuscript);
+      setSaveStatus(hasHandwriting ? "转换中，后端正在识别手写内容" : "转换中");
+      const result = await pcApi.convertManuscript(
+        savedManuscript.id,
+        title,
+        convertDialog?.optimizeAudio ?? false,
+        (progress) => {
+          const count = progress.total && progress.current !== undefined ? ` ${progress.current}/${progress.total}` : "";
+          setSaveStatus(progress.message ? `${progress.message}${count}` : `转换中${count}`);
+        },
+      );
+      if (result.document) {
+        setConvertWarnings(result.warnings);
+        addDocument(result.document);
+        setConversionNotice(result.warnings.length ? { documentId: result.document.id, warnings: result.warnings } : null);
+        openDocumentEditor(result.document.id);
+        setConvertDialog(null);
+        setSaveStatus(result.warnings.length ? "转换完成，部分手写内容已降级" : "已保存");
+      }
+    } catch (error) {
+      setSaveStatus("转换失败");
+      window.alert(error instanceof Error ? error.message : "转文档失败，请稍后重试");
+    } finally {
+      setIsConverting(false);
     }
   };
 
@@ -654,11 +666,11 @@ export function ManuscriptPanel(): React.JSX.Element {
           </div>
           <button
             className="rounded-xl bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50"
-            disabled={!manuscript}
+            disabled={!manuscript || isConverting}
             onClick={() => manuscript && setConvertDialog({ title: `${manuscript.title} 文档`, optimizeAudio: false })}
             type="button"
           >
-            {isConvertTaskRunning(convertTask) ? "转换中" : "转文档"}
+            {isConverting ? "转换中" : "转文档"}
           </button>
         </header>
 
@@ -857,6 +869,17 @@ export function ManuscriptPanel(): React.JSX.Element {
           </button>
         </div>
 
+        {convertWarnings.length ? (
+          <div className="mx-auto mt-4 max-w-4xl rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+            <div className="font-medium">转换完成，但部分内容已降级处理</div>
+            <ul className="mt-2 space-y-1">
+              {convertWarnings.map((warning) => (
+                <li key={`${warning.block_id}-${warning.code}`}>{warning.message || warning.code}</li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
+
         {menu && (
           <div
             className="fixed z-50 w-44 overflow-hidden rounded-xl border border-slate-200 bg-white py-1 text-sm shadow-xl"
@@ -1005,9 +1028,14 @@ export function ManuscriptPanel(): React.JSX.Element {
               <input checked={convertDialog.optimizeAudio} onChange={(event) => setConvertDialog({ ...convertDialog, optimizeAudio: event.target.checked })} type="checkbox" />
               启用录音内容优化
             </label>
+            {blocks.some((block) => block.type === "handwriting") ? (
+              <p className="mt-3 rounded-xl bg-blue-50 px-3 py-2 text-xs leading-5 text-blue-700">
+                转换前会先同步最新手写笔迹，后端将在转换任务中识别手写内容。
+              </p>
+            ) : null}
             <div className="mt-5 flex justify-end gap-2">
-              <button className="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 hover:bg-slate-50" onClick={() => setConvertDialog(null)} type="button">取消</button>
-              <button className="rounded-lg bg-blue-600 px-3 py-2 text-sm font-medium text-white hover:bg-blue-700" onClick={convertToDocument} type="button">开始转换</button>
+              <button className="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 hover:bg-slate-50 disabled:opacity-50" disabled={isConverting} onClick={() => setConvertDialog(null)} type="button">取消</button>
+              <button className="rounded-lg bg-blue-600 px-3 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50" disabled={isConverting} onClick={convertToDocument} type="button">{isConverting ? "转换中" : "开始转换"}</button>
             </div>
           </div>
         </div>

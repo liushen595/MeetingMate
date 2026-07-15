@@ -13,6 +13,7 @@ type WorkspaceState = {
   aiOutput: string;
   isHydrated: boolean;
   saveStatus: "idle" | "saving" | "saved" | "error";
+  conversionNotice: { documentId: string; warnings: Array<{ block_id: string; code: string; message: string }> } | null;
   setActiveSection: (section: ActiveSection) => void;
   hydrateWorkspace: (data: { documents: Document[]; manuscripts: Manuscript[] }) => void;
   addDocument: (document: Document) => void;
@@ -23,6 +24,7 @@ type WorkspaceState = {
   removeManuscript: (id: string) => void;
   closeSelectedManuscript: () => void;
   setSaveStatus: (status: WorkspaceState["saveStatus"]) => void;
+  setConversionNotice: (notice: WorkspaceState["conversionNotice"]) => void;
   selectDocument: (id: string) => void;
   selectManuscript: (id: string) => void;
   openDocumentEditor: (id: string) => void;
@@ -45,6 +47,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set) => ({
   aiOutput: "选择一个 AI 动作后，这里会显示模拟输出。",
   isHydrated: false,
   saveStatus: "idle",
+  conversionNotice: null,
   setActiveSection: (section) => set({ activeSection: section }),
   hydrateWorkspace: (data) =>
     set({
@@ -93,6 +96,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set) => ({
     }),
   closeSelectedManuscript: () => set({ selectedManuscriptId: "" }),
   setSaveStatus: (status) => set({ saveStatus: status }),
+  setConversionNotice: (notice) => set({ conversionNotice: notice }),
   selectDocument: (id) => set({ selectedDocumentId: id }),
   selectManuscript: (id) => set({ selectedManuscriptId: id }),
   openDocumentEditor: (id) => set({ selectedDocumentId: id, activeSection: "documentEditor" }),

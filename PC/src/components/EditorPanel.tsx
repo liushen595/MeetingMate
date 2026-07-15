@@ -12,6 +12,7 @@ type SlateText = {
 type SlateBlock = {
   type: "heading" | "paragraph" | "list" | "quote" | "action" | "image";
   props?: Record<string, unknown>;
+  sourceRefs?: unknown[];
   children: SlateText[];
 };
 
@@ -30,6 +31,9 @@ export function EditorPanel(): React.JSX.Element {
   );
   const updateDocument = useWorkspaceStore((state) => state.updateDocument);
   const setSaveStatus = useWorkspaceStore((state) => state.setSaveStatus);
+  const conversionNotice = useWorkspaceStore((state) => state.conversionNotice);
+  const setConversionNotice = useWorkspaceStore((state) => state.setConversionNotice);
+  const activeConversionNotice = conversionNotice?.documentId === document?.id ? conversionNotice : null;
   const [editorValue, setEditorValue] = useState<Descendant[]>(() => blocksToSlateValue(document?.blocks ?? []));
   const [editorDocumentId, setEditorDocumentId] = useState(document?.id ?? "");
   const [editorRevision, setEditorRevision] = useState(0);
@@ -94,6 +98,21 @@ export function EditorPanel(): React.JSX.Element {
           </div>
           <span className="rounded-full bg-slate-100 px-3 py-1 text-xs text-slate-500">{document.status}</span>
         </div>
+        {activeConversionNotice ? (
+          <div className="mb-6 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <div className="font-medium">部分手写内容已降级处理</div>
+                <ul className="mt-2 space-y-1">
+                  {activeConversionNotice.warnings.map((warning) => (
+                    <li key={`${warning.block_id}-${warning.code}`}>{warning.message || warning.code}</li>
+                  ))}
+                </ul>
+              </div>
+              <button className="rounded-lg px-2 py-1 text-xs text-amber-800 hover:bg-amber-100" onClick={() => setConversionNotice(null)} type="button">关闭</button>
+            </div>
+          </div>
+        ) : null}
         <Slate
           key={`${document.id}-${editorRevision}`}
           editor={editor}
@@ -211,14 +230,16 @@ function blocksToSlateValue(blocks: DocumentBlock[]): Descendant[] {
   return blocks.map((block) => {
     if (block.type === "list") {
       return {
-        type: "list",
-        children: [{ text: [block.content, ...(block.items ?? []).map((item) => `- ${item}`)].join("\n") }]
+      type: "list",
+      sourceRefs: block.sourceRefs,
+      children: [{ text: [block.content, ...(block.items ?? []).map((item) => `- ${item}`)].join("\n") }]
       };
     }
 
     return {
       type: block.type,
       props: block.props,
+      sourceRefs: block.sourceRefs,
       children: [{ text: block.content }]
     };
   });
@@ -237,7 +258,8 @@ function slateValueToBlocks(value: Descendant[]): DocumentBlock[] {
         id: `slate-${index}`,
         type: "list",
         content: lines.find((line) => !line.startsWith("- ")) ?? "列表",
-        items
+        items,
+        sourceRefs: element.sourceRefs,
       };
     }
 
@@ -246,14 +268,16 @@ function slateValueToBlocks(value: Descendant[]): DocumentBlock[] {
         id: `slate-${index}`,
         type: "image",
         content,
-        props: { ...element.props, caption: content }
+        props: { ...element.props, caption: content },
+        sourceRefs: element.sourceRefs,
       };
     }
 
     return {
       id: `slate-${index}`,
       type: element.type,
-      content
+      content,
+      sourceRefs: element.sourceRefs,
     };
   });
 }

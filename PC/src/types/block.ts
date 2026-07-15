@@ -23,4 +23,5 @@ export type DocumentBlock = {
   content: string;
   items?: string[];
   props?: Record<string, unknown>;
+  sourceRefs?: unknown[];
 };
