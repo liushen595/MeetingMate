@@ -71,8 +71,9 @@ export function createDocumentImageBlock(authorId: string, assetId: string, widt
   return { id: makeId("doc_block"), type: "image", ...base(authorId), props: { asset_id: assetId, caption, width, height }, source_refs: [] };
 }
 
-export function upsertOperation<TBlock extends ManuscriptBlock | DocumentBlock>(block: TBlock, afterBlockId: string | null = null): SyncOperation<TBlock> {
-  const apiBlock = block.type === "handwriting" ? ({ ...block, props: { ...block.props, strokes: normalizeStrokesForApi(block.props.strokes) } } as TBlock) : block;
+export function upsertOperation<TBlock extends ManuscriptBlock | DocumentBlock>(block: TBlock, authorId: string, afterBlockId: string | null = null): SyncOperation<TBlock> {
+  const normalizedBlock = { ...block, author_id: authorId, client_id: getClientId(), platform: getPlatform() as Platform } as TBlock;
+  const apiBlock = normalizedBlock.type === "handwriting" ? ({ ...normalizedBlock, props: { ...normalizedBlock.props, strokes: normalizeStrokesForApi(normalizedBlock.props.strokes) } } as TBlock) : normalizedBlock;
   return {
     op_id: makeId("op"),
     type: "upsert_block",

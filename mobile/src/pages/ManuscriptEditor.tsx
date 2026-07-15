@@ -13,6 +13,7 @@ import {
   upsertOperation,
 } from "../lib/blocks";
 import { captureImageFromCamera, formatDuration, readImageFile } from "../lib/media";
+import { readAsrSse } from "../lib/sse";
 import type { ConvertMode, Manuscript, ManuscriptBlock, ManuscriptHandwritingBlock, Stroke, StrokeTool, SyncOperation, Task } from "../types/api";
 import { AssetImage } from "../components/AssetImage";
 import { AudioAsset } from "../components/AudioAsset";
@@ -49,6 +50,7 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
   const [syncState, setSyncState] = useState("未同步");
   const [recording, setRecording] = useState<{ recorder: MediaRecorder; startedAt: number; afterBlockId: string | null } | null>(null);
   const [pendingAudios, setPendingAudios] = useState<PendingAudio[]>([]);
+  const [localAudioUrls, setLocalAudioUrls] = useState<Record<string, string>>({});
   const [task, setTask] = useState<Task | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [blockHeights, setBlockHeights] = useState<Record<string, number>>({});
@@ -62,24 +64,22 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
   const visibleBlocks = useMemo(() => blocks.filter((block) => !block.deleted), [blocks]);
 
   useEffect(() => {
-    let active = true;
     setError(null);
-    api
-      .getManuscript(id)
-      .then((data) => {
-        if (!active) return;
-        setManuscript(data);
-        setRevision(data.revision);
-        setBlocks(data.blocks.filter((block) => !block.deleted));
-      })
+    reloadManuscript()
+      .then(() => undefined)
       .catch((err) => setError(err instanceof Error ? err.message : "手稿加载失败"));
-    return () => {
-      active = false;
-    };
   }, [id]);
+
+  async function reloadManuscript() {
+    const data = await api.getManuscript(id);
+    setManuscript(data);
+    setRevision(data.revision);
+    setBlocks(data.blocks.filter((block) => !block.deleted));
+  }
 
   useEffect(() => {
     if (!task || task.status === "succeeded" || task.status === "failed" || task.status === "cancelled") return;
+    if (task.type === "asr_audio") return;
     const timer = window.setInterval(async () => {
       const next = await api.getTask(task.id);
       setTask(next);
@@ -146,7 +146,7 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
       const exists = current.some((item) => item.id === block.id);
       return exists ? replaceBlock(current, block) : insertAfter(current, block, afterBlockId);
     });
-    queueOperation(upsertOperation(block, afterBlockId));
+    queueOperation(upsertOperation(block, userId, afterBlockId));
   }
 
   function insertBlockRespectingSelection(block: ManuscriptBlock, afterBlockId: string | null) {
@@ -158,9 +158,9 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
 
     setBlockHeights((current) => ({ ...current, [split.continuation.id]: Math.max(120, estimateStrokeHeight(split.continuation.props.strokes)) }));
     setBlocks((current) => insertAfter(insertAfter(replaceBlock(current, split.updatedSource), block, split.source.id), split.continuation, block.id));
-    queueOperation(upsertOperation(split.updatedSource));
-    queueOperation(upsertOperation(block, split.source.id));
-    queueOperation(upsertOperation(split.continuation, block.id));
+    queueOperation(upsertOperation(split.updatedSource, userId));
+    queueOperation(upsertOperation(block, userId, split.source.id));
+    queueOperation(upsertOperation(split.continuation, userId, block.id));
     setSelected(null);
   }
 
@@ -220,18 +220,59 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
       const asset = await api.uploadAsset(blob, { kind: "audio", filename: `recording-${Date.now()}.webm`, contentType: blob.type || "audio/webm", durationMs });
       const block = createAudioBlock(userId, asset.id, durationMs);
       setPendingAudios((current) => {
-        const target = current.find((item) => item.id === pendingId);
-        if (target) URL.revokeObjectURL(target.objectUrl);
         return current.filter((item) => item.id !== pendingId);
       });
+      setLocalAudioUrls((current) => ({ ...current, [asset.id]: objectUrl }));
       insertBlockRespectingSelection(block, afterBlockId);
-      const asrTask = await api.asrAudio(asset.id);
-      setTask(asrTask);
+      await flushOps();
+      await startAsrStream(asset.id);
     } catch (err) {
       const message = err instanceof Error ? err.message : "录音上传失败";
       setPendingAudios((current) => current.map((item) => (item.id === pendingId ? { ...item, status: "failed", error: message } : item)));
       setError(message);
     }
+  }
+
+  async function startAsrStream(assetId: string) {
+    setSyncState("ASR 转写中");
+    const response = await api.streamAsrAudio(assetId);
+    await readAsrSse(response, {
+      onTask: (nextTask) => setTask(nextTask),
+      onDelta: (payload) => {
+        setBlocks((current) =>
+          current.map((item) =>
+            item.type === "audio" && item.props.asset_id === assetId
+              ? { ...item, props: { ...item.props, transcript: payload.transcript } }
+              : item,
+          ),
+        );
+      },
+      onDone: async (nextTask) => {
+        setTask(nextTask);
+        setSyncState("ASR 已完成，正在同步手稿");
+        await reloadManuscript();
+        const result = nextTask.result;
+        if (result?.asset_id === assetId && typeof result.transcript === "string") {
+          setBlocks((current) =>
+            current.map((item) =>
+              item.type === "audio" && item.props.asset_id === assetId
+                ? {
+                    ...item,
+                    props: {
+                      ...item.props,
+                      transcript: result.transcript ?? "",
+                      speaker_segments: result.speaker_segments ?? [],
+                      asr_task_id: nextTask.id,
+                      asr_generated_at: nextTask.updated_at,
+                    },
+                  }
+                : item,
+            ),
+          );
+        }
+        setSyncState("已保存");
+      },
+    });
   }
 
   async function chooseImage(afterBlockId: string | null = null) {
@@ -304,8 +345,8 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
     if (!split) return;
     setBlockHeights((current) => ({ ...current, [split.continuation.id]: Math.max(120, estimateStrokeHeight(split.continuation.props.strokes)) }));
     setBlocks((current) => insertAfter(replaceBlock(current, split.updatedSource), split.continuation, split.source.id));
-    queueOperation(upsertOperation(split.updatedSource));
-    queueOperation(upsertOperation(split.continuation, split.source.id));
+    queueOperation(upsertOperation(split.updatedSource, userId));
+    queueOperation(upsertOperation(split.continuation, userId, split.source.id));
     setSelected(null);
     setMenu(null);
   }
@@ -361,7 +402,7 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
               {block.type === "text" && <textarea onChange={(event) => handleTextInput(block, event.target.value)} placeholder="输入文字" value={block.props.content} />}
               {block.type === "audio" && (
                 <div className="audio-block">
-                  <AudioAsset assetId={block.props.asset_id} />
+                  <AudioAsset assetId={block.props.asset_id} fallbackSrc={localAudioUrls[block.props.asset_id]} />
                   <div>
                     <span>{formatDuration(block.props.duration_ms)}</span>
                     <p>{block.props.transcript || "录音已保存，ASR 完成后会写回转写文本。"}</p>

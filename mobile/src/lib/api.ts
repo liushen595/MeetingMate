@@ -136,6 +136,14 @@ export class ApiClient {
     });
   }
 
+  streamAsrAudio(assetId: string) {
+    return this.request<Response>("/tasks/asr-audio/stream", {
+      method: "POST",
+      idempotent: true,
+      body: JSON.stringify({ asset_id: assetId, language: "zh-CN", enable_diarization: true, client_id: this.clientId }),
+    }, true);
+  }
+
   getTask(id: string) {
     return this.request<Task>(`/tasks/${id}`);
   }

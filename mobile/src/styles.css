@@ -839,6 +839,19 @@ select {
   width: 100%;
 }
 
+.audio-player-stack {
+  display: grid;
+  gap: 4px;
+}
+
+.audio-player-stack audio {
+  width: 100%;
+}
+
+.audio-player-stack small {
+  color: #8a7558;
+}
+
 .pending-audio audio {
   width: 100%;
 }
