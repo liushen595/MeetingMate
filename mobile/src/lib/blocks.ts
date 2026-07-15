@@ -71,7 +71,7 @@ export function createDocumentImageBlock(authorId: string, assetId: string, widt
   return { id: makeId("doc_block"), type: "image", ...base(authorId), props: { asset_id: assetId, caption, width, height }, source_refs: [] };
 }
 
-export function upsertOperation<TBlock extends ManuscriptBlock | DocumentBlock>(block: TBlock, authorId: string, afterBlockId: string | null = null): SyncOperation<TBlock> {
+export function upsertOperation<TBlock extends ManuscriptBlock | DocumentBlock>(block: TBlock, authorId: string, afterBlockId: string | null = null, beforeBlockId: string | null = null): SyncOperation<TBlock> {
   const normalizedBlock = { ...block, author_id: authorId, client_id: getClientId(), platform: getPlatform() as Platform } as TBlock;
   const apiBlock = normalizedBlock.type === "handwriting" ? ({ ...normalizedBlock, props: { ...normalizedBlock.props, strokes: normalizeStrokesForApi(normalizedBlock.props.strokes) } } as TBlock) : normalizedBlock;
   return {
@@ -79,8 +79,20 @@ export function upsertOperation<TBlock extends ManuscriptBlock | DocumentBlock>(
     type: "upsert_block",
     block: apiBlock,
     block_id: null,
-    before_block_id: null,
+    before_block_id: beforeBlockId,
     after_block_id: afterBlockId,
+    created_at: nowIso(),
+  };
+}
+
+export function deleteOperation<TBlock>(blockId: string): SyncOperation<TBlock> {
+  return {
+    op_id: makeId("op"),
+    type: "delete_block",
+    block: null,
+    block_id: blockId,
+    before_block_id: null,
+    after_block_id: null,
     created_at: nowIso(),
   };
 }

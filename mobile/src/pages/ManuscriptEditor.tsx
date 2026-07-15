@@ -3,6 +3,7 @@ import { Haptics, ImpactStyle } from "@capacitor/haptics";
 import { api } from "../lib/api";
 import {
   createAudioBlock,
+  deleteOperation,
   createHandwritingBlock,
   createImageBlock,
   createTextBlock,
@@ -142,11 +143,65 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
   }
 
   function applyBlock(block: ManuscriptBlock, afterBlockId: string | null = null) {
+    const exists = blocks.some((item) => item.id === block.id);
+    const position = exists ? blockPosition(block.id) : { afterBlockId, beforeBlockId: null };
     setBlocks((current) => {
-      const exists = current.some((item) => item.id === block.id);
       return exists ? replaceBlock(current, block) : insertAfter(current, block, afterBlockId);
     });
-    queueOperation(upsertOperation(block, userId, afterBlockId));
+    queueOperation(upsertOperation(block, userId, position.afterBlockId, position.beforeBlockId));
+  }
+
+  function blockPosition(blockId: string) {
+    const index = blocks.findIndex((block) => block.id === blockId);
+    return {
+      afterBlockId: index > 0 ? blocks[index - 1]?.id ?? null : null,
+      beforeBlockId: index === 0 ? blocks[index + 1]?.id ?? null : null,
+    };
+  }
+
+  function queueDeleteBlock(blockId: string) {
+    queueOperation(deleteOperation<ManuscriptBlock>(blockId));
+  }
+
+  function deleteManuscriptBlock(blockId: string) {
+    if (!userId) return;
+    const index = visibleBlocks.findIndex((block) => block.id === blockId);
+    if (index === -1) return;
+    const previous = visibleBlocks[index - 1];
+    const next = visibleBlocks[index + 1];
+
+    if (previous?.type === "handwriting" && next?.type === "handwriting") {
+      const previousHeight = blockHeights[previous.id] ?? estimateStrokeHeight(previous.props.strokes);
+      const nextHeight = blockHeights[next.id] ?? estimateStrokeHeight(next.props.strokes);
+      const mergedStrokes = appendStrokesAtOffset(previous.props.strokes, next.props.strokes, previousHeight);
+      const mergedBlock = touchBlock({ ...previous, props: { ...previous.props, strokes: mergedStrokes } });
+      const position = blockPosition(previous.id);
+      const mergedHeight = Math.max(previousHeight + nextHeight, estimateStrokeHeight(mergedStrokes));
+
+      setBlocks((current) => current.filter((block) => block.id !== blockId && block.id !== next.id).map((block) => (block.id === previous.id ? mergedBlock : block)));
+      setBlockHeights((current) => {
+        const heights = { ...current, [previous.id]: mergedHeight };
+        delete heights[blockId];
+        delete heights[next.id];
+        return heights;
+      });
+      queueOperation(upsertOperation(mergedBlock, userId, position.afterBlockId, position.beforeBlockId));
+      queueDeleteBlock(blockId);
+      queueDeleteBlock(next.id);
+      setActiveBlockId(previous.id);
+    } else {
+      setBlocks((current) => current.filter((block) => block.id !== blockId));
+      setBlockHeights((current) => {
+        const heights = { ...current };
+        delete heights[blockId];
+        return heights;
+      });
+      queueDeleteBlock(blockId);
+      if (activeBlockId === blockId) setActiveBlockId(null);
+    }
+
+    if (selected?.blockId === blockId || selected?.blockId === next?.id) setSelected(null);
+    setMenu(null);
   }
 
   function insertBlockRespectingSelection(block: ManuscriptBlock, afterBlockId: string | null) {
@@ -156,9 +211,10 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
       return;
     }
 
+    const sourcePosition = blockPosition(split.updatedSource.id);
     setBlockHeights((current) => ({ ...current, [split.continuation.id]: Math.max(120, estimateStrokeHeight(split.continuation.props.strokes)) }));
     setBlocks((current) => insertAfter(insertAfter(replaceBlock(current, split.updatedSource), block, split.source.id), split.continuation, block.id));
-    queueOperation(upsertOperation(split.updatedSource, userId));
+    queueOperation(upsertOperation(split.updatedSource, userId, sourcePosition.afterBlockId, sourcePosition.beforeBlockId));
     queueOperation(upsertOperation(block, userId, split.source.id));
     queueOperation(upsertOperation(split.continuation, userId, block.id));
     setSelected(null);
@@ -306,6 +362,17 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
 
   function commitBlankHandwriting(strokes: Stroke[], height: number) {
     if (!userId) return;
+    const lastBlock = visibleBlocks.at(-1);
+    if (lastBlock?.type === "handwriting") {
+      const currentHeight = blockHeights[lastBlock.id] ?? estimateStrokeHeight(lastBlock.props.strokes);
+      const nextStrokes = appendStrokesAtOffset(lastBlock.props.strokes, strokes, currentHeight);
+      const block = touchBlock({ ...lastBlock, props: { ...lastBlock.props, strokes: nextStrokes } });
+      setBlockHeights((current) => ({ ...current, [block.id]: Math.max(currentHeight + height, estimateStrokeHeight(nextStrokes)) }));
+      applyBlock(block);
+      setActiveBlockId(block.id);
+      return;
+    }
+
     const block = createHandwritingBlock(userId, strokes);
     setBlockHeights((current) => ({ ...current, [block.id]: height }));
     applyBlock(block, visibleBlocks.at(-1)?.id ?? null);
@@ -321,6 +388,11 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
   }
 
   function handleTextInput(block: Extract<ManuscriptBlock, { type: "text" }>, content: string) {
+    if (content.length === 0) {
+      deleteManuscriptBlock(block.id);
+      return;
+    }
+
     applyBlock(touchBlock({ ...block, props: { content } }));
   }
 
@@ -343,9 +415,10 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
   function splitSelectedAsNextLine() {
     const split = buildSelectedContinuation(selected?.blockId ?? null);
     if (!split) return;
+    const sourcePosition = blockPosition(split.updatedSource.id);
     setBlockHeights((current) => ({ ...current, [split.continuation.id]: Math.max(120, estimateStrokeHeight(split.continuation.props.strokes)) }));
     setBlocks((current) => insertAfter(replaceBlock(current, split.updatedSource), split.continuation, split.source.id));
-    queueOperation(upsertOperation(split.updatedSource, userId));
+    queueOperation(upsertOperation(split.updatedSource, userId, sourcePosition.afterBlockId, sourcePosition.beforeBlockId));
     queueOperation(upsertOperation(split.continuation, userId, split.source.id));
     setSelected(null);
     setMenu(null);
@@ -446,6 +519,7 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
           <button onClick={() => chooseImage(menu.blockId)} type="button">插入图片</button>
           <button onClick={() => insertText(menu.blockId)} type="button">插入文字</button>
           {menu.selectedStrokeIds.length > 0 && <button onClick={splitSelectedAsNextLine} type="button">选区作为下一行</button>}
+          {menu.blockId && <button className="danger-menu-button" onClick={() => menu.blockId && deleteManuscriptBlock(menu.blockId)} type="button">删除该块</button>}
           <button onClick={() => setMenu(null)} type="button">关闭</button>
         </div>
       )}
@@ -500,4 +574,8 @@ function estimateStrokeHeight(strokes: Stroke[]) {
 function normalizeStrokesToTop(strokes: Stroke[]) {
   const minY = Math.min(...strokes.flatMap((stroke) => stroke.points.map((point) => point.y)));
   return strokes.map((stroke) => ({ ...stroke, points: stroke.points.map((point) => ({ ...point, y: Math.max(0, point.y - minY + 14) })) }));
+}
+
+function appendStrokesAtOffset(existing: Stroke[], incoming: Stroke[], offsetY: number) {
+  return [...existing, ...incoming.map((stroke) => ({ ...stroke, points: stroke.points.map((point) => ({ ...point, y: point.y + offsetY })) }))];
 }

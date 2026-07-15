@@ -920,6 +920,10 @@ select {
   text-align: left;
 }
 
+.context-menu .danger-menu-button {
+  color: #a73722;
+}
+
 .task-banner,
 .toast {
   width: min(100%, 820px);
