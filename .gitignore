@@ -142,6 +142,9 @@ vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
 
+# MeetingMate local desktop data
+PC/data/
+
 # Python
 __pycache__/
 *.py[cod]
