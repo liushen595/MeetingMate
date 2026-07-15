@@ -19,6 +19,14 @@ type DrawingState =
   | { mode: "erase" }
   | { mode: "lasso"; points: StrokePoint[] }
   | { mode: "drag"; pointer: StrokePoint; original: Stroke[] };
+type EyeDropperConstructor = new () => { open: () => Promise<{ sRGBHex?: string }> };
+
+const PEN_COLORS = ["#1f1b14", "#111827", "#2563eb", "#dc2626", "#16a34a", "#7c3aed"];
+const HIGHLIGHTER_COLORS = ["#fef08a", "#fde68a", "#bbf7d0", "#bfdbfe", "#fecdd3", "#ddd6fe"];
+const PEN_COLOR_KEY = "meetingmate.pen.color";
+const PEN_WIDTH_KEY = "meetingmate.pen.width";
+const HIGHLIGHTER_COLOR_KEY = "meetingmate.highlighter.color";
+const HIGHLIGHTER_WIDTH_KEY = "meetingmate.highlighter.width";
 
 export function ManuscriptPanel(): React.JSX.Element {
   const {
@@ -35,8 +43,10 @@ export function ManuscriptPanel(): React.JSX.Element {
   const manuscript = manuscripts.find((item) => item.id === selectedManuscriptId);
   const [blocks, setBlocks] = useState<ManuscriptBlock[]>([]);
   const [tool, setTool] = useState<StrokeTool>("pen");
-  const [color, setColor] = useState("#1f1b14");
-  const [brushWidth, setBrushWidth] = useState(3);
+  const [penColor, setPenColorState] = useState(() => localStorage.getItem(PEN_COLOR_KEY) ?? "#1f1b14");
+  const [penWidth, setPenWidthState] = useState(() => readStoredNumber(PEN_WIDTH_KEY, 3));
+  const [highlighterColor, setHighlighterColorState] = useState(() => localStorage.getItem(HIGHLIGHTER_COLOR_KEY) ?? "#fef08a");
+  const [highlighterWidth, setHighlighterWidthState] = useState(() => readStoredNumber(HIGHLIGHTER_WIDTH_KEY, 6));
   const [activeBlockId, setActiveBlockId] = useState<string | null>(null);
   const [selected, setSelected] = useState<{ blockId: string; strokeIds: string[] } | null>(null);
   const [menu, setMenu] = useState<MenuState>(null);
@@ -45,6 +55,10 @@ export function ManuscriptPanel(): React.JSX.Element {
   const [renameDialog, setRenameDialog] = useState<RenameDialogState | null>(null);
   const longPressTimerRef = useRef<number | null>(null);
   const lastSavedBlocksRef = useRef("");
+  const isColorTool = tool === "pen" || tool === "highlighter";
+  const color = tool === "highlighter" ? highlighterColor : penColor;
+  const brushWidth = tool === "highlighter" ? highlighterWidth : penWidth;
+  const palette = tool === "highlighter" ? HIGHLIGHTER_COLORS : PEN_COLORS;
 
   useEffect(() => {
     const nextBlocks = manuscript?.blocks ?? [];
@@ -218,6 +232,37 @@ export function ManuscriptPanel(): React.JSX.Element {
     setSaveStatus("等待自动保存");
   }
 
+  function setActiveColor(nextColor: string) {
+    if (tool === "highlighter") {
+      setHighlighterColorState(nextColor);
+      localStorage.setItem(HIGHLIGHTER_COLOR_KEY, nextColor);
+      return;
+    }
+    setPenColorState(nextColor);
+    localStorage.setItem(PEN_COLOR_KEY, nextColor);
+  }
+
+  function setActiveWidth(nextWidth: number) {
+    const normalizedWidth = Math.max(1, Math.min(18, Math.round(nextWidth)));
+    if (tool === "highlighter") {
+      setHighlighterWidthState(normalizedWidth);
+      localStorage.setItem(HIGHLIGHTER_WIDTH_KEY, String(normalizedWidth));
+      return;
+    }
+    setPenWidthState(normalizedWidth);
+    localStorage.setItem(PEN_WIDTH_KEY, String(normalizedWidth));
+  }
+
+  async function pickScreenColor() {
+    const eyeDropper = getEyeDropper();
+    if (!eyeDropper) {
+      window.alert("当前系统或浏览器内核不支持取色器。请使用调色盘选择颜色。");
+      return;
+    }
+    const result = await eyeDropper.open();
+    if (result.sRGBHex) setActiveColor(result.sRGBHex);
+  }
+
   return (
     <div className="grid min-h-0 flex-1 grid-cols-[280px_minmax(620px,1fr)_300px] gap-px bg-slate-200">
       <aside className="min-h-0 overflow-auto bg-white p-4">
@@ -254,8 +299,30 @@ export function ManuscriptPanel(): React.JSX.Element {
               {item === "pen" ? "笔" : item === "highlighter" ? "荧光" : item === "eraser" ? "橡皮" : "套索"}
             </button>
           ))}
-          <input aria-label="画笔颜色" onChange={(event) => setColor(event.target.value)} type="color" value={color} />
-          <input aria-label="画笔粗细" max="9" min="1" onChange={(event) => setBrushWidth(Number(event.target.value))} type="range" value={brushWidth} />
+          {isColorTool ? (
+            <div className="flex items-center gap-2 rounded-xl bg-white px-2 py-1 shadow-sm">
+              <span className="px-1 text-xs text-[#7c6a55]">{tool === "highlighter" ? "荧光笔" : "签字笔"}</span>
+              <div className="flex gap-1">
+                {palette.map((item) => (
+                  <button
+                    aria-label={`选择颜色 ${item}`}
+                    className={`h-6 w-6 rounded-full border ${color.toLowerCase() === item.toLowerCase() ? "border-[#2c2115] ring-2 ring-[#2c2115]/20" : "border-slate-200"}`}
+                    key={item}
+                    onClick={() => setActiveColor(item)}
+                    style={{ backgroundColor: item }}
+                    type="button"
+                  />
+                ))}
+              </div>
+              <label className="flex cursor-pointer items-center gap-1 rounded-lg border border-slate-200 px-2 py-1 text-xs text-[#2c2115] hover:bg-[#f8efe0]">
+                调色盘
+                <input aria-label="调色盘" className="h-0 w-0 opacity-0" onChange={(event) => setActiveColor(event.target.value)} type="color" value={color} />
+              </label>
+              <button className="rounded-lg border border-slate-200 px-2 py-1 text-xs text-[#2c2115] hover:bg-[#f8efe0]" onClick={() => void pickScreenColor()} type="button">取色器</button>
+              <span className="ml-1 text-xs text-[#7c6a55]">{brushWidth}px</span>
+              <input aria-label="画笔粗细" max={tool === "highlighter" ? "18" : "9"} min="1" onChange={(event) => setActiveWidth(Number(event.target.value))} type="range" value={brushWidth} />
+            </div>
+          ) : null}
         </div>
 
         <article className="mx-auto max-w-4xl rounded-[32px] border border-[#e4d7c4] bg-[#fffaf0] p-6 shadow-sm" onPointerCancel={cancelLongPress} onPointerLeave={cancelLongPress} onPointerUp={cancelLongPress}>
@@ -524,3 +591,5 @@ function distance(a: StrokePoint, b: StrokePoint) { return Math.hypot(a.x - b.x,
 function clamp(value: number, min: number, max: number) { return Math.min(max, Math.max(min, value)); }
 function makeId(prefix: string) { return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`; }
 function firstLine(value: string) { return value.split("\n")[0]?.slice(0, 32) ?? ""; }
+function readStoredNumber(key: string, fallback: number) { const value = Number(localStorage.getItem(key)); return Number.isFinite(value) && value > 0 ? value : fallback; }
+function getEyeDropper() { const candidate = (window as Window & { EyeDropper?: EyeDropperConstructor }).EyeDropper; return candidate ? new candidate() : null; }

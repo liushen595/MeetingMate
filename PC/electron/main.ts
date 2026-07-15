@@ -123,10 +123,12 @@ app.whenReady().then(() => {
       if (!response.ok) {
         throw new Error(`Upload part ${part.partNumber} failed: ${response.status} ${response.statusText}`);
       }
+      const responseText = await response.text();
+      const responseJson = responseText ? safeJsonParse(responseText) : null;
       uploadedParts.push({
         part_number: part.partNumber,
-        etag: response.headers.get("etag") ?? `part-${part.partNumber}`,
-        size_bytes: content.byteLength
+        etag: String(getResponseValue(responseJson, "etag") ?? response.headers.get("etag") ?? `part-${part.partNumber}`),
+        size_bytes: Number(getResponseValue(responseJson, "size_bytes") ?? content.byteLength)
       });
     }
     return { ok: true, parts: uploadedParts };
@@ -174,4 +176,18 @@ function getContentType(extension: string, kind: "audio" | "image"): string {
   if (extension === ".png") return "image/png";
   if (extension === ".bmp") return "image/bmp";
   return kind === "audio" ? "application/octet-stream" : "image/webp";
+}
+
+function safeJsonParse(value: string): unknown {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
+function getResponseValue(value: unknown, key: "etag" | "size_bytes"): string | number | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const next = (value as Record<string, unknown>)[key];
+  return typeof next === "string" || typeof next === "number" ? next : null;
 }
