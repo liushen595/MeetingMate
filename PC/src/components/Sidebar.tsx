@@ -1,11 +1,9 @@
 import { ActiveSection, useWorkspaceStore } from "../stores/workspaceStore";
 
 const navItems: Array<{ label: string; section: ActiveSection }> = [
-  { label: "文档库", section: "library" },
-  { label: "手稿", section: "manuscripts" },
-  { label: "AI 工作台", section: "ai" },
-  { label: "导出", section: "exports" },
-  { label: "设置", section: "settings" }
+  { label: "首页", section: "home" },
+  { label: "库", section: "library" },
+  { label: "账户", section: "account" }
 ];
 
 export function Sidebar(): React.JSX.Element {

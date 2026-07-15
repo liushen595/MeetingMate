@@ -3,6 +3,7 @@ import type { DocumentBlock } from "./block";
 export type Document = {
   id: string;
   manuscriptId?: string;
+  revision?: number;
   title: string;
   status: "draft" | "reviewing" | "synced";
   updatedAt: string;
