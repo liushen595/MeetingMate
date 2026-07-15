@@ -29,6 +29,7 @@ DASHSCOPE_API_URL="https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api/v1"
 DASHSCOPE_API_KEY=""
 DASHSCOPE_ASR_MODEL="qwen3-asr-flash"
 DASHSCOPE_IMAGE_MODEL="qwen-vl-plus"
+DASHSCOPE_TEXT_MODEL="qwen-plus"
 
 # Optional fallback provider kept for future use.
 AZURE_SPEECH_ENDPOINT=""
@@ -54,6 +55,8 @@ DATABASE_COMMAND_TIMEOUT_SECONDS=30
 `ASR_PROVIDER="dashscope"` uses Alibaba Cloud Model Studio DashScope ASR. The backend sends uploaded audio as a Base64 data URI and rejects input whose Base64 payload exceeds 10MB. `AZURE_SPEECH_*` is retained as a fallback provider configuration for future Azure Speech support.
 
 `VISION_PROVIDER="dashscope"` uses DashScope multimodal image recognition. The image model is read from `DASHSCOPE_IMAGE_MODEL` and defaults to `qwen-vl-plus` when unset.
+
+`DASHSCOPE_TEXT_MODEL` is used for text-generation tasks such as cleaning ASR filler words during manuscript conversion. It defaults to `qwen-plus` when unset.
 
 ```bash
 uvicorn app.main:app --reload

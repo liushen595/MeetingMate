@@ -7209,6 +7209,10 @@
           "client_id": {
             "type": "string",
             "title": "Client Id"
+          },
+          "optimize_audio": {
+            "type": "boolean",
+            "title": "Optimize Audio"
           }
         },
         "additionalProperties": false,
@@ -7217,7 +7221,8 @@
           "manuscript_id",
           "mode",
           "title",
-          "client_id"
+          "client_id",
+          "optimize_audio"
         ],
         "title": "ConvertManuscriptRequest"
       },
