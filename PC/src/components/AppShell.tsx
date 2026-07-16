@@ -45,7 +45,7 @@ export function AppShell(): React.JSX.Element {
   }
 
   return (
-    <div className="flex h-full min-h-0 bg-slate-100 text-slate-950">
+    <div className="pc-warm-shell flex h-full min-h-0 text-slate-950">
       <Sidebar />
       <main className="flex min-w-0 flex-1 flex-col">
         <Toolbar />
@@ -56,8 +56,8 @@ export function AppShell(): React.JSX.Element {
         ) : null}
         {activeSection === "home" ? <HomePanel /> : null}
         {activeSection === "library" ? (
-          <section className="min-h-0 flex-1 overflow-auto bg-slate-50 p-8">
-            <div className="mx-auto max-w-5xl rounded-3xl border border-slate-200 bg-white shadow-sm">
+          <section className="pc-warm-gradient min-h-0 flex-1 overflow-auto p-8">
+            <div className="pc-warm-panel mx-auto max-w-5xl rounded-3xl border border-slate-200 shadow-sm">
               <LibraryPanel />
             </div>
           </section>

@@ -10,6 +10,7 @@ type SlateText = {
 };
 
 type SlateBlock = {
+  id?: string;
   type: "heading" | "paragraph" | "list" | "quote" | "action" | "image";
   props?: Record<string, unknown>;
   sourceRefs?: unknown[];
@@ -39,10 +40,12 @@ export function EditorPanel(): React.JSX.Element {
   const [editorRevision, setEditorRevision] = useState(0);
   const [exportStatus, setExportStatus] = useState<string | null>(null);
   const lastSavedValueRef = useRef(serializeValue(editorValue));
+  const lastSavedBlockIdsRef = useRef<string[]>(document?.blocks.map((block) => block.id) ?? []);
 
   useEffect(() => {
     const nextValue = blocksToSlateValue(document?.blocks ?? []);
     lastSavedValueRef.current = serializeValue(nextValue);
+    lastSavedBlockIdsRef.current = document?.blocks.map((block) => block.id) ?? [];
     setEditorDocumentId(document?.id ?? "");
     setEditorValue(nextValue);
     setEditorRevision((revision) => revision + 1);
@@ -57,15 +60,17 @@ export function EditorPanel(): React.JSX.Element {
 
     const timeoutId = window.setTimeout(() => {
       const nextBlocks = slateValueToBlocks(editorValue);
+      const deletedBlockIds = findDeletedBlockIds(lastSavedBlockIdsRef.current, nextBlocks);
       setSaveStatus("saving");
       pcApi.saveDocument({
           ...document,
           title: getTitleFromBlocks(nextBlocks, document.title),
           blocks: nextBlocks
-        })
+        }, { deletedBlockIds })
         .then((savedDocument) => {
           const savedValue = blocksToSlateValue(savedDocument.blocks);
           lastSavedValueRef.current = serializeValue(savedValue);
+          lastSavedBlockIdsRef.current = savedDocument.blocks.map((block) => block.id);
           updateDocument(savedDocument);
           setSaveStatus("saved");
         })
@@ -84,13 +89,15 @@ export function EditorPanel(): React.JSX.Element {
     try {
       setExportStatus("正在保存并导出 DOCX");
       const nextBlocks = slateValueToBlocks(editorValue);
+      const deletedBlockIds = findDeletedBlockIds(lastSavedBlockIdsRef.current, nextBlocks);
       const nextDocument = await pcApi.saveDocument({
         ...document,
         title: getTitleFromBlocks(nextBlocks, document.title),
         blocks: nextBlocks,
-      });
+      }, { deletedBlockIds });
       updateDocument(nextDocument);
       lastSavedValueRef.current = serializeValue(blocksToSlateValue(nextDocument.blocks));
+      lastSavedBlockIdsRef.current = nextDocument.blocks.map((block) => block.id);
       setSaveStatus("saved");
       const blob = await pcApi.exportDocumentBlob(nextDocument.id, "docx");
       const filename = `${safeFilename(nextDocument.title)}.docx`;
@@ -126,6 +133,12 @@ export function EditorPanel(): React.JSX.Element {
           <div className="flex shrink-0 items-center gap-2">
             <button className="rounded-xl bg-slate-950 px-4 py-2 text-sm font-medium text-white hover:bg-slate-800 disabled:opacity-50" disabled={exportStatus === "正在保存并导出 DOCX"} onClick={() => void exportDocx()} type="button">
               {exportStatus === "正在保存并导出 DOCX" ? "导出中" : "导出 DOCX"}
+            </button>
+            <button className="rounded-xl bg-slate-950 px-4 py-2 text-sm font-medium text-white hover:bg-slate-800 disabled:opacity-50" disabled={!pcApi.currentSession} onClick={async () => {
+              const url = await pcApi.exportDocument(document.id);
+              window.open(url, "_blank");
+            }} type="button">
+              导出 PDF
             </button>
             <span className="rounded-full bg-slate-100 px-3 py-1 text-xs text-slate-500">{document.status}</span>
           </div>
@@ -267,13 +280,15 @@ function blocksToSlateValue(blocks: DocumentBlock[]): Descendant[] {
   return blocks.map((block) => {
     if (block.type === "list") {
       return {
-      type: "list",
-      sourceRefs: block.sourceRefs,
-      children: [{ text: [block.content, ...(block.items ?? []).map((item) => `- ${item}`)].join("\n") }]
+        id: block.id,
+        type: "list",
+        sourceRefs: block.sourceRefs,
+        children: [{ text: [block.content, ...(block.items ?? []).map((item) => `- ${item}`)].join("\n") }]
       };
     }
 
     return {
+      id: block.id,
       type: block.type,
       props: block.props,
       sourceRefs: block.sourceRefs,
@@ -283,16 +298,19 @@ function blocksToSlateValue(blocks: DocumentBlock[]): Descendant[] {
 }
 
 function slateValueToBlocks(value: Descendant[]): DocumentBlock[] {
+  const usedBlockIds = new Set<string>();
+
   return value.map((node, index) => {
     const element = node as SlateBlock;
     const content = element.children.map((child) => child.text).join("");
+    const id = slateBlockId(element, usedBlockIds);
 
     if (element.type === "list") {
       const lines = content.split("\n").map((line) => line.trim()).filter(Boolean);
       const items = lines.filter((line) => line.startsWith("- ")).map((line) => line.replace(/^-\s+/, ""));
 
       return {
-        id: `slate-${index}`,
+        id,
         type: "list",
         content: lines.find((line) => !line.startsWith("- ")) ?? "列表",
         items,
@@ -302,7 +320,7 @@ function slateValueToBlocks(value: Descendant[]): DocumentBlock[] {
 
     if (element.type === "image") {
       return {
-        id: `slate-${index}`,
+        id,
         type: "image",
         content,
         props: { ...element.props, caption: content },
@@ -311,12 +329,27 @@ function slateValueToBlocks(value: Descendant[]): DocumentBlock[] {
     }
 
     return {
-      id: `slate-${index}`,
+      id,
       type: element.type,
       content,
       sourceRefs: element.sourceRefs,
     };
   });
+}
+
+function slateBlockId(element: SlateBlock, usedBlockIds: Set<string>): string {
+  if (element.id && !usedBlockIds.has(element.id)) {
+    usedBlockIds.add(element.id);
+    return element.id;
+  }
+  const id = `doc_block_${crypto.randomUUID()}`;
+  usedBlockIds.add(id);
+  return id;
+}
+
+function findDeletedBlockIds(previousBlockIds: string[], nextBlocks: DocumentBlock[]): string[] {
+  const nextBlockIds = new Set(nextBlocks.map((block) => block.id));
+  return previousBlockIds.filter((blockId) => !nextBlockIds.has(blockId));
 }
 
 function serializeValue(value: Descendant[]): string {

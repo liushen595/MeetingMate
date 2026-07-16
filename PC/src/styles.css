@@ -12,8 +12,10 @@ body,
 
 body {
   margin: 0;
-  color: #111827;
-  background: #f8fafc;
+  color: #241d15;
+  background:
+    radial-gradient(circle at top left, rgba(255, 255, 255, 0.85), transparent 30rem),
+    linear-gradient(145deg, #f4eadb 0%, #e7d4ba 56%, #d8c0a2 100%);
   font-family:
     Inter,
     ui-sans-serif,
@@ -28,4 +30,288 @@ button,
 input,
 textarea {
   font: inherit;
+}
+
+/* Warm paper theme aligned with the mobile app. These overrides only remap color utilities. */
+.bg-slate-50 {
+  background-color: #f4eadb;
+}
+
+.bg-slate-100 {
+  background-color: #efe2ce;
+}
+
+.bg-slate-200 {
+  background-color: #dec8aa;
+}
+
+.bg-slate-800,
+.hover\:bg-slate-800:hover {
+  background-color: #3d2c1d;
+}
+
+.bg-slate-950,
+.hover\:bg-slate-950:hover {
+  background-color: #201a14;
+}
+
+.bg-slate-950\/20 {
+  background-color: rgba(32, 26, 20, 0.28);
+}
+
+.bg-white,
+.hover\:bg-white:hover,
+.focus\:bg-white:focus {
+  background-color: #fff9ef;
+}
+
+.bg-blue-50,
+.hover\:bg-blue-50:hover {
+  background-color: #f2dfc2;
+}
+
+.bg-blue-100 {
+  background-color: #ead2ad;
+}
+
+.bg-blue-500 {
+  background-color: #9b6e34;
+}
+
+.bg-blue-600,
+.hover\:bg-blue-600:hover {
+  background-color: #8b5a2b;
+}
+
+.bg-blue-700,
+.hover\:bg-blue-700:hover {
+  background-color: #70451f;
+}
+
+.bg-emerald-50,
+.hover\:bg-emerald-50:hover {
+  background-color: #e1f3dd;
+}
+
+.bg-emerald-100 {
+  background-color: #cae6c5;
+}
+
+.bg-emerald-600,
+.hover\:bg-emerald-600:hover {
+  background-color: #2d6a4f;
+}
+
+.bg-emerald-700,
+.hover\:bg-emerald-700:hover {
+  background-color: #24533f;
+}
+
+.bg-amber-50 {
+  background-color: #fff1cf;
+}
+
+.bg-amber-100 {
+  background-color: #f4dda9;
+}
+
+.bg-red-50,
+.hover\:bg-red-50:hover {
+  background-color: #f9e5dd;
+}
+
+.border-slate-100,
+.focus\:border-slate-100:focus {
+  border-color: rgba(84, 61, 34, 0.08);
+}
+
+.border-slate-200,
+.hover\:border-slate-200:hover,
+.focus\:border-slate-200:focus {
+  border-color: rgba(84, 61, 34, 0.14);
+}
+
+.border-blue-200,
+.hover\:border-blue-200:hover,
+.focus\:border-blue-200:focus {
+  border-color: #d8b071;
+}
+
+.border-blue-300,
+.focus\:border-blue-300:focus {
+  border-color: #bf8745;
+}
+
+.border-emerald-100 {
+  border-color: rgba(49, 132, 87, 0.14);
+}
+
+.border-emerald-200 {
+  border-color: rgba(49, 132, 87, 0.28);
+}
+
+.border-amber-200 {
+  border-color: #e2b95d;
+}
+
+.text-slate-100 {
+  color: #f8efe1;
+}
+
+.text-slate-300 {
+  color: #d8c0a2;
+}
+
+.text-slate-400 {
+  color: #a0896d;
+}
+
+.text-slate-500 {
+  color: #786955;
+}
+
+.text-slate-600 {
+  color: #6f5d49;
+}
+
+.text-slate-700 {
+  color: #5b4a37;
+}
+
+.text-slate-800 {
+  color: #463626;
+}
+
+.text-slate-900 {
+  color: #34281d;
+}
+
+.text-slate-950 {
+  color: #241d15;
+}
+
+.text-blue-500,
+.text-blue-600 {
+  color: #9b6e34;
+}
+
+.text-blue-700,
+.hover\:text-blue-700:hover {
+  color: #7d4a24;
+}
+
+.text-emerald-500,
+.text-emerald-600 {
+  color: #318457;
+}
+
+.text-emerald-700 {
+  color: #286d48;
+}
+
+.text-emerald-800 {
+  color: #23583c;
+}
+
+.text-emerald-900 {
+  color: #1d4932;
+}
+
+.text-amber-700,
+.text-amber-800,
+.text-amber-900 {
+  color: #7d4a24;
+}
+
+.text-white,
+.hover\:text-white:hover {
+  color: #fff9ef;
+}
+
+.placeholder\:text-slate-300::placeholder {
+  color: #c1ad92;
+}
+
+.ring-blue-50 {
+  --tw-ring-color: #f2dfc2;
+}
+
+.focus\:ring-blue-100:focus {
+  --tw-ring-color: #ead2ad;
+}
+
+.shadow-sm,
+.shadow-2xl {
+  --tw-shadow-color: rgba(85, 60, 30, 0.14);
+}
+
+.pc-warm-shell {
+  background: #efe2ce;
+}
+
+.pc-warm-gradient {
+  background:
+    radial-gradient(circle at top left, rgba(255, 255, 255, 0.85), transparent 30rem),
+    linear-gradient(145deg, #f4eadb 0%, #e7d4ba 56%, #d8c0a2 100%);
+}
+
+.pc-warm-panel {
+  border-color: rgba(84, 61, 34, 0.12);
+  background:
+    radial-gradient(circle at 94% 12%, rgba(134, 91, 39, 0.16), transparent 9rem),
+    rgba(255, 249, 239, 0.9);
+  box-shadow: 0 20px 52px rgba(85, 60, 30, 0.14);
+}
+
+.pc-manuscript-gradient,
+.pc-manuscript-gradient:hover {
+  background: linear-gradient(145deg, #241d15, #8c5d30);
+  color: #fff5e6;
+  box-shadow: 0 16px 32px rgba(74, 47, 23, 0.22);
+}
+
+.pc-library-tabs {
+  background: rgba(65, 45, 22, 0.08);
+  color: #4a3a27;
+}
+
+.pc-library-tab {
+  background: transparent;
+  color: #4a3a27;
+}
+
+.pc-library-tab:hover {
+  background: rgba(255, 250, 242, 0.72);
+}
+
+.pc-library-tab-active,
+.pc-library-tab-active:hover {
+  background: #241d15;
+  color: #ffffff;
+  box-shadow: 0 8px 18px rgba(55, 39, 21, 0.16);
+}
+
+.pc-library-manuscript-card {
+  border-color: rgba(92, 65, 30, 0.1);
+  background: rgba(255, 250, 242, 0.82);
+  color: #241d15;
+}
+
+.pc-library-manuscript-card:hover {
+  background: rgba(255, 250, 242, 0.96);
+}
+
+.pc-library-document-card {
+  border-color: rgba(92, 65, 30, 0.1);
+  background: rgba(242, 248, 249, 0.88);
+  color: #241d15;
+}
+
+.pc-library-document-card:hover {
+  background: rgba(249, 253, 253, 0.96);
+}
+
+.pc-library-card-selected {
+  border-color: rgba(141, 91, 44, 0.38);
+  box-shadow: inset 0 0 0 1px rgba(141, 91, 44, 0.18), 0 10px 28px rgba(85, 60, 30, 0.1);
 }

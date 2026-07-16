@@ -41,14 +41,14 @@ export function LibraryPanel(): React.JSX.Element {
           <div className="text-xs uppercase tracking-[0.2em] text-slate-400">Library</div>
           <h2 className="mt-1 text-lg font-semibold text-slate-900">手稿与文本文档</h2>
         </div>
-        <button className="rounded-lg bg-emerald-600 px-3 py-2 text-xs font-medium text-white hover:bg-emerald-700" onClick={createManuscript} type="button">
+        <button className="pc-manuscript-gradient rounded-lg px-3 py-2 text-xs font-medium" onClick={createManuscript} type="button">
           新手稿
         </button>
       </div>
 
-      <div className="mb-4 grid grid-cols-3 rounded-xl bg-slate-100 p-1 text-xs font-medium text-slate-600">
+      <div className="pc-library-tabs mb-4 grid grid-cols-3 rounded-xl p-1 text-xs font-medium">
         {(["all", "manuscripts", "documents"] as const).map((item) => (
-          <button className={`rounded-lg px-2 py-2 ${tab === item ? "bg-white text-slate-950 shadow-sm" : ""}`} key={item} onClick={() => setTab(item)} type="button">
+          <button className={`rounded-lg px-2 py-2 transition ${tab === item ? "pc-library-tab-active" : "pc-library-tab"}`} key={item} onClick={() => setTab(item)} type="button">
             {item === "all" ? "全部" : item === "manuscripts" ? "手稿" : "文档"}
           </button>
         ))}
@@ -61,14 +61,14 @@ export function LibraryPanel(): React.JSX.Element {
             <div className="space-y-2">
               {manuscripts.map((manuscript) => (
                 <button
-                  className={`w-full rounded-xl border p-3 text-left transition ${
-                    manuscript.id === selectedManuscriptId ? "border-emerald-200 bg-emerald-50" : "border-slate-200 bg-white hover:bg-slate-50"
+                  className={`pc-library-manuscript-card w-full rounded-xl border p-3 text-left transition ${
+                    manuscript.id === selectedManuscriptId ? "pc-library-card-selected" : ""
                   }`}
                   key={manuscript.id}
                   onClick={() => openManuscriptEditor(manuscript.id)}
                   type="button"
                 >
-                  <span className="text-[11px] uppercase tracking-wide text-emerald-600">Manuscript</span>
+                  <span className="text-[11px] uppercase tracking-wide text-slate-500">Manuscript</span>
                   <div className="mt-1 text-sm font-medium text-slate-950">{manuscript.title}</div>
                   <div className="mt-1 text-xs text-slate-500">{manuscript.blocks.length} blocks · {manuscript.updatedAt}</div>
                 </button>
@@ -84,13 +84,13 @@ export function LibraryPanel(): React.JSX.Element {
             <div className="space-y-2">
               {documents.map((document) => (
                 <div
-                  className={`w-full rounded-xl border p-3 text-left transition ${
-                    document.id === selectedDocumentId ? "border-blue-200 bg-blue-50" : "border-slate-200 bg-white hover:bg-slate-50"
+                  className={`pc-library-document-card w-full rounded-xl border p-3 text-left transition ${
+                    document.id === selectedDocumentId ? "pc-library-card-selected" : ""
                   }`}
                   key={document.id}
                 >
                   <button className="block w-full text-left" onClick={() => openDocumentEditor(document.id)} type="button">
-                    <span className="text-[11px] uppercase tracking-wide text-blue-600">Document</span>
+                    <span className="text-[11px] uppercase tracking-wide text-slate-500">Document</span>
                     <div className="mt-1 text-sm font-medium text-slate-950">{document.title}</div>
                     <div className="mt-1 text-xs text-slate-500">{document.updatedAt}</div>
                   </button>

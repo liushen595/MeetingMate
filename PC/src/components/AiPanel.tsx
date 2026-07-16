@@ -92,12 +92,15 @@ export function AiPanel(): React.JSX.Element {
       setBusy(true);
       setError(null);
       setStatus("正在应用 AI 修改");
-      const nextBlocks = agentResult?.tool_calls.length
+      const agentApplyResult = agentResult?.tool_calls.length
         ? applyDocumentAgentToolCalls(document.blocks, agentResult.tool_calls)
+        : null;
+      const nextBlocks = agentApplyResult
+        ? agentApplyResult.blocks
         : draft.trim()
           ? [...document.blocks, { id: `doc_block_${crypto.randomUUID()}`, type: "paragraph" as const, content: draft.trim(), props: { content: draft.trim() } }]
           : document.blocks;
-      const saved = await pcApi.saveDocument({ ...document, blocks: nextBlocks });
+      const saved = await pcApi.saveDocument({ ...document, blocks: nextBlocks }, { deletedBlockIds: agentApplyResult?.deletedBlockIds });
       updateDocument(saved);
       setAgentResult(null);
       setPrompt("");
@@ -161,12 +164,6 @@ export function AiPanel(): React.JSX.Element {
       <div className="space-y-3 border-t border-slate-200 p-5">
         <button className="w-full rounded-xl bg-emerald-600 px-4 py-3 text-sm font-medium text-white hover:bg-emerald-700 disabled:opacity-50" disabled={!canApply || busy} onClick={() => void applyAgentOutput()} type="button">
           应用到文档
-        </button>
-        <button className="w-full rounded-xl bg-slate-950 px-4 py-3 text-sm font-medium text-white hover:bg-slate-800 disabled:opacity-50" disabled={!pcApi.currentSession || !selectedDocumentId} onClick={async () => {
-          const url = await pcApi.exportDocument(selectedDocumentId);
-          window.open(url, "_blank");
-        }} type="button">
-          导出 PDF
         </button>
       </div>
     </aside>

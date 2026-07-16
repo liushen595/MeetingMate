@@ -77,6 +77,16 @@ type RemoteDocument = {
   derived_from?: { manuscript_id?: string } | null;
 };
 
+type SyncOperation<TBlock> = {
+  op_id: string;
+  type: "upsert_block" | "delete_block";
+  block: TBlock | null;
+  block_id: string | null;
+  before_block_id: string | null;
+  after_block_id: string | null;
+  created_at: string;
+};
+
 type RemoteGroupSummary = {
   id: string;
   name: string;
@@ -179,7 +189,7 @@ export function isAuthError(error: unknown): boolean {
 }
 
 const SESSION_KEY = "meetingmate.session";
-const API_BASE_URL = "http://10.90.130.14:8000/api/v1";
+const API_BASE_URL = "https://mm.wanderflare.net/api/v1";
 
 class PcApiClient {
   private session: Session | null = this.readSession();
@@ -262,30 +272,27 @@ class PcApiClient {
     return toManuscript(remote);
   }
 
-  async saveManuscript(manuscript: Manuscript): Promise<Manuscript> {
+  async saveManuscript(manuscript: Manuscript, options: { deletedBlockIds?: string[] } = {}): Promise<Manuscript> {
     if (typeof manuscript.revision !== "number")
       throw new Error("远端手稿缺少 revision，无法同步");
+    const operations = buildBlockOperations(
+      manuscript.blocks,
+      options.deletedBlockIds ?? [],
+      (block) =>
+        toRemoteManuscriptBlock(
+          block,
+          this.sessionUserId(),
+          this.clientId,
+          this.platform,
+        ),
+    );
     await this.request(`/manuscripts/${manuscript.id}/blocks`, {
       method: "PUT",
       idempotent: true,
       body: JSON.stringify({
         client_id: this.clientId,
         base_revision: manuscript.revision,
-        operations: manuscript.blocks.map((block, index) => ({
-          op_id: `op_${crypto.randomUUID()}`,
-          type: "upsert_block",
-          block: toRemoteManuscriptBlock(
-            block,
-            this.sessionUserId(),
-            this.clientId,
-            this.platform,
-          ),
-          block_id: null,
-          before_block_id: null,
-          after_block_id:
-            index > 0 ? (manuscript.blocks[index - 1]?.id ?? null) : null,
-          created_at: new Date().toISOString(),
-        })),
+        operations,
       }),
     });
     return this.getManuscript(manuscript.id);
@@ -312,30 +319,27 @@ class PcApiClient {
     return toDocument(remote);
   }
 
-  async saveDocument(document: Document): Promise<Document> {
+  async saveDocument(document: Document, options: { deletedBlockIds?: string[] } = {}): Promise<Document> {
     if (typeof document.revision !== "number")
       throw new Error("远端文档缺少 revision，无法同步");
+    const operations = buildBlockOperations(
+      document.blocks,
+      options.deletedBlockIds ?? [],
+      (block) =>
+        toRemoteDocumentBlock(
+          block,
+          this.sessionUserId(),
+          this.clientId,
+          this.platform,
+        ),
+    );
     await this.request(`/documents/${document.id}/blocks`, {
       method: "PUT",
       idempotent: true,
       body: JSON.stringify({
         client_id: this.clientId,
         base_revision: document.revision,
-        operations: document.blocks.map((block, index) => ({
-          op_id: `op_${crypto.randomUUID()}`,
-          type: "upsert_block",
-          block: toRemoteDocumentBlock(
-            block,
-            this.sessionUserId(),
-            this.clientId,
-            this.platform,
-          ),
-          block_id: null,
-          before_block_id: null,
-          after_block_id:
-            index > 0 ? (document.blocks[index - 1]?.id ?? null) : null,
-          created_at: new Date().toISOString(),
-        })),
+        operations,
       }),
     });
     return this.getDocument(document.id);
@@ -1216,6 +1220,39 @@ function toRemoteDocumentBlock(
       },
     };
   return { ...base, type: "paragraph", props: { content: block.content } };
+}
+
+function buildBlockOperations<TBlock extends { id: string }>(
+  blocks: TBlock[],
+  deletedBlockIds: string[],
+  toRemoteBlock: (block: TBlock) => Record<string, unknown>,
+): Array<SyncOperation<Record<string, unknown>>> {
+  const now = new Date().toISOString();
+  const visibleBlockIds = new Set(blocks.map((block) => block.id));
+  const uniqueDeletedBlockIds = Array.from(new Set(deletedBlockIds)).filter(
+    (blockId) => !visibleBlockIds.has(blockId),
+  );
+
+  return [
+    ...blocks.map((block, index) => ({
+      op_id: `op_${crypto.randomUUID()}`,
+      type: "upsert_block" as const,
+      block: toRemoteBlock(block),
+      block_id: null,
+      before_block_id: null,
+      after_block_id: index > 0 ? (blocks[index - 1]?.id ?? null) : null,
+      created_at: now,
+    })),
+    ...uniqueDeletedBlockIds.map((blockId) => ({
+      op_id: `op_${crypto.randomUUID()}`,
+      type: "delete_block" as const,
+      block: null,
+      block_id: blockId,
+      before_block_id: null,
+      after_block_id: null,
+      created_at: now,
+    })),
+  ];
 }
 
 function remoteBlockBase(

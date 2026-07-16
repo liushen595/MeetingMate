@@ -126,6 +126,8 @@ export function ManuscriptPanel(): React.JSX.Element {
   const longPressTimerRef = useRef<number | null>(null);
   const autoSaveTimerRef = useRef<number | null>(null);
   const lastSavedBlocksRef = useRef("");
+  const lastSavedBlockIdsRef = useRef<string[]>([]);
+  const deletedBlockIdsRef = useRef<string[]>([]);
   const isColorTool = tool === "pen" || tool === "highlighter";
   const color = tool === "highlighter" ? highlighterColor : penColor;
   const brushWidth = tool === "highlighter" ? highlighterWidth : penWidth;
@@ -135,9 +137,11 @@ export function ManuscriptPanel(): React.JSX.Element {
     const nextBlocks = manuscript?.blocks ?? [];
     setBlocks(nextBlocks);
     lastSavedBlocksRef.current = JSON.stringify(nextBlocks);
+    lastSavedBlockIdsRef.current = nextBlocks.map((block) => block.id);
     setSaveStatus("未同步");
     setMenu(null);
     setSelected(null);
+    deletedBlockIdsRef.current = [];
   }, [manuscript?.id, manuscript?.blocks]);
 
   useEffect(() => {
@@ -148,10 +152,13 @@ export function ManuscriptPanel(): React.JSX.Element {
     if (autoSaveTimerRef.current) window.clearTimeout(autoSaveTimerRef.current);
     autoSaveTimerRef.current = window.setTimeout(() => {
       setSaveStatus("自动保存中");
+      const deletedBlockIds = pendingDeletedBlockIds();
       pcApi
-        .saveManuscript({ ...manuscript, blocks })
+        .saveManuscript({ ...manuscript, blocks }, { deletedBlockIds })
         .then((savedManuscript) => {
           lastSavedBlocksRef.current = JSON.stringify(savedManuscript.blocks);
+          lastSavedBlockIdsRef.current = savedManuscript.blocks.map((block) => block.id);
+          clearDeletedBlockIds(deletedBlockIds);
           updateManuscript(savedManuscript);
           setSaveStatus("已保存");
         })
@@ -203,8 +210,11 @@ export function ManuscriptPanel(): React.JSX.Element {
       if (!title) return;
       const hasHandwriting = blocks.some((block) => block.type === "handwriting");
       setSaveStatus(hasHandwriting ? "同步手写内容，准备识别转换" : "同步手稿，准备转换");
-      const savedManuscript = await pcApi.saveManuscript({ ...manuscript, blocks });
+      const deletedBlockIds = pendingDeletedBlockIds();
+      const savedManuscript = await pcApi.saveManuscript({ ...manuscript, blocks }, { deletedBlockIds });
       lastSavedBlocksRef.current = JSON.stringify(savedManuscript.blocks);
+      lastSavedBlockIdsRef.current = savedManuscript.blocks.map((block) => block.id);
+      clearDeletedBlockIds(deletedBlockIds);
       setBlocks(savedManuscript.blocks);
       updateManuscript(savedManuscript);
       setSaveStatus(hasHandwriting ? "转换中，后端正在识别手写内容" : "转换中");
@@ -342,6 +352,7 @@ export function ManuscriptPanel(): React.JSX.Element {
         delete heights[next.id];
         return heights;
       });
+      markBlocksDeleted(blockId, next.id);
       setActiveBlockId(previous.id);
     } else {
       setBlocks((current) => current.filter((block) => block.id !== blockId));
@@ -350,6 +361,7 @@ export function ManuscriptPanel(): React.JSX.Element {
         delete heights[blockId];
         return heights;
       });
+      markBlocksDeleted(blockId);
       if (activeBlockId === blockId) setActiveBlockId(null);
     }
 
@@ -357,6 +369,21 @@ export function ManuscriptPanel(): React.JSX.Element {
       setSelected(null);
     setMenu(null);
     setSaveStatus("等待自动保存");
+  }
+
+  function markBlocksDeleted(...blockIds: string[]) {
+    const persistedBlockIds = new Set(lastSavedBlockIdsRef.current);
+    const nextBlockIds = blockIds.filter((blockId) => persistedBlockIds.has(blockId));
+    if (nextBlockIds.length === 0) return;
+    deletedBlockIdsRef.current = Array.from(new Set([...deletedBlockIdsRef.current, ...nextBlockIds]));
+  }
+
+  function pendingDeletedBlockIds() {
+    return [...deletedBlockIdsRef.current];
+  }
+
+  function clearDeletedBlockIds(blockIds: string[]) {
+    deletedBlockIdsRef.current = deletedBlockIdsRef.current.filter((blockId) => !blockIds.includes(blockId));
   }
 
   function insertText(afterBlockId: string | null = null) {
@@ -389,8 +416,11 @@ export function ManuscriptPanel(): React.JSX.Element {
       const nextBlocks = insertBlockRespectingSelection(block, afterBlockId);
       setMenu(null);
       setSaveStatus("同步图片块");
-      const savedManuscript = await pcApi.saveManuscript({ ...manuscript, blocks: nextBlocks });
+      const deletedBlockIds = pendingDeletedBlockIds();
+      const savedManuscript = await pcApi.saveManuscript({ ...manuscript, blocks: nextBlocks }, { deletedBlockIds });
       lastSavedBlocksRef.current = JSON.stringify(savedManuscript.blocks);
+      lastSavedBlockIdsRef.current = savedManuscript.blocks.map((block) => block.id);
+      clearDeletedBlockIds(deletedBlockIds);
       updateManuscript(savedManuscript);
       setRecognizingImageAssetIds((current) => [...current, image.assetId]);
       setSaveStatus("图片识别中");
@@ -401,6 +431,8 @@ export function ManuscriptPanel(): React.JSX.Element {
         const nextBlocks = result.text && imageBlock ? insertAfter(refreshed.blocks, createTextBlock(result.text), imageBlock.id) : refreshed.blocks;
         const savedWithExtractedTextBlock = await pcApi.saveManuscript({ ...refreshed, blocks: nextBlocks });
         lastSavedBlocksRef.current = JSON.stringify(savedWithExtractedTextBlock.blocks);
+        lastSavedBlockIdsRef.current = savedWithExtractedTextBlock.blocks.map((block) => block.id);
+        deletedBlockIdsRef.current = [];
         setBlocks(savedWithExtractedTextBlock.blocks);
         updateManuscript(savedWithExtractedTextBlock);
         setSaveStatus("已保存");

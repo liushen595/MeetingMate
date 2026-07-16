@@ -112,7 +112,14 @@ Example output sequence:
       "width": 320,
       "height": 120
     },
-    "source_refs": [{ "manuscript_id": "manuscript_xxx", "block_id": "block_hw_1", "range": null, "region": null }]
+    "source_refs": [
+      {
+        "manuscript_id": "manuscript_xxx",
+        "block_id": "block_hw_1",
+        "range": null,
+        "region": null
+      }
+    ]
   },
   {
     "type": "heading",
@@ -120,7 +127,14 @@ Example output sequence:
       "level": 2,
       "content": "移动端优先推进"
     },
-    "source_refs": [{ "manuscript_id": "manuscript_xxx", "block_id": "block_hw_1", "range": null, "region": null }]
+    "source_refs": [
+      {
+        "manuscript_id": "manuscript_xxx",
+        "block_id": "block_hw_1",
+        "range": null,
+        "region": null
+      }
+    ]
   }
 ]
 ```

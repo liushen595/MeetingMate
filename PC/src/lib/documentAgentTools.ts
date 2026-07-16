@@ -4,8 +4,9 @@ import type { DocumentAgentToolCall } from "./documentAgent";
 export function applyDocumentAgentToolCalls(
   blocks: DocumentBlock[],
   toolCalls: DocumentAgentToolCall[],
-): DocumentBlock[] {
+): { blocks: DocumentBlock[]; deletedBlockIds: string[] } {
   let nextBlocks = blocks;
+  const deletedBlockIds: string[] = [];
 
   function upsert(block: DocumentBlock, afterBlockId: string | null = null): void {
     const exists = nextBlocks.some((item) => item.id === block.id);
@@ -15,7 +16,9 @@ export function applyDocumentAgentToolCalls(
   }
 
   function remove(blockId: string): void {
+    if (!nextBlocks.some((block) => block.id === blockId)) return;
     nextBlocks = nextBlocks.filter((block) => block.id !== blockId);
+    deletedBlockIds.push(blockId);
   }
 
   for (const call of toolCalls) {
@@ -74,7 +77,7 @@ export function applyDocumentAgentToolCalls(
     }
   }
 
-  return nextBlocks;
+  return { blocks: nextBlocks, deletedBlockIds: Array.from(new Set(deletedBlockIds)) };
 }
 
 export function getBlockText(block: DocumentBlock): string {

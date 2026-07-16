@@ -194,16 +194,16 @@ export function HomePanel(): React.JSX.Element {
   const activeMessages = messages.filter((message) => message.groupId === activeGroup?.id);
 
   return (
-    <section className="min-h-0 flex-1 overflow-auto bg-slate-50 p-8">
+    <section className="pc-warm-gradient min-h-0 flex-1 overflow-auto p-8">
       <div className="mx-auto max-w-6xl space-y-6">
-        <div className="rounded-3xl border border-slate-200 bg-white p-8 shadow-sm">
+        <div className="pc-warm-panel rounded-3xl border border-slate-200 p-8 shadow-sm">
           <div className="text-xs uppercase tracking-[0.2em] text-blue-500">MeetingMate PC</div>
           <h2 className="mt-3 text-3xl font-bold text-slate-950">从手稿到文档的 AI 工作流</h2>
           <p className="mt-3 max-w-2xl text-sm leading-7 text-slate-500">在库中新建或打开手稿，采集文字、手写、语音和图片，再转换为富文本文档进行 Agent 辅助编辑。</p>
         </div>
 
         <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_minmax(420px,0.95fr)]">
-          <div className="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm">
+          <div className="pc-warm-panel rounded-3xl border border-slate-200 p-6 shadow-sm">
             <div className="flex items-start justify-between gap-4">
               <div>
                 <div className="text-xs uppercase tracking-[0.2em] text-emerald-500">Schedule</div>
@@ -224,7 +224,7 @@ export function HomePanel(): React.JSX.Element {
                   </div>
                   <div className="flex shrink-0 gap-2">
                     <button className="rounded-xl border border-emerald-200 px-3 py-2 text-sm font-medium text-emerald-700 hover:bg-white" onClick={() => openEditMeetingDialog(nextMeeting)} type="button">修改</button>
-                    <button className="rounded-xl bg-blue-600 px-3 py-2 text-sm font-medium text-white hover:bg-blue-700" onClick={() => void createManuscriptFromMeeting()} type="button">创建手稿</button>
+                    <button className="pc-manuscript-gradient rounded-xl px-3 py-2 text-sm font-medium" onClick={() => void createManuscriptFromMeeting()} type="button">创建手稿</button>
                   </div>
                 </div>
               </div>
@@ -251,7 +251,7 @@ export function HomePanel(): React.JSX.Element {
             ) : null}
           </div>
 
-          <div className="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm">
+          <div className="pc-warm-panel rounded-3xl border border-slate-200 p-6 shadow-sm">
             <div className="flex items-start justify-between gap-4">
               <div>
                 <div className="text-xs uppercase tracking-[0.2em] text-blue-500">Groups</div>
