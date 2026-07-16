@@ -18,6 +18,7 @@ type ApiErrorPayload = {
   error?: {
     code?: string;
     message?: string;
+    details?: Record<string, unknown> | null;
     request_id?: string;
   };
 };
@@ -85,6 +86,14 @@ type SyncOperation<TBlock> = {
   before_block_id: string | null;
   after_block_id: string | null;
   created_at: string;
+};
+
+type SyncResponse<TBlock> = {
+  resource_id: string;
+  revision: number;
+  applied_op_ids: string[];
+  conflicts: unknown[];
+  blocks: TBlock[];
 };
 
 type RemoteGroupSummary = {
@@ -173,13 +182,15 @@ export type AudioTranscription = {
 export class ApiError extends Error {
   readonly status: number;
   readonly code: string;
+  readonly details?: Record<string, unknown> | null;
   readonly requestId?: string;
 
-  constructor(status: number, message: string, code = "", requestId?: string) {
+  constructor(status: number, message: string, code = "", details?: Record<string, unknown> | null, requestId?: string) {
     super(message);
     this.name = "ApiError";
     this.status = status;
     this.code = code;
+    this.details = details;
     this.requestId = requestId;
   }
 }
@@ -286,7 +297,7 @@ class PcApiClient {
           this.platform,
         ),
     );
-    await this.request(`/manuscripts/${manuscript.id}/blocks`, {
+    const response = await this.request<SyncResponse<Record<string, unknown>>>(`/manuscripts/${manuscript.id}/blocks`, {
       method: "PUT",
       idempotent: true,
       body: JSON.stringify({
@@ -295,7 +306,12 @@ class PcApiClient {
         operations,
       }),
     });
-    return this.getManuscript(manuscript.id);
+    return {
+      ...manuscript,
+      revision: response.revision,
+      updatedAt: new Date().toISOString(),
+      blocks: manuscript.blocks,
+    };
   }
 
   async getManuscript(id: string): Promise<Manuscript> {
@@ -553,7 +569,7 @@ class PcApiClient {
     });
   }
 
-  async transcribeAudio(file: SelectedFile): Promise<AudioTranscription> {
+  async transcribeAudio(file: SelectedFile, onProgress?: (progress: ConvertProgress) => void): Promise<AudioTranscription> {
     const asset = await this.createReadyAsset(file);
     const task = await this.request<Task>("/tasks/asr-audio", {
       method: "POST",
@@ -565,7 +581,11 @@ class PcApiClient {
         client_id: this.clientId,
       }),
     });
-    const completedTask = await this.waitForTask(task);
+    const completedTask = await this.waitForTask(
+      task,
+      "服务器已接收音频，但 ASR 任务超时未返回文本",
+      onProgress,
+    );
     const transcript = extractTranscript(completedTask.result);
     if (transcript)
       return {
@@ -608,7 +628,7 @@ class PcApiClient {
     return { assetId: asset.id, width: asset.width ?? file.width ?? null, height: asset.height ?? file.height ?? null };
   }
 
-  async recognizeImageAsset(assetId: string): Promise<ImageRecognitionResult> {
+  async recognizeImageAsset(assetId: string, onProgress?: (progress: ConvertProgress) => void): Promise<ImageRecognitionResult> {
     const task = await this.request<Task>("/tasks/recognize-image", {
       method: "POST",
       idempotent: true,
@@ -617,6 +637,7 @@ class PcApiClient {
     const completedTask = await this.waitForTask(
       task,
       "图片识别任务超时未返回文本",
+      onProgress,
     );
     const caption = extractImageCaption(completedTask.result);
     const text = extractImageText(completedTask.result) || caption;
@@ -960,6 +981,7 @@ function apiErrorFromResponse(
     response.status,
     error?.message ?? fallbackMessage ?? response.statusText,
     error?.code ?? "",
+    error?.details,
     error?.request_id,
   );
 }

@@ -15,7 +15,11 @@ type MeetingDraft = {
 };
 
 export function HomePanel(): React.JSX.Element {
+  const addDocument = useWorkspaceStore((state) => state.addDocument);
   const addManuscript = useWorkspaceStore((state) => state.addManuscript);
+  const isHydrated = useWorkspaceStore((state) => state.isHydrated);
+  const manuscripts = useWorkspaceStore((state) => state.manuscripts);
+  const openDocumentEditor = useWorkspaceStore((state) => state.openDocumentEditor);
   const openManuscriptEditor = useWorkspaceStore((state) => state.openManuscriptEditor);
   const documents = useWorkspaceStore((state) => state.documents);
   const [meetings, setMeetings] = useState<MeetingSchedule[]>(() => loadMeetings());
@@ -32,6 +36,8 @@ export function HomePanel(): React.JSX.Element {
   const [isSubmittingGroup, setIsSubmittingGroup] = useState(false);
   const [isSendingDocument, setIsSendingDocument] = useState(false);
   const [groupError, setGroupError] = useState<string | null>(null);
+  const latestManuscript = manuscripts[0];
+  const latestDocument = documents[0];
   const nextMeeting = useMemo(() => getNextMeeting(meetings), [meetings]);
 
   useEffect(() => {
@@ -122,6 +128,18 @@ export function HomePanel(): React.JSX.Element {
     openManuscriptEditor(manuscript.id);
   }
 
+  async function createManuscript(): Promise<void> {
+    const manuscript = await pcApi.createManuscript("未命名手稿");
+    addManuscript(manuscript);
+    openManuscriptEditor(manuscript.id);
+  }
+
+  async function createDocument(): Promise<void> {
+    const document = await pcApi.createDocument("未命名文档");
+    addDocument(document);
+    openDocumentEditor(document.id);
+  }
+
   async function createGroup(): Promise<void> {
     if (!groupName.trim()) return;
     try {
@@ -194,127 +212,191 @@ export function HomePanel(): React.JSX.Element {
   const activeMessages = messages.filter((message) => message.groupId === activeGroup?.id);
 
   return (
-    <section className="pc-warm-gradient min-h-0 flex-1 overflow-auto p-8">
-      <div className="mx-auto max-w-6xl space-y-6">
-        <div className="pc-warm-panel rounded-3xl border border-slate-200 p-8 shadow-sm">
-          <div className="text-xs uppercase tracking-[0.2em] text-blue-500">MeetingMate PC</div>
-          <h2 className="mt-3 text-3xl font-bold text-slate-950">从手稿到文档的 AI 工作流</h2>
-          <p className="mt-3 max-w-2xl text-sm leading-7 text-slate-500">在库中新建或打开手稿，采集文字、手写、语音和图片，再转换为富文本文档进行 Agent 辅助编辑。</p>
-        </div>
+    <section className="pc-home-screen pc-warm-gradient min-h-0 flex-1 overflow-auto px-6 py-5">
+      <div className="pc-home-stack mx-auto max-w-6xl">
+        <header className="pc-home-hero">
+          <div className="pc-hero-status-row">
+            <p className="pc-eyebrow">MeetingMate Mobile</p>
+            <span>{isHydrated ? "已连接工作区" : "同步中"}</span>
+          </div>
+          <h2>现场素材，直接沉淀成可编辑文档。</h2>
+          <p>录音、图片、手写和文字进入同一份手稿，由云端 ASR、图片识别和 Agent 整理成保留来源引用的正式文档。</p>
+          <div className="pc-hero-metrics" aria-label="工作区概览">
+            <div>
+              <strong>{manuscripts.length}</strong>
+              <span>手稿</span>
+            </div>
+            <div>
+              <strong>{documents.length}</strong>
+              <span>文档</span>
+            </div>
+            <div>
+              <strong>{groups.length}</strong>
+              <span>协作组</span>
+            </div>
+          </div>
+        </header>
 
-        <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_minmax(420px,0.95fr)]">
-          <div className="pc-warm-panel rounded-3xl border border-slate-200 p-6 shadow-sm">
-            <div className="flex items-start justify-between gap-4">
+        <div className="pc-home-dashboard-grid pc-home-priority-grid">
+          <section className="pc-home-panel">
+            <div className="pc-panel-head">
               <div>
-                <div className="text-xs uppercase tracking-[0.2em] text-emerald-500">Schedule</div>
-                <h3 className="mt-2 text-xl font-semibold text-slate-950">会议安排</h3>
+                <p className="pc-eyebrow">Schedule</p>
+                <h3>会议安排</h3>
               </div>
-              <button className="rounded-xl bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700" onClick={openNewMeetingDialog} type="button">编辑会议</button>
+              <button className="pc-primary-small" onClick={openNewMeetingDialog} type="button">编辑会议</button>
             </div>
 
             {nextMeeting ? (
-              <div className="mt-6 rounded-2xl border border-emerald-100 bg-emerald-50 p-5">
-                <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
+              <div className="pc-meeting-feature">
+                <div className="pc-meeting-feature-content">
                   <div>
-                    <div className="text-sm font-semibold text-emerald-900">最早开始</div>
-                    <h4 className="mt-2 text-2xl font-bold text-slate-950">{nextMeeting.title}</h4>
-                    <p className="mt-3 text-sm text-slate-600">时间：{formatDateTime(nextMeeting.startAt)}</p>
-                    <p className="mt-1 text-sm text-slate-600">地址：{nextMeeting.address || "未填写"}</p>
-                    {nextMeeting.notes ? <p className="mt-3 text-sm leading-6 text-slate-500">{nextMeeting.notes}</p> : null}
+                    <span>最早开始</span>
+                    <strong>{nextMeeting.title}</strong>
+                    <p>时间：{formatDateTime(nextMeeting.startAt)}</p>
+                    <p>地址：{nextMeeting.address || "未填写"}</p>
+                    {nextMeeting.notes ? <p>{nextMeeting.notes}</p> : null}
                   </div>
-                  <div className="flex shrink-0 gap-2">
-                    <button className="rounded-xl border border-emerald-200 px-3 py-2 text-sm font-medium text-emerald-700 hover:bg-white" onClick={() => openEditMeetingDialog(nextMeeting)} type="button">修改</button>
-                    <button className="pc-manuscript-gradient rounded-xl px-3 py-2 text-sm font-medium" onClick={() => void createManuscriptFromMeeting()} type="button">创建手稿</button>
+                  <div className="pc-meeting-actions">
+                    <button className="pc-ghost-button" onClick={() => openEditMeetingDialog(nextMeeting)} type="button">修改</button>
+                    <button className="pc-primary-small" onClick={() => void createManuscriptFromMeeting()} type="button">创建手稿</button>
                   </div>
                 </div>
               </div>
             ) : (
-              <div className="mt-6 rounded-2xl border border-dashed border-slate-200 p-8 text-center">
-                <h4 className="text-base font-semibold text-slate-900">暂无会议</h4>
-                <p className="mt-2 text-sm text-slate-500">添加会议后，首页只展示最早开始的一场。</p>
-                <button className="mt-4 rounded-xl bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700" onClick={openNewMeetingDialog} type="button">添加会议</button>
+              <div className="pc-empty-panel">
+                <strong>暂无会议</strong>
+                <span>添加会议后，首页只展示最早开始的一场。</span>
+                <button className="pc-primary-small" onClick={openNewMeetingDialog} type="button">添加会议</button>
               </div>
             )}
 
             {meetings.length > 0 ? (
-              <div className="mt-5 space-y-2">
+              <div className="pc-compact-list">
                 {meetings.slice(0, 4).map((meeting) => (
-                  <div className="flex items-center justify-between rounded-xl border border-slate-200 px-4 py-3" key={meeting.id}>
+                  <div className="pc-compact-row" key={meeting.id}>
                     <div>
-                      <div className="text-sm font-medium text-slate-900">{meeting.title}</div>
-                      <div className="mt-1 text-xs text-slate-500">{formatDateTime(meeting.startAt)} · {meeting.address || "未填写地址"}</div>
+                      <strong>{meeting.title}</strong>
+                      <small>{formatDateTime(meeting.startAt)} · {meeting.address || "未填写地址"}</small>
                     </div>
-                    <button className="text-xs font-medium text-red-600 hover:text-red-700" onClick={() => deleteMeeting(meeting.id)} type="button">删除</button>
+                    <button className="pc-danger-link" onClick={() => deleteMeeting(meeting.id)} type="button">删除</button>
                   </div>
                 ))}
               </div>
             ) : null}
-          </div>
+          </section>
 
-          <div className="pc-warm-panel rounded-3xl border border-slate-200 p-6 shadow-sm">
-            <div className="flex items-start justify-between gap-4">
+          <section className="pc-home-panel">
+            <div className="pc-panel-head pc-panel-head-stacked">
               <div>
-                <div className="text-xs uppercase tracking-[0.2em] text-blue-500">Groups</div>
-                <h3 className="mt-2 text-xl font-semibold text-slate-950">组</h3>
-                <p className="mt-2 text-sm leading-6 text-slate-500">创建或加入组，把库中文档按发送时快照分享给组成员。</p>
+                <p className="pc-eyebrow">Groups</p>
+                <h3>用户组</h3>
+                <p className="pc-panel-copy">创建或加入组后，可把文档快照发送给组成员。</p>
               </div>
-              <div className="flex gap-2">
-                <button className="rounded-xl bg-blue-600 px-3 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50" disabled={isSubmittingGroup} onClick={() => setGroupDialog("create")} type="button">创建组</button>
-                <button className="rounded-xl border border-slate-200 px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50" disabled={isSubmittingGroup} onClick={() => setGroupDialog("join")} type="button">加入组</button>
+              <div className="pc-panel-actions">
+                <button className="pc-primary-small" disabled={isSubmittingGroup} onClick={() => setGroupDialog("create")} type="button">创建组</button>
+                <button className="pc-ghost-button" disabled={isSubmittingGroup} onClick={() => setGroupDialog("join")} type="button">加入组</button>
               </div>
             </div>
 
-            {groupError ? <div className="mt-4 rounded-xl border border-red-100 bg-red-50 px-3 py-2 text-sm text-red-700">{groupError}</div> : null}
+            {groupError ? <button className="pc-toast-inline" onClick={() => setGroupError(null)} type="button">{groupError}</button> : null}
 
             {isLoadingGroups ? (
-              <div className="mt-6 rounded-2xl border border-dashed border-slate-200 p-8 text-center text-sm text-slate-500">组列表加载中...</div>
+              <div className="pc-empty-panel pc-groups-empty"><span>正在加载组列表...</span></div>
             ) : groups.length === 0 ? (
-              <div className="mt-6 rounded-2xl border border-dashed border-slate-200 p-8 text-center text-sm text-slate-500">还没有组。创建组会生成 6 位数字口令码，有效期一天。</div>
+              <div className="pc-empty-panel pc-groups-empty"><span>还没有组。创建组会生成 6 位数字口令码，有效期一天。</span></div>
             ) : (
-              <div className="mt-6 grid gap-4 lg:grid-cols-[180px_1fr]">
-                <div className="space-y-2">
+              <div className="pc-group-layout">
+                <div className="pc-group-tabs">
                   {groups.map((group) => (
-                    <button className={`w-full rounded-xl border p-3 text-left text-sm ${group.id === activeGroup?.id ? "border-blue-200 bg-blue-50" : "border-slate-200 hover:bg-slate-50"}`} key={group.id} onClick={() => setSelectedGroupId(group.id)} type="button">
-                      <div className="font-medium text-slate-950">{group.name}</div>
-                      <div className="mt-1 text-xs text-slate-500">{group.memberCount} 人 · {group.role === "owner" ? "我创建" : "成员"}</div>
+                    <button className={group.id === activeGroup?.id ? "pc-group-tab active" : "pc-group-tab"} key={group.id} onClick={() => setSelectedGroupId(group.id)} type="button">
+                      <strong>{group.name}</strong>
+                      <small>{group.memberCount} 人 · {group.inviteCode}</small>
                     </button>
                   ))}
                 </div>
-                <div className="rounded-2xl border border-slate-200 p-4">
-                  {activeGroup ? (
-                    <>
-                      <div className="flex items-start justify-between gap-3">
-                        <div>
-                          <h4 className="font-semibold text-slate-950">{activeGroup.name}</h4>
-                          <p className="mt-1 text-xs text-slate-500">口令 {activeGroup.inviteCode}，有效期至 {formatDateTime(activeGroup.inviteCodeExpiresAt)}</p>
-                        </div>
-                      </div>
-                      <div className="mt-4 flex gap-2">
-                        <select className="min-w-0 flex-1 rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none" onChange={(event) => setSelectedDocumentId(event.target.value)} value={selectedDocumentId}>
-                          <option value="">选择库中文档</option>
-                          {documents.map((document) => <option key={document.id} value={document.id}>{document.title}</option>)}
-                        </select>
-                        <button className="rounded-xl bg-slate-950 px-3 py-2 text-sm font-medium text-white disabled:opacity-50" disabled={!selectedDocumentId || !activeGroup || isSendingDocument} onClick={() => void sendDocumentToGroup()} type="button">{isSendingDocument ? "发送中" : "发送"}</button>
-                      </div>
-                      <div className="mt-4 space-y-2">
-                        {isLoadingMessages ? <div className="rounded-xl bg-slate-50 p-4 text-sm text-slate-500">文档消息加载中...</div> : null}
-                        {!isLoadingMessages && activeMessages.length === 0 ? <div className="rounded-xl bg-slate-50 p-4 text-sm text-slate-500">暂无文档消息。</div> : null}
-                        {activeMessages.map((message) => (
-                          <div className="flex items-center justify-between rounded-xl border border-slate-200 px-3 py-2" key={message.id}>
-                            <div>
-                              <div className="text-sm font-medium text-slate-900">{message.documentTitle}</div>
-                              <div className="mt-1 text-xs text-slate-500">{displaySenderName(message.senderName)} · {formatDateTime(message.sentAt)}</div>
-                            </div>
-                            <button className="rounded-lg border border-slate-200 px-2 py-1 text-xs text-slate-700 hover:bg-slate-50" onClick={() => void downloadGroupDocument(message)} type="button">下载</button>
+                {activeGroup ? (
+                  <div className="pc-group-detail">
+                    <h4>{activeGroup.name}</h4>
+                    <p>口令 {activeGroup.inviteCode}，有效期至 {formatDateTime(activeGroup.inviteCodeExpiresAt)}</p>
+                    <div className="pc-document-send-row">
+                      <select onChange={(event) => setSelectedDocumentId(event.target.value)} value={selectedDocumentId}>
+                        <option value="">选择库中文档</option>
+                        {documents.map((document) => <option key={document.id} value={document.id}>{document.title}</option>)}
+                      </select>
+                      <button className="pc-primary-small" disabled={!selectedDocumentId || !activeGroup || isSendingDocument} onClick={() => void sendDocumentToGroup()} type="button">{isSendingDocument ? "发送中" : "发送"}</button>
+                    </div>
+                    <div className="pc-message-stack">
+                      {isLoadingMessages ? <div className="pc-message-empty">正在加载文档消息...</div> : null}
+                      {!isLoadingMessages && activeMessages.length === 0 ? <div className="pc-message-empty">暂无文档消息。</div> : null}
+                      {activeMessages.map((message) => (
+                        <div className="pc-message-row" key={message.id}>
+                          <div>
+                            <strong>{message.documentTitle}</strong>
+                            <small>{displaySenderName(message.senderName)} · {formatDateTime(message.sentAt)}</small>
                           </div>
-                        ))}
-                      </div>
-                    </>
-                  ) : null}
-                </div>
+                          <button className="pc-ghost-button" onClick={() => void downloadGroupDocument(message)} type="button">下载</button>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
               </div>
             )}
+          </section>
+        </div>
+
+        <div className="pc-quick-grid">
+          <button className="pc-quick-card ink" onClick={() => void createManuscript()} type="button">
+            <span>开始采集</span>
+            <strong>新建现场手稿</strong>
+            <small>录音、拍照、手写都放进一张连续稿纸</small>
+          </button>
+          <button className="pc-quick-card paper" onClick={() => void createDocument()} type="button">
+            <span>开始整理</span>
+            <strong>新建正式文档</strong>
+            <small>块编辑、AI 润色、摘要和续写</small>
+          </button>
+        </div>
+
+        <section className="pc-home-workflow" aria-label="核心服务流程">
+          <div>
+            <span>01</span>
+            <strong>采集</strong>
+            <small>音频 / 图片 / 手写</small>
           </div>
+          <div>
+            <span>02</span>
+            <strong>识别</strong>
+            <small>ASR / 图片理解 / 手写识别</small>
+          </div>
+          <div>
+            <span>03</span>
+            <strong>成文</strong>
+            <small>Agent 整理 / 引用保留</small>
+          </div>
+        </section>
+
+        <div className="pc-home-section-row">
+          <h3>最近继续</h3>
+          {!isHydrated && <span>同步中</span>}
+        </div>
+        <div className="pc-home-recent-stack">
+          {latestManuscript ? (
+            <button className="pc-home-recent-card" onClick={() => openManuscriptEditor(latestManuscript.id)} type="button">
+              <span className="card-kind">最近手稿</span>
+              <strong>{latestManuscript.title}</strong>
+              <small>{formatRelativeTime(latestManuscript.updatedAt)}</small>
+            </button>
+          ) : null}
+          {latestDocument ? (
+            <button className="pc-home-recent-card document" onClick={() => openDocumentEditor(latestDocument.id)} type="button">
+              <span className="card-kind">最近文档</span>
+              <strong>{latestDocument.title}</strong>
+              <small>{formatRelativeTime(latestDocument.updatedAt)}</small>
+            </button>
+          ) : null}
+          {!latestManuscript && !latestDocument ? <p className="pc-home-empty-state">还没有内容。先创建一份手稿，录入现场素材。</p> : null}
         </div>
 
       </div>
@@ -365,6 +447,20 @@ function Dialog({ title, children, onClose }: { title: string; children: ReactNo
 
 function formatDateTime(value: string): string {
   return new Intl.DateTimeFormat("zh-CN", { dateStyle: "medium", timeStyle: "short" }).format(new Date(value));
+}
+
+function formatRelativeTime(value: string): string {
+  const timestamp = new Date(value).getTime();
+  if (Number.isNaN(timestamp)) return value;
+  const diffMs = Date.now() - timestamp;
+  const minute = 60_000;
+  const hour = 60 * minute;
+  const day = 24 * hour;
+  if (diffMs < minute) return "刚刚";
+  if (diffMs < hour) return `${Math.floor(diffMs / minute)} 分钟前`;
+  if (diffMs < day) return `${Math.floor(diffMs / hour)} 小时前`;
+  if (diffMs < 7 * day) return `${Math.floor(diffMs / day)} 天前`;
+  return new Intl.DateTimeFormat("zh-CN", { dateStyle: "medium" }).format(new Date(timestamp));
 }
 
 function displaySenderName(senderName: string): string {

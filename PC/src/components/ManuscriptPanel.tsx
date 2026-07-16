@@ -8,9 +8,10 @@ import {
 } from "react";
 import { Layer, Line, Rect, Stage } from "react-konva";
 import type { KonvaEventObject } from "konva/lib/Node";
-import { pcApi, type AudioTranscription, type ConvertWarning, type ImageRecognitionResult } from "../lib/api";
+import { ApiError, pcApi, type AudioTranscription, type ConvertProgress, type ConvertWarning, type ImageRecognitionResult } from "../lib/api";
 import { useWorkspaceStore } from "../stores/workspaceStore";
 import type { ManuscriptBlock } from "../types/block";
+import type { Manuscript } from "../types/manuscript";
 
 type StrokeTool = "pen" | "highlighter" | "eraser" | "lasso";
 type StrokePoint = { x: number; y: number; t: number; pressure: number };
@@ -45,6 +46,13 @@ type MenuState = {
   selectedStrokeIds: string[];
 } | null;
 type RenameDialogState = { manuscriptId: string; title: string };
+type ProcessingNotice = {
+  id: string;
+  kind: "audio" | "image";
+  title: string;
+  detail: string;
+  progress: number | null;
+};
 type UiPointEvent = MouseEvent<Element> | ReactPointerEvent<Element>;
 type DrawingState =
   | { mode: "none" }
@@ -93,7 +101,7 @@ export function ManuscriptPanel(): React.JSX.Element {
   const manuscript = manuscripts.find(
     (item) => item.id === selectedManuscriptId,
   );
-  const [blocks, setBlocks] = useState<ManuscriptBlock[]>([]);
+  const [blocks, setBlocks] = useState<ManuscriptBlock[]>(() => manuscript?.blocks ?? []);
   const [tool, setTool] = useState<StrokeTool>("pen");
   const [penColor, setPenColorState] = useState(
     () => localStorage.getItem(PEN_COLOR_KEY) ?? "#1f1b14",
@@ -117,6 +125,7 @@ export function ManuscriptPanel(): React.JSX.Element {
   const [saveStatus, setSaveStatus] = useState("未同步");
   const [recognizingImageAssetIds, setRecognizingImageAssetIds] = useState<string[]>([]);
   const [localImageUrls, setLocalImageUrls] = useState<Record<string, string>>({});
+  const [processingNotices, setProcessingNotices] = useState<ProcessingNotice[]>([]);
   const [convertDialog, setConvertDialog] = useState<{ title: string; optimizeAudio: boolean } | null>(null);
   const [isConverting, setIsConverting] = useState(false);
   const [convertWarnings, setConvertWarnings] = useState<ConvertWarning[]>([]);
@@ -125,7 +134,11 @@ export function ManuscriptPanel(): React.JSX.Element {
   );
   const longPressTimerRef = useRef<number | null>(null);
   const autoSaveTimerRef = useRef<number | null>(null);
+  const blocksRef = useRef<ManuscriptBlock[]>(manuscript?.blocks ?? []);
+  const manuscriptRef = useRef(manuscript);
+  const savePromiseRef = useRef<Promise<Manuscript | null> | null>(null);
   const lastSavedBlocksRef = useRef("");
+  const hasUnsavedChangesRef = useRef(false);
   const lastSavedBlockIdsRef = useRef<string[]>([]);
   const deletedBlockIdsRef = useRef<string[]>([]);
   const isColorTool = tool === "pen" || tool === "highlighter";
@@ -134,41 +147,182 @@ export function ManuscriptPanel(): React.JSX.Element {
   const palette = tool === "highlighter" ? HIGHLIGHTER_COLORS : PEN_COLORS;
 
   useEffect(() => {
+    if (autoSaveTimerRef.current) {
+      window.clearTimeout(autoSaveTimerRef.current);
+      autoSaveTimerRef.current = null;
+    }
     const nextBlocks = manuscript?.blocks ?? [];
+    blocksRef.current = nextBlocks;
+    manuscriptRef.current = manuscript;
     setBlocks(nextBlocks);
     lastSavedBlocksRef.current = JSON.stringify(nextBlocks);
+    hasUnsavedChangesRef.current = false;
     lastSavedBlockIdsRef.current = nextBlocks.map((block) => block.id);
     setSaveStatus("未同步");
     setMenu(null);
     setSelected(null);
     deletedBlockIdsRef.current = [];
-  }, [manuscript?.id, manuscript?.blocks]);
+  }, [manuscript?.id]);
 
   useEffect(() => {
-    if (!manuscript) return;
-    const serialized = JSON.stringify(blocks);
-    if (serialized === lastSavedBlocksRef.current) return;
+    if (!manuscript) {
+      manuscriptRef.current = undefined;
+      return;
+    }
+    const currentRevision = manuscriptRef.current?.id === manuscript.id ? manuscriptRef.current.revision : undefined;
+    const nextRevision =
+      typeof currentRevision === "number" || typeof manuscript.revision === "number"
+        ? Math.max(currentRevision ?? 0, manuscript.revision ?? 0)
+        : undefined;
+    manuscriptRef.current = {
+      ...manuscript,
+      revision: nextRevision,
+      blocks: blocksRef.current,
+    };
+  }, [manuscript]);
 
-    if (autoSaveTimerRef.current) window.clearTimeout(autoSaveTimerRef.current);
-    autoSaveTimerRef.current = window.setTimeout(() => {
-      setSaveStatus("自动保存中");
-      const deletedBlockIds = pendingDeletedBlockIds();
-      pcApi
-        .saveManuscript({ ...manuscript, blocks }, { deletedBlockIds })
-        .then((savedManuscript) => {
-          lastSavedBlocksRef.current = JSON.stringify(savedManuscript.blocks);
-          lastSavedBlockIdsRef.current = savedManuscript.blocks.map((block) => block.id);
-          clearDeletedBlockIds(deletedBlockIds);
-          updateManuscript(savedManuscript);
-          setSaveStatus("已保存");
-        })
-        .catch(() => setSaveStatus("保存失败，将重试"));
-    }, 700);
+  useEffect(() => {
+    blocksRef.current = blocks;
+    scheduleAutoSave();
+  }, [blocks]);
 
+  useEffect(() => {
     return () => {
       if (autoSaveTimerRef.current) window.clearTimeout(autoSaveTimerRef.current);
     };
-  }, [blocks, manuscript, updateManuscript]);
+  }, []);
+
+  function setLocalBlocks(
+    value: ManuscriptBlock[] | ((current: ManuscriptBlock[]) => ManuscriptBlock[]),
+  ): ManuscriptBlock[] | null {
+    const current = blocksRef.current;
+    const nextBlocks = typeof value === "function" ? value(current) : value;
+    if (nextBlocks === current) return manuscriptRef.current ? nextBlocks : null;
+    blocksRef.current = nextBlocks;
+    hasUnsavedChangesRef.current = true;
+    setBlocks(nextBlocks);
+    const currentManuscript = manuscriptRef.current;
+    if (currentManuscript) {
+      manuscriptRef.current = { ...currentManuscript, blocks: nextBlocks };
+    }
+    return currentManuscript ? nextBlocks : null;
+  }
+
+  function scheduleAutoSave(delay = 700) {
+    if (!manuscriptRef.current) return;
+    if (!hasUnsavedChangesRef.current) return;
+    if (autoSaveTimerRef.current) window.clearTimeout(autoSaveTimerRef.current);
+    autoSaveTimerRef.current = window.setTimeout(() => void saveLatestManuscript(), delay);
+  }
+
+  async function saveLatestManuscript(): Promise<Manuscript | null> {
+    if (autoSaveTimerRef.current) {
+      window.clearTimeout(autoSaveTimerRef.current);
+      autoSaveTimerRef.current = null;
+    }
+    if (savePromiseRef.current) {
+      await savePromiseRef.current;
+      return saveLatestManuscript();
+    }
+
+    const currentManuscript = manuscriptRef.current;
+    if (!currentManuscript) return null;
+    if (!hasUnsavedChangesRef.current) return currentManuscript;
+    const snapshotBlocks = blocksRef.current;
+    const serializedSnapshot = JSON.stringify(snapshotBlocks);
+    if (serializedSnapshot === lastSavedBlocksRef.current) {
+      hasUnsavedChangesRef.current = false;
+      return currentManuscript;
+    }
+
+    const deletedBlockIds = pendingDeletedBlockIds();
+    setSaveStatus("自动保存中");
+    const savePromise = pcApi
+      .saveManuscript({ ...currentManuscript, blocks: snapshotBlocks }, { deletedBlockIds })
+      .then((savedManuscript) => {
+        if (manuscriptRef.current?.id !== currentManuscript.id) {
+          updateManuscript(savedManuscript);
+          return savedManuscript;
+        }
+        const latestBlocks = blocksRef.current;
+        const currentSavedBlocks = JSON.stringify(latestBlocks) === serializedSnapshot ? snapshotBlocks : latestBlocks;
+        const nextManuscript = {
+          ...savedManuscript,
+          blocks: currentSavedBlocks,
+        };
+        manuscriptRef.current = nextManuscript;
+        updateManuscript(currentSavedBlocks === snapshotBlocks ? nextManuscript : savedManuscript);
+        lastSavedBlockIdsRef.current = Array.from(
+          new Set([...lastSavedBlockIdsRef.current, ...snapshotBlocks.map((block) => block.id)]),
+        );
+        const currentBlockIds = new Set(currentSavedBlocks.map((block) => block.id));
+        const persistedThenRemovedBlockIds = snapshotBlocks
+          .map((block) => block.id)
+          .filter((blockId) => !currentBlockIds.has(blockId));
+        if (persistedThenRemovedBlockIds.length > 0) {
+          deletedBlockIdsRef.current = Array.from(
+            new Set([...deletedBlockIdsRef.current, ...persistedThenRemovedBlockIds]),
+          );
+        }
+        clearDeletedBlockIds(deletedBlockIds);
+        if (currentSavedBlocks === snapshotBlocks) {
+          lastSavedBlocksRef.current = serializedSnapshot;
+          hasUnsavedChangesRef.current = false;
+          setSaveStatus("已保存");
+        } else {
+          hasUnsavedChangesRef.current = true;
+          setSaveStatus("等待自动保存");
+          scheduleAutoSave(120);
+        }
+        return nextManuscript;
+      })
+      .catch(async (error) => {
+        const serverRevision = getConflictServerRevision(error);
+        if (serverRevision !== null) {
+          if (manuscriptRef.current?.id !== currentManuscript.id) return null;
+          const nextManuscript = { ...currentManuscript, revision: serverRevision, blocks: blocksRef.current };
+          manuscriptRef.current = nextManuscript;
+          savePromiseRef.current = null;
+          setSaveStatus("自动保存中");
+          return saveLatestManuscript();
+        }
+        setSaveStatus("保存失败，将重试");
+        scheduleAutoSave(1600);
+        return null;
+      })
+      .finally(() => {
+        if (savePromiseRef.current === savePromise) savePromiseRef.current = null;
+      });
+    savePromiseRef.current = savePromise;
+    return savePromise;
+  }
+
+  function showProcessingNotice(input: Omit<ProcessingNotice, "id">) {
+    const id = makeId("processing");
+    setProcessingNotices((current) => [...current, { ...input, id }]);
+    return id;
+  }
+
+  function updateProcessingNotice(id: string, patch: Partial<Omit<ProcessingNotice, "id">>) {
+    setProcessingNotices((current) =>
+      current.map((notice) => (notice.id === id ? { ...notice, ...patch } : notice)),
+    );
+  }
+
+  function closeProcessingNotice(id: string) {
+    setProcessingNotices((current) => current.filter((notice) => notice.id !== id));
+  }
+
+  function progressNoticeUpdate(id: string, fallback: string) {
+    return (progress: ConvertProgress) => {
+      const current = typeof progress.current === "number" ? progress.current : null;
+      const total = typeof progress.total === "number" && progress.total > 0 ? progress.total : null;
+      updateProcessingNotice(id, {
+        detail: progress.message || fallback,
+        progress: current !== null && total !== null ? Math.max(0, Math.min(100, Math.round((current / total) * 100))) : null,
+      });
+    };
+  }
 
   const createManuscript = async (): Promise<void> => {
     const nextManuscript = await pcApi.createManuscript("未命名手稿");
@@ -208,15 +362,11 @@ export function ManuscriptPanel(): React.JSX.Element {
       setConvertWarnings([]);
       const title = convertDialog?.title.trim() || `${manuscript.title} 文档`;
       if (!title) return;
-      const hasHandwriting = blocks.some((block) => block.type === "handwriting");
+      const currentBlocks = blocksRef.current;
+      const hasHandwriting = currentBlocks.some((block) => block.type === "handwriting");
       setSaveStatus(hasHandwriting ? "同步手写内容，准备识别转换" : "同步手稿，准备转换");
-      const deletedBlockIds = pendingDeletedBlockIds();
-      const savedManuscript = await pcApi.saveManuscript({ ...manuscript, blocks }, { deletedBlockIds });
-      lastSavedBlocksRef.current = JSON.stringify(savedManuscript.blocks);
-      lastSavedBlockIdsRef.current = savedManuscript.blocks.map((block) => block.id);
-      clearDeletedBlockIds(deletedBlockIds);
-      setBlocks(savedManuscript.blocks);
-      updateManuscript(savedManuscript);
+      const savedManuscript = await saveLatestManuscript();
+      if (!savedManuscript) throw new Error("手稿保存失败，无法转换");
       setSaveStatus(hasHandwriting ? "转换中，后端正在识别手写内容" : "转换中");
       const result = await pcApi.convertManuscript(
         savedManuscript.id,
@@ -249,7 +399,7 @@ export function ManuscriptPanel(): React.JSX.Element {
     block: ManuscriptBlock,
     afterBlockId: string | null = null,
   ) {
-    setBlocks((current) => {
+    setLocalBlocks((current) => {
       const exists = current.some((item) => item.id === block.id);
       return exists
         ? current.map((item) => (item.id === block.id ? block : item))
@@ -264,8 +414,10 @@ export function ManuscriptPanel(): React.JSX.Element {
   ): ManuscriptBlock[] {
     const split = buildSelectedContinuation(afterBlockId);
     if (!split) {
-      applyBlock(block, afterBlockId);
-      return insertAfter(blocks, block, afterBlockId);
+      const nextBlocks = insertAfter(blocksRef.current, block, afterBlockId);
+      setLocalBlocks(nextBlocks);
+      setSaveStatus("等待自动保存");
+      return nextBlocks;
     }
 
     setBlockHeights((current) => ({
@@ -276,11 +428,11 @@ export function ManuscriptPanel(): React.JSX.Element {
       ),
     }));
     const nextBlocks = insertAfter(
-      insertAfter(replaceBlock(blocks, split.updatedSource), block, split.source.id),
+      insertAfter(replaceBlock(blocksRef.current, split.updatedSource), block, split.source.id),
       split.continuation,
       block.id,
     );
-    setBlocks(nextBlocks);
+    setLocalBlocks(nextBlocks);
     setSelected(null);
     setSaveStatus("等待自动保存");
     return nextBlocks;
@@ -289,7 +441,7 @@ export function ManuscriptPanel(): React.JSX.Element {
   function buildSelectedContinuation(afterBlockId: string | null) {
     if (!selected?.strokeIds.length || selected.blockId !== afterBlockId)
       return null;
-    const source = blocks.find(
+    const source = blocksRef.current.find(
       (block): block is HandwritingBlock =>
         block.id === selected.blockId && block.type === "handwriting",
     );
@@ -341,7 +493,7 @@ export function ManuscriptPanel(): React.JSX.Element {
         estimateStrokeHeight(mergedStrokes),
       );
 
-      setBlocks((current) =>
+      setLocalBlocks((current) =>
         current
           .filter((block) => block.id !== blockId && block.id !== next.id)
           .map((block) => (block.id === previous.id ? mergedBlock : block)),
@@ -355,7 +507,7 @@ export function ManuscriptPanel(): React.JSX.Element {
       markBlocksDeleted(blockId, next.id);
       setActiveBlockId(previous.id);
     } else {
-      setBlocks((current) => current.filter((block) => block.id !== blockId));
+      setLocalBlocks((current) => current.filter((block) => block.id !== blockId));
       setBlockHeights((current) => {
         const heights = { ...current };
         delete heights[blockId];
@@ -394,48 +546,70 @@ export function ManuscriptPanel(): React.JSX.Element {
   }
 
   async function insertAudio(afterBlockId: string | null = null) {
+    let noticeId: string | null = null;
     try {
       const file = await window.meetingMate?.selectAudioFile();
       if (!file) return;
-      const audio = await pcApi.transcribeAudio(file);
+      noticeId = showProcessingNotice({
+        kind: "audio",
+        title: "正在处理语音",
+        detail: "正在上传音频文件",
+        progress: null,
+      });
+      const audio = await pcApi.transcribeAudio(
+        file,
+        progressNoticeUpdate(noticeId, "正在转写音频"),
+      );
+      updateProcessingNotice(noticeId, { detail: "正在追加语音块", progress: 100 });
       insertBlockRespectingSelection(createAudioBlock(audio), afterBlockId);
       setMenu(null);
     } catch (error) {
       window.alert(error instanceof Error ? error.message : String(error));
+    } finally {
+      if (noticeId) closeProcessingNotice(noticeId);
     }
   }
 
   async function insertImage(afterBlockId: string | null = null) {
+    let noticeId: string | null = null;
     try {
       if (!manuscript) return;
       const file = await window.meetingMate?.selectImageFile();
       if (!file) return;
+      noticeId = showProcessingNotice({
+        kind: "image",
+        title: "正在处理图像",
+        detail: "正在上传图片文件",
+        progress: null,
+      });
       const image = await pcApi.uploadImageAsset(file);
+      updateProcessingNotice(noticeId, { detail: "正在创建图片块", progress: null });
       if (file.dataUrl) setLocalImageUrls((current) => ({ ...current, [image.assetId]: file.dataUrl ?? "" }));
       const block = createImageBlock({ ...image, caption: "", text: "", taskId: null, generatedAt: null });
-      const nextBlocks = insertBlockRespectingSelection(block, afterBlockId);
+      insertBlockRespectingSelection(block, afterBlockId);
       setMenu(null);
       setSaveStatus("同步图片块");
-      const deletedBlockIds = pendingDeletedBlockIds();
-      const savedManuscript = await pcApi.saveManuscript({ ...manuscript, blocks: nextBlocks }, { deletedBlockIds });
-      lastSavedBlocksRef.current = JSON.stringify(savedManuscript.blocks);
-      lastSavedBlockIdsRef.current = savedManuscript.blocks.map((block) => block.id);
-      clearDeletedBlockIds(deletedBlockIds);
-      updateManuscript(savedManuscript);
+      const savedManuscript = await saveLatestManuscript();
+      if (!savedManuscript) throw new Error("图片块保存失败");
       setRecognizingImageAssetIds((current) => [...current, image.assetId]);
       setSaveStatus("图片识别中");
       try {
-        const result = await pcApi.recognizeImageAsset(image.assetId);
-        const refreshed = await pcApi.getManuscript(manuscript.id);
-        const imageBlock = refreshed.blocks.find((item) => item.type === "image" && item.props.asset_id === image.assetId);
-        const nextBlocks = result.text && imageBlock ? insertAfter(refreshed.blocks, createTextBlock(result.text), imageBlock.id) : refreshed.blocks;
-        const savedWithExtractedTextBlock = await pcApi.saveManuscript({ ...refreshed, blocks: nextBlocks });
-        lastSavedBlocksRef.current = JSON.stringify(savedWithExtractedTextBlock.blocks);
-        lastSavedBlockIdsRef.current = savedWithExtractedTextBlock.blocks.map((block) => block.id);
-        deletedBlockIdsRef.current = [];
-        setBlocks(savedWithExtractedTextBlock.blocks);
-        updateManuscript(savedWithExtractedTextBlock);
-        setSaveStatus("已保存");
+        updateProcessingNotice(noticeId, { detail: "正在识别图片文字", progress: null });
+        const result = await pcApi.recognizeImageAsset(
+          image.assetId,
+          progressNoticeUpdate(noticeId, "正在识别图片文字"),
+        );
+        if (result.text) {
+          updateProcessingNotice(noticeId, { detail: "正在追加识别文本", progress: 100 });
+          const textBlock = createTextBlock(result.text);
+          setLocalBlocks((current) => {
+            const imageBlock = current.find((item) => item.type === "image" && item.props.asset_id === image.assetId);
+            return imageBlock ? insertAfter(current, textBlock, imageBlock.id) : current;
+          });
+          await saveLatestManuscript();
+        } else {
+          await saveLatestManuscript();
+        }
       } catch (error) {
         setSaveStatus("图片文字提取失败");
         window.alert(error instanceof Error ? error.message : "图片文字提取失败，可稍后重试或手动编辑提取文本");
@@ -444,6 +618,8 @@ export function ManuscriptPanel(): React.JSX.Element {
       }
     } catch (error) {
       window.alert(error instanceof Error ? error.message : String(error));
+    } finally {
+      if (noticeId) closeProcessingNotice(noticeId);
     }
   }
 
@@ -544,7 +720,7 @@ export function ManuscriptPanel(): React.JSX.Element {
         estimateStrokeHeight(split.continuation.props.strokes ?? []),
       ),
     }));
-    setBlocks((current) =>
+    setLocalBlocks((current) =>
       insertAfter(
         replaceBlock(current, split.updatedSource),
         split.continuation,
@@ -899,6 +1075,25 @@ export function ManuscriptPanel(): React.JSX.Element {
             </button>
           </div>
         )}
+
+        {processingNotices.length > 0 && (
+          <div className="pc-processing-stack" role="status" aria-live="polite">
+            {processingNotices.map((notice) => (
+              <div className="pc-processing-card" key={notice.id}>
+                <div className="pc-processing-glow" />
+                <div className="pc-processing-content">
+                  <span className="pc-processing-kind">{notice.kind === "audio" ? "Audio" : "Image"}</span>
+                  <strong>{notice.title}</strong>
+                  <small>{notice.detail}</small>
+                  <div className={notice.progress === null ? "pc-processing-bar is-flowing" : "pc-processing-bar"}>
+                    <span style={{ width: `${notice.progress ?? 100}%` }} />
+                  </div>
+                  {notice.progress !== null ? <em>{notice.progress}%</em> : <em>处理中</em>}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
       </section>
 
       <aside className="min-h-0 overflow-auto bg-white p-4">
@@ -1236,8 +1431,8 @@ function HandwritingCanvas({
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const strokesRef = useRef(strokes);
+  const drawingRef = useRef<DrawingState>({ mode: "none" });
   const [width, setWidth] = useState(720);
-  const [drawing, setDrawing] = useState<DrawingState>({ mode: "none" });
   const [lassoPoints, setLassoPoints] = useState<StrokePoint[]>([]);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
 
@@ -1254,6 +1449,10 @@ function HandwritingCanvas({
   const selectedBounds = getStrokeBounds(
     strokes.filter((stroke) => selectedIds.includes(stroke.id)),
   );
+
+  function setDrawing(next: DrawingState) {
+    drawingRef.current = next;
+  }
 
   function start(event: KonvaEventObject<globalThis.PointerEvent>) {
     const point = pointFromEvent(event, width, height, isLast);
@@ -1303,12 +1502,16 @@ function HandwritingCanvas({
     const point = pointFromEvent(event, width, height, isLast);
     if (!point) return;
     event.evt.preventDefault();
+    const drawing = drawingRef.current;
     if (tool === "eraser" && drawing.mode === "erase") return eraseAt(point);
     if (drawing.mode === "draw") {
       maybeExtend(point);
+      const activeStroke =
+        strokesRef.current.find((stroke) => stroke.id === drawing.stroke.id) ??
+        drawing.stroke;
       const nextStroke = {
-        ...drawing.stroke,
-        points: [...drawing.stroke.points, point],
+        ...activeStroke,
+        points: [...activeStroke.points, point],
       };
       setDrawing({ mode: "draw", stroke: nextStroke });
       const current = strokesRef.current.some(
@@ -1349,6 +1552,7 @@ function HandwritingCanvas({
   }
 
   function end() {
+    const drawing = drawingRef.current;
     if (drawing.mode === "lasso") {
       const selected = selectStrokes(strokesRef.current, drawing.points);
       setSelectedIds(selected);
@@ -1492,6 +1696,11 @@ function createAudioBlock(audio: AudioTranscription): ManuscriptBlock {
       speaker_segments: audio.speakerSegments,
     },
   };
+}
+function getConflictServerRevision(error: unknown): number | null {
+  if (!(error instanceof ApiError) || error.code !== "revision_conflict") return null;
+  const value = error.details?.server_revision;
+  return typeof value === "number" ? value : null;
 }
 function createImageBlock(result: ImageRecognitionResult): ManuscriptBlock {
   return {
