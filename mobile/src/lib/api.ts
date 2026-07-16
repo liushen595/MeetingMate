@@ -137,6 +137,10 @@ export class ApiClient {
     return this.request<Manuscript>(`/manuscripts/${id}`);
   }
 
+  deleteManuscript(id: string) {
+    return this.request<void>(`/manuscripts/${id}`, { method: "DELETE" });
+  }
+
   syncManuscriptBlocks(id: string, baseRevision: number, operations: SyncOperation<ManuscriptBlock>[]) {
     return this.request<SyncResponse<ManuscriptBlock>>(`/manuscripts/${id}/blocks`, {
       method: "PUT",
@@ -216,6 +220,10 @@ export class ApiClient {
 
   getDocument(id: string) {
     return this.request<Document>(`/documents/${id}`);
+  }
+
+  deleteDocument(id: string) {
+    return this.request<void>(`/documents/${id}`, { method: "DELETE" });
   }
 
   syncDocumentBlocks(id: string, baseRevision: number, operations: SyncOperation<DocumentBlock>[]) {

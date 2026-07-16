@@ -79,6 +79,16 @@ export default function App() {
         await refreshLibrary();
         navigate(`/documents/${doc.id}`);
       },
+      async deleteManuscript(id: string) {
+        await api.deleteManuscript(id);
+        setManuscripts((current) => current.filter((item) => item.id !== id));
+        await refreshLibrary();
+      },
+      async deleteDocument(id: string) {
+        await api.deleteDocument(id);
+        setDocuments((current) => current.filter((item) => item.id !== id));
+        await refreshLibrary();
+      },
     }),
     [refreshLibrary],
   );
@@ -122,6 +132,8 @@ export default function App() {
             manuscripts={manuscripts}
             onCreateDocument={actions.createDocument}
             onCreateManuscript={actions.createManuscript}
+            onDeleteDocument={actions.deleteDocument}
+            onDeleteManuscript={actions.deleteManuscript}
             onOpenDocument={actions.openDocument}
             onOpenManuscript={actions.openManuscript}
             onRefresh={refreshLibrary}
