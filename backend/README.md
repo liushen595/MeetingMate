@@ -26,6 +26,7 @@ API_PUBLIC_BASE_URL=""
 ASR_PROVIDER="dashscope"
 VISION_PROVIDER="dashscope"
 DASHSCOPE_API_URL="https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api/v1"
+DASHSCOPE_OPENAI_BASE_URL="https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
 DASHSCOPE_API_KEY=""
 DASHSCOPE_ASR_MODEL="qwen3-asr-flash"
 DASHSCOPE_IMAGE_MODEL="qwen-vl-plus"
@@ -56,7 +57,7 @@ DATABASE_COMMAND_TIMEOUT_SECONDS=30
 
 `VISION_PROVIDER="dashscope"` uses DashScope multimodal image recognition. The image model is read from `DASHSCOPE_IMAGE_MODEL` and defaults to `qwen-vl-plus` when unset.
 
-`DASHSCOPE_TEXT_MODEL` is used for text-generation tasks such as cleaning ASR filler words during manuscript conversion. It defaults to `qwen-plus` when unset.
+`DASHSCOPE_TEXT_MODEL` is used for text-generation tasks such as cleaning ASR filler words during manuscript conversion and mobile document Agent tool-call generation. It defaults to `qwen-plus` when unset. The Agent uses DashScope's OpenAI-compatible streaming chat API with `response_format={"type":"json_object"}` and `enable_thinking=true`; set `DASHSCOPE_OPENAI_BASE_URL` when the compatible-mode endpoint cannot be derived from `DASHSCOPE_API_URL`.
 
 ```bash
 uvicorn app.main:app --reload
