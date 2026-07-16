@@ -16,8 +16,8 @@ import {
 } from "../lib/blocks";
 import { DOCUMENT_AGENT_TOOLS_VERSION, buildDocumentAgentContext, safeParseAgentResult, type DocumentAgentResult } from "../lib/documentAgent";
 import { applyDocumentAgentToolCalls, getBlockText, toHeadingBlock, toListBlock, toParagraphBlock, toQuoteBlock } from "../lib/documentAgentTools";
-import { canUseNativeCamera, captureImageFromCamera, readImageFile } from "../lib/media";
-import { readAgentEditSse, readSseText } from "../lib/sse";
+import { canUseNativeCamera, captureImageFromCamera, createPcmRecorder, readImageFile, type PcmRecorder } from "../lib/media";
+import { readAgentEditSse, readAsrSse, readSseText } from "../lib/sse";
 import type { Document, DocumentBlock, SyncOperation, Task } from "../types/api";
 
 interface DocumentEditorProps {
@@ -27,6 +27,9 @@ interface DocumentEditorProps {
 
 type PendingOp = SyncOperation<DocumentBlock>;
 type DocumentSheet = "insert" | "format" | "agent" | "export" | null;
+type VoiceInputState = "idle" | "recording" | "uploading" | "transcribing";
+
+const AGENT_BUSY_MESSAGES = ["正在理解你的修改意图", "正在阅读选中内容", "正在规划文档操作", "正在生成可应用方案"];
 
 export function DocumentEditor({ id, onBack }: DocumentEditorProps) {
   const [document, setDocument] = useState<Document | null>(null);
@@ -41,11 +44,18 @@ export function DocumentEditor({ id, onBack }: DocumentEditorProps) {
   const [agentDraft, setAgentDraft] = useState("");
   const [agentResult, setAgentResult] = useState<DocumentAgentResult | null>(null);
   const [agentStatus, setAgentStatus] = useState("");
+  const [agentBusyStep, setAgentBusyStep] = useState(0);
   const [agentBusy, setAgentBusy] = useState(false);
+  const [voiceInputState, setVoiceInputState] = useState<VoiceInputState>("idle");
+  const [voiceInputMessage, setVoiceInputMessage] = useState("");
   const [task, setTask] = useState<Task | null>(null);
+  const [exportingFormat, setExportingFormat] = useState<"pdf" | "docx" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const imageAfterBlockIdRef = useRef<string | null>(null);
+  const downloadedExportIdsRef = useRef<Set<string>>(new Set());
+  const voiceRecorderRef = useRef<{ recorder: PcmRecorder; startedAt: number } | null>(null);
+  const voiceStartPendingRef = useRef(false);
   const pendingOpsRef = useRef<PendingOp[]>([]);
   const syncTimerRef = useRef<number | null>(null);
   const undoStackRef = useRef<DocumentBlock[][]>([]);
@@ -57,6 +67,11 @@ export function DocumentEditor({ id, onBack }: DocumentEditorProps) {
   const selectedBlocks = useMemo(() => visibleBlocks.filter((block) => selectedIds.includes(block.id)), [selectedIds, visibleBlocks]);
   const formatTargets = selectedBlocks.length > 0 ? selectedBlocks : activeBlock ? [activeBlock] : [];
   const agentScopeLabel = selectedIds.length > 0 ? `${selectedIds.length} 段内容` : "全文";
+  const agentLiveText = useMemo(() => {
+    if (agentBusy && agentDraft.trim()) return lastPreviewLine(agentDraft);
+    if (agentBusy) return agentStatus || AGENT_BUSY_MESSAGES[agentBusyStep % AGENT_BUSY_MESSAGES.length];
+    return agentStatus || agentResult?.summary || "";
+  }, [agentBusy, agentBusyStep, agentDraft, agentResult, agentStatus]);
 
   useEffect(() => {
     let active = true;
@@ -92,17 +107,41 @@ export function DocumentEditor({ id, onBack }: DocumentEditorProps) {
   }, [id]);
 
   useEffect(() => {
-    if (!task || task.status === "succeeded" || task.status === "failed" || task.status === "cancelled") return;
+    if (!task) return;
+    if (task.status === "succeeded") {
+      void downloadExportTask(task);
+      return;
+    }
+    if (task.status === "failed" || task.status === "cancelled") {
+      setExportingFormat(null);
+      setError(task.error?.message ?? "导出失败");
+      return;
+    }
     const timer = window.setInterval(async () => {
-      const next = await api.getTask(task.id);
-      setTask(next);
-      if (next.status === "succeeded" && next.result?.export_id) {
-        const download = await api.getExportDownloadUrl(next.result.export_id);
-        window.open(download.download_url, "_blank");
+      try {
+        const next = await api.getTask(task.id);
+        setTask(next);
+        if (next.status === "succeeded") void downloadExportTask(next);
+        if (next.status === "failed" || next.status === "cancelled") {
+          setExportingFormat(null);
+          setError(next.error?.message ?? "导出失败");
+        }
+      } catch (err) {
+        setExportingFormat(null);
+        setError(err instanceof Error ? err.message : "导出状态查询失败");
       }
     }, 1800);
     return () => window.clearInterval(timer);
   }, [task]);
+
+  useEffect(() => {
+    if (!agentBusy) {
+      setAgentBusyStep(0);
+      return;
+    }
+    const timer = window.setInterval(() => setAgentBusyStep((current) => current + 1), 1200);
+    return () => window.clearInterval(timer);
+  }, [agentBusy]);
 
   function queueOperation(op: PendingOp) {
     if (op.type === "upsert_block" && op.block) {
@@ -287,6 +326,82 @@ export function DocumentEditor({ id, onBack }: DocumentEditorProps) {
     setSheet(null);
   }
 
+  async function startVoiceInput() {
+    if (agentBusy || voiceInputState !== "idle" || voiceRecorderRef.current) return;
+    voiceStartPendingRef.current = true;
+    setError(null);
+    setVoiceInputMessage("正在申请麦克风权限");
+    try {
+      const recorder = await createPcmRecorder();
+      if (!voiceStartPendingRef.current) {
+        await recorder.stop();
+        setVoiceInputMessage("");
+        return;
+      }
+      voiceRecorderRef.current = { recorder, startedAt: Date.now() };
+      setVoiceInputState("recording");
+      setVoiceInputMessage("正在录音，松开后转文字");
+    } catch (err) {
+      voiceStartPendingRef.current = false;
+      setVoiceInputState("idle");
+      setVoiceInputMessage("");
+      setError(err instanceof Error ? err.message : "语音输入启动失败，请检查麦克风权限");
+    }
+  }
+
+  async function stopVoiceInput() {
+    voiceStartPendingRef.current = false;
+    const current = voiceRecorderRef.current;
+    if (!current) return;
+    voiceRecorderRef.current = null;
+    try {
+      const audio = await current.recorder.stop();
+      const durationMs = audio.durationMs || Date.now() - current.startedAt;
+      if (durationMs < 500) {
+        setVoiceInputState("idle");
+        setVoiceInputMessage("录音太短，请按住后再说");
+        window.setTimeout(() => setVoiceInputMessage(""), 1600);
+        return;
+      }
+      await transcribeAgentVoice(audio.blob, audio.contentType, audio.extension, durationMs);
+    } catch (err) {
+      setVoiceInputState("idle");
+      setVoiceInputMessage("");
+      setError(err instanceof Error ? err.message : "语音输入失败");
+    }
+  }
+
+  async function transcribeAgentVoice(blob: Blob, contentType: string, extension: string, durationMs: number) {
+    let assetId: string | null = null;
+    setVoiceInputState("uploading");
+    setVoiceInputMessage("正在上传语音");
+    try {
+      const asset = await api.uploadAsset(blob, { kind: "audio", filename: `agent-voice-${Date.now()}.${extension}`, contentType, durationMs });
+      assetId = asset.id;
+      setVoiceInputState("transcribing");
+      setVoiceInputMessage("正在转成文字");
+      const response = await api.streamAsrAudio(asset.id, { enableDiarization: false });
+      let transcript = "";
+      await readAsrSse(response, {
+        onDelta: (payload) => {
+          transcript = payload.transcript || transcript;
+          if (transcript) setVoiceInputMessage(lastPreviewLine(transcript));
+        },
+        onDone: (nextTask) => {
+          transcript = nextTask.result?.transcript ?? transcript;
+        },
+      });
+      const text = transcript.trim();
+      if (!text) throw new Error("没有识别到可用语音内容");
+      setAgentPrompt((current) => (current.trim() ? `${current.trim()}\n${text}` : text));
+      setVoiceInputMessage("已填入语音指令");
+      window.setTimeout(() => setVoiceInputMessage(""), 1600);
+    } finally {
+      setVoiceInputState("idle");
+      if (assetId) void api.deleteAsset(assetId).catch(() => undefined);
+    }
+  }
+
   async function runAgent() {
     if (!agentPrompt.trim() || !document) return;
     await flushOps();
@@ -376,10 +491,44 @@ export function DocumentEditor({ id, onBack }: DocumentEditorProps) {
   }
 
   async function exportFile(format: "pdf" | "docx") {
-    await flushOps();
-    const nextTask = await api.exportDocument(id, format);
-    setTask(nextTask);
+    setExportingFormat(format);
+    setError(null);
     setSheet(null);
+    try {
+      await flushOps();
+      const nextTask = await api.exportDocument(id, format);
+      setTask(nextTask);
+      if (nextTask.status === "succeeded") await downloadExportTask(nextTask);
+      if (nextTask.status === "failed" || nextTask.status === "cancelled") {
+        setExportingFormat(null);
+        setError(nextTask.error?.message ?? "导出失败");
+      }
+    } catch (err) {
+      setExportingFormat(null);
+      setError(err instanceof Error ? err.message : "导出失败");
+    }
+  }
+
+  async function downloadExportTask(doneTask: Task) {
+    const exportId = doneTask.result?.export_id;
+    if (!exportId) {
+      setExportingFormat(null);
+      setError("导出完成但没有返回文件");
+      return;
+    }
+    if (downloadedExportIdsRef.current.has(exportId)) return;
+    downloadedExportIdsRef.current.add(exportId);
+
+    try {
+      const format = doneTask.result?.format ?? exportingFormat ?? "docx";
+      const blob = await api.downloadExport(exportId);
+      saveBlob(blob, exportFilename(document?.title ?? "document", format));
+    } catch (err) {
+      downloadedExportIdsRef.current.delete(exportId);
+      setError(err instanceof Error ? err.message : "下载导出文件失败");
+    } finally {
+      setExportingFormat(null);
+    }
   }
 
   if (error && !document) return <DocumentMessage title="文档加载失败" message={error} onBack={onBack} />;
@@ -437,6 +586,8 @@ export function DocumentEditor({ id, onBack }: DocumentEditorProps) {
           agentResult={agentResult}
           agentScopeLabel={agentScopeLabel}
           agentStatus={agentStatus}
+          agentLiveText={agentLiveText}
+          exportingFormat={exportingFormat}
           formatTargetCount={formatTargets.length}
           onAgentPromptChange={setAgentPrompt}
           onApplyAgent={applyAgentOutput}
@@ -450,8 +601,12 @@ export function DocumentEditor({ id, onBack }: DocumentEditorProps) {
           onSetAgentPrompt={setAgentPrompt}
           onTransform={transformTargets}
           onUseFullDocument={() => setSelectedIds([])}
+          onVoiceInputStart={() => void startVoiceInput()}
+          onVoiceInputStop={() => void stopVoiceInput()}
           selectedCount={selectedIds.length}
           sheet={sheet}
+          voiceInputMessage={voiceInputMessage}
+          voiceInputState={voiceInputState}
         />
       )}
     </section>
@@ -493,6 +648,8 @@ function DocumentSheetPanel({
   agentResult,
   agentScopeLabel,
   agentStatus,
+  agentLiveText,
+  exportingFormat,
   formatTargetCount,
   selectedCount,
   sheet,
@@ -508,6 +665,10 @@ function DocumentSheetPanel({
   onSetAgentPrompt,
   onTransform,
   onUseFullDocument,
+  onVoiceInputStart,
+  onVoiceInputStop,
+  voiceInputMessage,
+  voiceInputState,
 }: {
   activeBlock: DocumentBlock | null;
   agentBusy: boolean;
@@ -516,6 +677,8 @@ function DocumentSheetPanel({
   agentResult: DocumentAgentResult | null;
   agentScopeLabel: string;
   agentStatus: string;
+  agentLiveText: string;
+  exportingFormat: "pdf" | "docx" | null;
   formatTargetCount: number;
   selectedCount: number;
   sheet: Exclude<DocumentSheet, null>;
@@ -531,7 +694,12 @@ function DocumentSheetPanel({
   onSetAgentPrompt: (value: string) => void;
   onTransform: (kind: "paragraph" | "heading" | "list" | "quote") => void;
   onUseFullDocument: () => void;
+  onVoiceInputStart: () => void;
+  onVoiceInputStop: () => void;
+  voiceInputMessage: string;
+  voiceInputState: VoiceInputState;
 }) {
+  const voiceBusy = voiceInputState !== "idle";
   return (
     <div className="document-sheet-backdrop" onClick={onClose}>
       <section className="document-sheet" onClick={(event) => event.stopPropagation()}>
@@ -582,12 +750,33 @@ function DocumentSheetPanel({
                 "改成会议纪要语气",
               ].map((prompt) => <button key={prompt} onClick={() => onSetAgentPrompt(prompt)} type="button">{prompt}</button>)}
             </div>
-            <textarea onChange={(event) => onAgentPromptChange(event.target.value)} placeholder="例如：把选中内容整理成三条行动项。" value={agentPrompt} />
+            <div className={agentBusy ? "agent-prompt-shell busy" : "agent-prompt-shell"}>
+              <textarea onChange={(event) => onAgentPromptChange(event.target.value)} placeholder="例如：把选中内容整理成三条行动项。" value={agentPrompt} />
+            </div>
+            <button
+              className={voiceBusy ? "agent-voice-button recording" : "agent-voice-button"}
+              disabled={agentBusy}
+              onContextMenu={(event) => event.preventDefault()}
+              onPointerCancel={onVoiceInputStop}
+              onPointerDown={(event) => {
+                event.preventDefault();
+                event.currentTarget.setPointerCapture(event.pointerId);
+                onVoiceInputStart();
+              }}
+              onPointerLeave={(event) => {
+                if (event.buttons === 1) onVoiceInputStop();
+              }}
+              onPointerUp={onVoiceInputStop}
+              type="button"
+            >
+              <strong>{voiceInputState === "recording" ? "松开转文字" : voiceBusy ? "语音处理中" : "按住说话"}</strong>
+              <span>{voiceInputMessage || "说出你想让 AI 做的修改，不会自动发送"}</span>
+            </button>
+            {(agentBusy || agentLiveText) && <AgentLiveStatus busy={agentBusy} text={agentLiveText} />}
             <div className="agent-actions">
               <button className="primary-small" disabled={agentBusy || !agentPrompt.trim()} onClick={onRunAgent} type="button">{agentBusy ? "生成中" : "生成修改"}</button>
               <button disabled={!agentDraft.trim() && !agentResult} onClick={onApplyAgent} type="button">应用</button>
             </div>
-            {agentStatus && <p className="agent-status">{agentStatus}</p>}
             {agentResult && <AgentResultPreview result={agentResult} />}
             {!agentResult && agentDraft && <pre className="agent-draft">{agentDraft}</pre>}
           </div>
@@ -595,8 +784,8 @@ function DocumentSheetPanel({
 
         {sheet === "export" && (
           <div className="sheet-action-grid">
-            <button onClick={() => onExport("pdf")} type="button"><strong>PDF</strong><span>适合快速分享和预览</span></button>
-            <button onClick={() => onExport("docx")} type="button"><strong>DOCX</strong><span>适合继续编辑</span></button>
+            <button disabled={!!exportingFormat} onClick={() => onExport("pdf")} type="button"><strong>{exportingFormat === "pdf" ? "PDF 生成中" : "PDF"}</strong><span>适合快速分享和预览</span></button>
+            <button disabled={!!exportingFormat} onClick={() => onExport("docx")} type="button"><strong>{exportingFormat === "docx" ? "DOCX 生成中" : "DOCX"}</strong><span>适合继续编辑</span></button>
           </div>
         )}
       </section>
@@ -609,6 +798,15 @@ function AgentResultPreview({ result }: { result: DocumentAgentResult }) {
     <div className="agent-result-card">
       <strong>{result.summary || "AI 修改方案"}</strong>
       <span>将执行 {result.tool_calls.length} 个文档操作</span>
+    </div>
+  );
+}
+
+function AgentLiveStatus({ busy, text }: { busy: boolean; text: string }) {
+  return (
+    <div aria-live="polite" className={busy ? "agent-live-status busy" : "agent-live-status"}>
+      <span className="agent-live-dot" />
+      <p>{text || "AI 正在处理"}</p>
     </div>
   );
 }
@@ -721,6 +919,29 @@ function AutoTextarea({ className, value, placeholder, onFocus, onKeyDown, onCha
       value={value}
     />
   );
+}
+
+function lastPreviewLine(text: string) {
+  const lines = text.split("\n").map((line) => line.trim()).filter(Boolean);
+  const line = lines.at(-1) ?? text.trim();
+  return line.length > 120 ? `${line.slice(0, 120)}...` : line;
+}
+
+function saveBlob(blob: Blob, filename: string) {
+  const objectUrl = URL.createObjectURL(blob);
+  const link = globalThis.document.createElement("a");
+  link.href = objectUrl;
+  link.download = filename;
+  link.rel = "noopener";
+  globalThis.document.body.append(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
+}
+
+function exportFilename(title: string, format: "pdf" | "docx") {
+  const safeTitle = title.trim().replace(/[\\/:*?"<>|]+/g, "-").replace(/\s+/g, " ").slice(0, 80) || "document";
+  return `${safeTitle}.${format}`;
 }
 
 function cloneDocumentBlocks(blocks: DocumentBlock[]) {

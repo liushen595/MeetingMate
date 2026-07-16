@@ -626,6 +626,7 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
               {block.type === "image" && (
                 <figure className="image-block">
                   <AssetImage alt="手稿图片原图" assetId={block.props.asset_id} fallbackSrc={localImageUrls[block.props.asset_id]} />
+                  {block.props.caption && <figcaption>{block.props.caption}</figcaption>}
                 </figure>
               )}
               {block.type === "handwriting" && (

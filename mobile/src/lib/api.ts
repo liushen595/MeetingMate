@@ -161,11 +161,11 @@ export class ApiClient {
     });
   }
 
-  streamAsrAudio(assetId: string) {
+  streamAsrAudio(assetId: string, options: { enableDiarization?: boolean } = {}) {
     return this.request<Response>("/tasks/asr-audio/stream", {
       method: "POST",
       idempotent: true,
-      body: JSON.stringify({ asset_id: assetId, language: "zh-CN", enable_diarization: true, client_id: this.clientId }),
+      body: JSON.stringify({ asset_id: assetId, language: "zh-CN", enable_diarization: options.enableDiarization ?? true, client_id: this.clientId }),
     }, true);
   }
 
@@ -196,6 +196,10 @@ export class ApiClient {
     const response = await fetch(`${this.baseUrl}/assets/${assetId}/stream`, { headers });
     if (!response.ok) throw await this.toApiError(response);
     return URL.createObjectURL(await response.blob());
+  }
+
+  deleteAsset(assetId: string) {
+    return this.request<void>(`/assets/${assetId}`, { method: "DELETE" });
   }
 
   listDocuments() {
@@ -232,6 +236,23 @@ export class ApiClient {
 
   getExportDownloadUrl(exportId: string) {
     return this.request<{ download_url: string; expires_at: string }>(`/exports/${exportId}/download`);
+  }
+
+  async downloadExport(exportId: string, retried = false): Promise<Blob> {
+    if (!this.session) throw new Error("请先登录服务器");
+
+    const download = await this.getExportDownloadUrl(exportId);
+    const headers = new Headers();
+    headers.set("Authorization", `Bearer ${this.session.access_token}`);
+    headers.set("X-Client-Id", this.clientId);
+
+    const response = await fetch(download.download_url, { headers });
+    if (response.status === 401 && !retried && this.session.refresh_token) {
+      await this.refreshSession();
+      return this.downloadExport(exportId, true);
+    }
+    if (!response.ok) throw await this.toApiError(response);
+    return response.blob();
   }
 
   async listGroups(): Promise<GroupSummary[]> {
