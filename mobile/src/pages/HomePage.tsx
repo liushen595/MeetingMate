@@ -25,13 +25,11 @@ type MeetingDraft = {
 
 const MEETINGS_KEY = "meetingmate.local.meetings";
 
-const groupApiSpec = [
-  "POST /api/v1/groups - 创建组并返回 6 位口令码",
-  "POST /api/v1/groups/join - 使用 6 位口令码加入组",
-  "GET /api/v1/groups - 获取当前用户加入的组列表",
-  "GET /api/v1/groups/{group_id}/messages - 获取组内文档消息",
-  "POST /api/v1/groups/{group_id}/documents - 发送库中文档到组",
-  "GET /api/v1/groups/{group_id}/documents/{message_id}/download - 下载组内文档",
+const collaborationHighlights = [
+  "6 位口令邀请，有效期一天",
+  "库中文档按发送时快照共享",
+  "组内成员可下载 DOCX 文档",
+  "保留原文档，不影响个人库编辑",
 ];
 
 interface HomePageProps {
@@ -229,21 +227,80 @@ export function HomePage(props: HomePageProps) {
 
   return (
     <section className="screen home-screen">
-      <header className="hero-card">
-        <p className="eyebrow">移动工作台</p>
-        <h1>先记录现场，再让 Agent 整理成文档。</h1>
-        <p>录音、拍照、手写都进入同一张连续稿纸；转换后的文档保留来源引用，可继续手动编辑或交给 AI 修改。</p>
+      <header className="hero-card home-hero">
+        <div className="hero-status-row">
+          <p className="eyebrow">MeetingMate Mobile</p>
+          <span>{props.loading ? "同步中" : "已连接工作区"}</span>
+        </div>
+        <h1>现场素材，直接沉淀成可编辑文档。</h1>
+        <p>录音、图片、手写和文字进入同一份手稿，由云端 ASR、图片识别和 Agent 整理成保留来源引用的正式文档。</p>
+        <div className="hero-metrics" aria-label="工作区概览">
+          <div>
+            <strong>{props.manuscripts.length}</strong>
+            <span>手稿</span>
+          </div>
+          <div>
+            <strong>{props.documents.length}</strong>
+            <span>文档</span>
+          </div>
+          <div>
+            <strong>{groups.length}</strong>
+            <span>协作组</span>
+          </div>
+        </div>
       </header>
 
       <div className="quick-grid">
         <button className="quick-card ink" onClick={() => void props.onCreateManuscript()} type="button">
-          <span>新建手稿</span>
-          <strong>录音 / 图片 / 手写</strong>
+          <span>开始采集</span>
+          <strong>新建现场手稿</strong>
+          <small>录音、拍照、手写都放进一张连续稿纸</small>
         </button>
         <button className="quick-card paper" onClick={() => void props.onCreateDocument()} type="button">
-          <span>新建文档</span>
-          <strong>块编辑 / Agent 修改</strong>
+          <span>开始整理</span>
+          <strong>新建正式文档</strong>
+          <small>块编辑、AI 润色、摘要和续写</small>
         </button>
+      </div>
+
+      <section className="home-workflow" aria-label="核心服务流程">
+        <div>
+          <span>01</span>
+          <strong>采集</strong>
+          <small>音频 / 图片 / 手写</small>
+        </div>
+        <div>
+          <span>02</span>
+          <strong>识别</strong>
+          <small>ASR / 图片理解 / 手写识别</small>
+        </div>
+        <div>
+          <span>03</span>
+          <strong>成文</strong>
+          <small>Agent 整理 / 引用保留</small>
+        </div>
+      </section>
+
+      <div className="section-title-row home-section-row">
+        <h2>最近继续</h2>
+        {props.loading && <span>同步中</span>}
+      </div>
+      <div className="recent-stack home-recent-stack">
+        {latestManuscript && (
+          <button className="library-card home-recent-card" onClick={() => props.onOpenManuscript(latestManuscript.id)} type="button">
+            <span className="card-kind">最近手稿</span>
+            <strong>{latestManuscript.title}</strong>
+            <small>{formatRelativeTime(latestManuscript.updated_at)}</small>
+          </button>
+        )}
+        {latestDocument && (
+          <button className="library-card document home-recent-card" onClick={() => props.onOpenDocument(latestDocument.id)} type="button">
+            <span className="card-kind">最近文档</span>
+            <strong>{latestDocument.title}</strong>
+            <small>{formatRelativeTime(latestDocument.updated_at)}</small>
+          </button>
+        )}
+        {!latestManuscript && !latestDocument && <p className="empty-state home-empty-state">还没有内容。先创建一份手稿，录入现场素材。</p>}
       </div>
 
       <div className="home-dashboard-grid">
@@ -353,33 +410,13 @@ export function HomePage(props: HomePageProps) {
       </div>
 
       <section className="home-panel api-spec-panel">
-        <h2>组功能 API 规范草案</h2>
+        <p className="eyebrow">Collaboration Scope</p>
+        <h2>组协作覆盖范围</h2>
+        <p className="panel-copy">把整理后的文档以快照形式发给成员，适合会后纪要、资料分发和小组复盘。</p>
         <div className="api-spec-grid">
-          {groupApiSpec.map((item) => <code className="api-code" key={item}>{item}</code>)}
+          {collaborationHighlights.map((item) => <span className="api-code" key={item}>{item}</span>)}
         </div>
       </section>
-
-      <div className="section-title-row">
-        <h2>最近继续</h2>
-        {props.loading && <span>同步中</span>}
-      </div>
-      <div className="recent-stack">
-        {latestManuscript && (
-          <button className="library-card" onClick={() => props.onOpenManuscript(latestManuscript.id)} type="button">
-            <span className="card-kind">手稿</span>
-            <strong>{latestManuscript.title}</strong>
-            <small>{formatRelativeTime(latestManuscript.updated_at)}</small>
-          </button>
-        )}
-        {latestDocument && (
-          <button className="library-card document" onClick={() => props.onOpenDocument(latestDocument.id)} type="button">
-            <span className="card-kind">文档</span>
-            <strong>{latestDocument.title}</strong>
-            <small>{formatRelativeTime(latestDocument.updated_at)}</small>
-          </button>
-        )}
-        {!latestManuscript && !latestDocument && <p className="empty-state">还没有内容。先创建一份手稿，录入现场素材。</p>}
-      </div>
 
       {meetingDialog ? (
         <MobileDialog title={meetingDialog.id ? "编辑会议" : "新增会议"} onClose={() => setMeetingDialog(null)}>

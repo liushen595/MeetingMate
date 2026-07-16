@@ -661,13 +661,15 @@ export function ManuscriptEditor({ id, onBack, onOpenDocument }: ManuscriptEdito
       </div>
 
       {menu && (
-        <div className="context-menu" style={{ left: menu.x, top: menu.y }}>
-          <button onClick={() => startRecording(menu.blockId)} type="button">开始录制</button>
-          <button onClick={() => chooseImage(menu.blockId)} type="button">插入图片</button>
-          <button onClick={() => insertText(menu.blockId)} type="button">插入文字</button>
-          {menu.selectedStrokeIds.length > 0 && <button onClick={splitSelectedAsNextLine} type="button">选区作为下一行</button>}
-          {menu.blockId && <button className="danger-menu-button" onClick={() => menu.blockId && deleteManuscriptBlock(menu.blockId)} type="button">删除该块</button>}
-          <button onClick={() => setMenu(null)} type="button">关闭</button>
+        <div className="context-menu-layer" onPointerDown={() => setMenu(null)}>
+          <div className="context-menu" onPointerDown={(event) => event.stopPropagation()} style={{ left: menu.x, top: menu.y }}>
+            <button onClick={() => startRecording(menu.blockId)} type="button">开始录制</button>
+            <button onClick={() => chooseImage(menu.blockId)} type="button">插入图片</button>
+            <button onClick={() => insertText(menu.blockId)} type="button">插入文字</button>
+            {menu.selectedStrokeIds.length > 0 && <button onClick={splitSelectedAsNextLine} type="button">选区作为下一行</button>}
+            {menu.blockId && <button className="danger-menu-button" onClick={() => menu.blockId && deleteManuscriptBlock(menu.blockId)} type="button">删除该块</button>}
+            <button onClick={() => setMenu(null)} type="button">关闭</button>
+          </div>
         </div>
       )}
 
