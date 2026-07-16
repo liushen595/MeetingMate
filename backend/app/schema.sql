@@ -141,6 +141,7 @@ CREATE TABLE IF NOT EXISTS group_document_messages (
 );
 
 CREATE INDEX IF NOT EXISTS idx_group_document_messages_group_sent_at ON group_document_messages(group_id, sent_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_group_document_messages_sender_id ON group_document_messages(sender_id);
 
 CREATE TABLE IF NOT EXISTS document_versions (
     id TEXT PRIMARY KEY,

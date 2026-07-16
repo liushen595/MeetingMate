@@ -54,6 +54,14 @@ MAX_INVITE_CODE_ATTEMPTS = 10
 AGENT_TOOLS_VERSION = "mobile-doc-agent-v1"
 MAX_AGENT_TOOL_CALLS = 20
 AGENT_EDITABLE_BLOCK_TYPES = {"paragraph", "heading", "quote", "code", "list"}
+EXPORT_IMAGE_MAX_SIDE = 1800
+PDF_FONT_CANDIDATES = [
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+    "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+    "/usr/share/fonts/opentype/ipafont-gothic/ipag.ttf",
+]
 DEFAULT_CORS_ORIGIN_REGEX = r"^https?://(localhost|127\.0\.0\.1|10\.(?:\d{1,3}\.){2}\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3})(?::\d+)?$"
 HANDWRITING_BITMAP_CONTENT_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/bmp"}
 HANDWRITING_RENDER_SCALE = 2
@@ -284,8 +292,23 @@ def make_api_upload_url(request: Request, asset_id: str, upload_id: str, part_nu
     return f"{public_api_base_url(request)}{API_PREFIX}/assets/{quote(asset_id, safe='')}/upload-parts/{part_number}?{query}"
 
 
-def make_asset_stream_url(request: Request, asset_id: str) -> str:
-    return f"{public_api_base_url(request)}{API_PREFIX}/assets/{quote(asset_id, safe='')}/stream"
+def asset_stream_signature(asset_id: str, owner_id: str, checksum_sha256: str, expires_at: int) -> str:
+    payload = f"{asset_id}:{owner_id}:{checksum_sha256}:{expires_at}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
+
+
+def make_asset_stream_url(request: Request, record: AssetRecord, expires_at: datetime | None = None) -> str:
+    url = f"{public_api_base_url(request)}{API_PREFIX}/assets/{quote(record.asset.id, safe='')}/stream"
+    if expires_at is None:
+        return url
+    expires_at_ts = int(expires_at.timestamp())
+    query = urlencode(
+        {
+            "expires_at": str(expires_at_ts),
+            "signature": asset_stream_signature(record.asset.id, record.owner_id, record.asset.checksum_sha256, expires_at_ts),
+        }
+    )
+    return f"{url}?{query}"
 
 
 def encode_cursor(offset: int) -> str:
@@ -1486,6 +1509,15 @@ class PostgresRepository:
             for block in document.blocks:
                 if isinstance(block, DocumentImageBlock) and block.props.asset_id == asset_id:
                     return True
+        rows = await self.pool.fetch(
+            "SELECT document_snapshot FROM group_document_messages WHERE sender_id = $1",
+            owner_id,
+        )
+        for row in rows:
+            document = Document.model_validate(parse_jsonb(row["document_snapshot"]))
+            for block in document.blocks:
+                if isinstance(block, DocumentImageBlock) and block.props.asset_id == asset_id:
+                    return True
         return False
 
     async def list_manuscripts(self, owner_id: str, include_deleted: bool = False) -> list[Manuscript]:
@@ -2429,6 +2461,52 @@ def require_asset_content(record: AssetRecord) -> bytes:
     return content
 
 
+def normalize_export_image(record: AssetRecord) -> ExportImage | None:
+    content = asset_content_bytes(record)
+    if not content:
+        return None
+    try:
+        from PIL import Image, ImageOps
+    except ImportError as exc:
+        raise RuntimeError("Pillow is required to render image exports.") from exc
+    try:
+        with Image.open(io.BytesIO(content)) as source:
+            image = ImageOps.exif_transpose(source)
+            if image.mode not in {"RGB", "RGBA"}:
+                image = image.convert("RGBA")
+            image.thumbnail((EXPORT_IMAGE_MAX_SIDE, EXPORT_IMAGE_MAX_SIDE))
+            output = io.BytesIO()
+            image.save(output, format="PNG")
+            width, height = image.size
+    except Exception:
+        return None
+    return ExportImage(
+        asset_id=record.asset.id,
+        filename=f"{record.asset.id}.png",
+        content=output.getvalue(),
+        content_type="image/png",
+        width=width,
+        height=height,
+    )
+
+
+async def collect_export_images(db: PostgresRepository, document: Document, owner_id: str) -> dict[str, ExportImage]:
+    images: dict[str, ExportImage] = {}
+    for block in document.blocks:
+        if block.deleted or not isinstance(block, DocumentImageBlock):
+            continue
+        asset_id = block.props.asset_id
+        if asset_id in images:
+            continue
+        record = await db.get_asset_record(asset_id)
+        if not record or record.owner_id != owner_id or record.asset.kind != "image" or record.asset.status != "ready":
+            continue
+        image = normalize_export_image(record)
+        if image:
+            images[asset_id] = image
+    return images
+
+
 def header_filename_fallback(filename: str, default: str) -> str:
     fallback = "".join(char if 32 <= ord(char) < 127 and char not in {'\\', '/', '"'} else "_" for char in filename).strip()
     return fallback or default
@@ -2898,25 +2976,465 @@ def document_plain_text(document: Document) -> str:
     return "\n".join(parts)
 
 
-def render_export_content(document: Document, export_format: Literal["pdf", "docx"]) -> bytes:
-    text = document_plain_text(document)
-    if export_format == "pdf":
-        payload = text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
-        return (
-            "%PDF-1.4\n"
-            "1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n"
-            "2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n"
-            "3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >> endobj\n"
-            f"4 0 obj << /Length {len(payload) + 32} >> stream\nBT /F1 12 Tf 72 720 Td ({payload}) Tj ET\nendstream endobj\n"
-            "%%EOF\n"
-        ).encode("utf-8")
+@dataclass(frozen=True)
+class ExportLine:
+    text: str
+    style: str = "paragraph"
+    indent: int = 0
+
+
+@dataclass(frozen=True)
+class ExportImage:
+    asset_id: str
+    filename: str
+    content: bytes
+    content_type: str
+    width: int
+    height: int
+
+
+@dataclass(frozen=True)
+class DocxImagePart:
+    relationship_id: str
+    target: str
+    image: ExportImage
+
+
+def export_lines_from_block(block: DocumentBlock) -> list[ExportLine]:
+    props = block.props
+    lines: list[ExportLine] = []
+    if isinstance(props, HeadingProps):
+        lines.append(ExportLine(props.content, f"heading{min(props.level, 6)}"))
+    elif isinstance(props, TextProps):
+        lines.append(ExportLine(props.content))
+    elif isinstance(props, ListProps):
+        for index, item in enumerate(props.items, start=1):
+            marker = f"{index}." if props.style == "numbered" else "-"
+            lines.append(ExportLine(f"{marker} {item}", "list", 1))
+    elif isinstance(props, QuoteProps):
+        lines.append(ExportLine(props.content, "quote", 1))
+    elif isinstance(props, ImageProps):
+        caption = props.caption or ""
+        lines.append(ExportLine(f"图片：{caption}" if caption else "图片", "image", 1))
+    elif isinstance(props, TableProps):
+        for row in props.rows:
+            lines.append(ExportLine(" | ".join(row), "table"))
+    elif isinstance(props, CodeProps):
+        lines.append(ExportLine(props.content, "code"))
+    lines.append(ExportLine(""))
+    return lines
+
+
+def export_lines_from_document(document: Document) -> list[ExportLine]:
+    lines: list[ExportLine] = [ExportLine(document.title, "title"), ExportLine("")]
+    for block in document.blocks:
+        if block.deleted:
+            continue
+        lines.extend(export_lines_from_block(block))
+    return lines
+
+
+def xml_escape_text(value: str) -> str:
+    safe_chars: list[str] = []
+    for char in value:
+        codepoint = ord(char)
+        if char in {"\t", "\n", "\r"} or (0x20 <= codepoint <= 0xD7FF) or (0xE000 <= codepoint <= 0xFFFD) or (0x10000 <= codepoint <= 0x10FFFF):
+            safe_chars.append(char)
+    return "".join(safe_chars).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def xml_escape_attr(value: str) -> str:
+    return xml_escape_text(value).replace('"', "&quot;")
+
+
+def docx_run_properties_xml(run_properties: str) -> str:
+    return f"<w:rPr>{run_properties}</w:rPr>" if run_properties else ""
+
+
+def docx_runs_xml(text: str, run_properties: str = "") -> str:
+    rpr = docx_run_properties_xml(run_properties)
+    parts = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    runs: list[str] = []
+    for index, part in enumerate(parts):
+        if index > 0:
+            runs.append(f"<w:r>{rpr}<w:br/></w:r>")
+        runs.append(f"<w:r>{rpr}<w:t xml:space=\"preserve\">{xml_escape_text(part)}</w:t></w:r>")
+    return "".join(runs)
+
+
+def docx_paragraph_xml(text: str, *, style: str | None = None, paragraph_properties: str = "", run_properties: str = "") -> str:
+    ppr = f"<w:pStyle w:val=\"{style}\"/>" if style else ""
+    ppr += paragraph_properties
+    return f"<w:p>{f'<w:pPr>{ppr}</w:pPr>' if ppr else ''}{docx_runs_xml(text, run_properties)}</w:p>"
+
+
+def docx_table_xml(rows: list[list[str]]) -> str:
+    column_count = max((len(row) for row in rows), default=1) or 1
+    cell_width = max(9000 // column_count, 1)
+    grid = "".join(f"<w:gridCol w:w=\"{cell_width}\"/>" for _ in range(column_count))
+    table_rows: list[str] = []
+    for row in rows:
+        cells = []
+        for cell in row:
+            cells.append(
+                "<w:tc>"
+                f"<w:tcPr><w:tcW w:w=\"{cell_width}\" w:type=\"dxa\"/></w:tcPr>"
+                f"{docx_paragraph_xml(cell)}"
+                "</w:tc>"
+            )
+        for _ in range(column_count - len(row)):
+            cells.append(
+                "<w:tc>"
+                f"<w:tcPr><w:tcW w:w=\"{cell_width}\" w:type=\"dxa\"/></w:tcPr>"
+                f"{docx_paragraph_xml('')}"
+                "</w:tc>"
+            )
+        table_rows.append(f"<w:tr>{''.join(cells)}</w:tr>")
+    return (
+        "<w:tbl>"
+        "<w:tblPr><w:tblW w:w=\"0\" w:type=\"auto\"/>"
+        "<w:tblBorders>"
+        "<w:top w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"CBD5E1\"/>"
+        "<w:left w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"CBD5E1\"/>"
+        "<w:bottom w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"CBD5E1\"/>"
+        "<w:right w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"CBD5E1\"/>"
+        "<w:insideH w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"CBD5E1\"/>"
+        "<w:insideV w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"CBD5E1\"/>"
+        "</w:tblBorders></w:tblPr>"
+        f"<w:tblGrid>{grid}</w:tblGrid>"
+        f"{''.join(table_rows)}"
+        "</w:tbl>"
+    )
+
+
+def docx_image_extent(width: int, height: int) -> tuple[int, int]:
+    max_width_emu = 5_700_000
+    max_height_emu = 7_500_000
+    width_emu = max(width, 1) * 9525
+    height_emu = max(height, 1) * 9525
+    scale = min(max_width_emu / width_emu, max_height_emu / height_emu, 1)
+    return int(width_emu * scale), int(height_emu * scale)
+
+
+def docx_image_xml(image: ExportImage, relationship_id: str, doc_pr_id: int, caption: str | None) -> str:
+    cx, cy = docx_image_extent(image.width, image.height)
+    description = xml_escape_attr(caption or image.filename)
+    return (
+        "<w:p><w:r><w:drawing>"
+        "<wp:inline distT=\"0\" distB=\"0\" distL=\"0\" distR=\"0\">"
+        f"<wp:extent cx=\"{cx}\" cy=\"{cy}\"/>"
+        "<wp:effectExtent l=\"0\" t=\"0\" r=\"0\" b=\"0\"/>"
+        f"<wp:docPr id=\"{doc_pr_id}\" name=\"Picture {doc_pr_id}\" descr=\"{description}\"/>"
+        "<wp:cNvGraphicFramePr><a:graphicFrameLocks noChangeAspect=\"1\"/></wp:cNvGraphicFramePr>"
+        "<a:graphic><a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">"
+        "<pic:pic>"
+        "<pic:nvPicPr>"
+        f"<pic:cNvPr id=\"{doc_pr_id}\" name=\"{xml_escape_attr(image.filename)}\" descr=\"{description}\"/>"
+        "<pic:cNvPicPr/>"
+        "</pic:nvPicPr>"
+        "<pic:blipFill>"
+        f"<a:blip r:embed=\"{relationship_id}\"/>"
+        "<a:stretch><a:fillRect/></a:stretch>"
+        "</pic:blipFill>"
+        "<pic:spPr>"
+        "<a:xfrm><a:off x=\"0\" y=\"0\"/>"
+        f"<a:ext cx=\"{cx}\" cy=\"{cy}\"/></a:xfrm>"
+        "<a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom>"
+        "</pic:spPr>"
+        "</pic:pic>"
+        "</a:graphicData></a:graphic>"
+        "</wp:inline>"
+        "</w:drawing></w:r></w:p>"
+    )
+
+
+def docx_document_xml(document: Document, images: dict[str, ExportImage], image_parts: list[DocxImagePart]) -> str:
+    elements: list[str] = [docx_paragraph_xml(document.title, style="Title")]
+    for block in document.blocks:
+        if block.deleted:
+            continue
+        props = block.props
+        if isinstance(props, HeadingProps):
+            elements.append(docx_paragraph_xml(props.content, style=f"Heading{min(props.level, 6)}"))
+        elif isinstance(props, TextProps):
+            elements.append(docx_paragraph_xml(props.content))
+        elif isinstance(props, ListProps):
+            num_id = "2" if props.style == "numbered" else "1"
+            paragraph_properties = f"<w:numPr><w:ilvl w:val=\"0\"/><w:numId w:val=\"{num_id}\"/></w:numPr>"
+            for item in props.items:
+                elements.append(docx_paragraph_xml(item, paragraph_properties=paragraph_properties))
+        elif isinstance(props, QuoteProps):
+            elements.append(docx_paragraph_xml(props.content, style="Quote", run_properties="<w:i/>"))
+        elif isinstance(props, ImageProps):
+            caption = props.caption or ""
+            image = images.get(props.asset_id)
+            if image:
+                relationship_id = f"rId{len(image_parts) + 3}"
+                target = f"media/image{len(image_parts) + 1}.png"
+                image_parts.append(DocxImagePart(relationship_id=relationship_id, target=target, image=image))
+                elements.append(docx_image_xml(image, relationship_id, len(image_parts), caption))
+                if caption:
+                    elements.append(docx_paragraph_xml(caption, style="Caption"))
+            else:
+                elements.append(docx_paragraph_xml(f"图片：{caption}" if caption else "图片", style="Caption"))
+        elif isinstance(props, TableProps) and props.rows:
+            elements.append(docx_table_xml(props.rows))
+        elif isinstance(props, CodeProps):
+            elements.append(
+                docx_paragraph_xml(
+                    props.content,
+                    style="Code",
+                    run_properties="<w:rFonts w:ascii=\"Consolas\" w:hAnsi=\"Consolas\" w:eastAsia=\"Consolas\"/><w:sz w:val=\"20\"/>",
+                )
+            )
+    body = "".join(elements)
+    return (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+        "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" "
+        "xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" "
+        "xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\" "
+        "xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" "
+        "xmlns:pic=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">"
+        f"<w:body>{body}"
+        "<w:sectPr><w:pgSz w:w=\"11906\" w:h=\"16838\"/>"
+        "<w:pgMar w:top=\"1440\" w:right=\"1440\" w:bottom=\"1440\" w:left=\"1440\" w:header=\"720\" w:footer=\"720\" w:gutter=\"0\"/>"
+        "</w:sectPr></w:body></w:document>"
+    )
+
+
+def docx_styles_xml() -> str:
+    heading_styles = "".join(
+        f"<w:style w:type=\"paragraph\" w:styleId=\"Heading{level}\"><w:name w:val=\"heading {level}\"/>"
+        f"<w:basedOn w:val=\"Normal\"/><w:next w:val=\"Normal\"/><w:qFormat/>"
+        f"<w:pPr><w:keepNext/><w:spacing w:before=\"{max(240 - level * 20, 120)}\" w:after=\"120\"/></w:pPr>"
+        f"<w:rPr><w:b/><w:sz w:val=\"{max(32 - level * 2, 22)}\"/></w:rPr></w:style>"
+        for level in range(1, 7)
+    )
+    return (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+        "<w:styles xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">"
+        "<w:style w:type=\"paragraph\" w:default=\"1\" w:styleId=\"Normal\"><w:name w:val=\"Normal\"/>"
+        "<w:qFormat/><w:pPr><w:spacing w:after=\"120\" w:line=\"276\" w:lineRule=\"auto\"/></w:pPr><w:rPr><w:sz w:val=\"22\"/></w:rPr></w:style>"
+        "<w:style w:type=\"paragraph\" w:styleId=\"Title\"><w:name w:val=\"Title\"/><w:basedOn w:val=\"Normal\"/><w:next w:val=\"Normal\"/><w:qFormat/>"
+        "<w:pPr><w:spacing w:after=\"300\"/><w:jc w:val=\"center\"/></w:pPr><w:rPr><w:b/><w:sz w:val=\"36\"/></w:rPr></w:style>"
+        f"{heading_styles}"
+        "<w:style w:type=\"paragraph\" w:styleId=\"Quote\"><w:name w:val=\"Quote\"/><w:basedOn w:val=\"Normal\"/><w:qFormat/>"
+        "<w:pPr><w:ind w:left=\"720\"/><w:spacing w:before=\"120\" w:after=\"120\"/></w:pPr><w:rPr><w:i/><w:color w:val=\"64748B\"/></w:rPr></w:style>"
+        "<w:style w:type=\"paragraph\" w:styleId=\"Caption\"><w:name w:val=\"Caption\"/><w:basedOn w:val=\"Normal\"/><w:qFormat/>"
+        "<w:pPr><w:ind w:left=\"360\"/><w:spacing w:before=\"80\" w:after=\"160\"/></w:pPr><w:rPr><w:i/><w:color w:val=\"475569\"/></w:rPr></w:style>"
+        "<w:style w:type=\"paragraph\" w:styleId=\"Code\"><w:name w:val=\"Code\"/><w:basedOn w:val=\"Normal\"/><w:qFormat/>"
+        "<w:pPr><w:spacing w:before=\"120\" w:after=\"120\"/><w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"F1F5F9\"/></w:pPr>"
+        "<w:rPr><w:rFonts w:ascii=\"Consolas\" w:hAnsi=\"Consolas\" w:eastAsia=\"Consolas\"/><w:sz w:val=\"20\"/></w:rPr></w:style>"
+        "</w:styles>"
+    )
+
+
+def docx_numbering_xml() -> str:
+    return (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+        "<w:numbering xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">"
+        "<w:abstractNum w:abstractNumId=\"1\"><w:lvl w:ilvl=\"0\"><w:start w:val=\"1\"/><w:numFmt w:val=\"bullet\"/>"
+        "<w:lvlText w:val=\"&#8226;\"/><w:lvlJc w:val=\"left\"/><w:pPr><w:ind w:left=\"720\" w:hanging=\"360\"/></w:pPr></w:lvl></w:abstractNum>"
+        "<w:abstractNum w:abstractNumId=\"2\"><w:lvl w:ilvl=\"0\"><w:start w:val=\"1\"/><w:numFmt w:val=\"decimal\"/>"
+        "<w:lvlText w:val=\"%1.\"/><w:lvlJc w:val=\"left\"/><w:pPr><w:ind w:left=\"720\" w:hanging=\"360\"/></w:pPr></w:lvl></w:abstractNum>"
+        "<w:num w:numId=\"1\"><w:abstractNumId w:val=\"1\"/></w:num>"
+        "<w:num w:numId=\"2\"><w:abstractNumId w:val=\"2\"/></w:num>"
+        "</w:numbering>"
+    )
+
+
+def docx_image_relationships_xml(image_parts: list[DocxImagePart]) -> str:
+    return "".join(
+        f"<Relationship Id=\"{part.relationship_id}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\" Target=\"{part.target}\"/>"
+        for part in image_parts
+    )
+
+
+def render_docx_content(document: Document, images: dict[str, ExportImage]) -> bytes:
+    image_parts: list[DocxImagePart] = []
+    document_xml = docx_document_xml(document, images, image_parts)
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("[Content_Types].xml", "<?xml version='1.0' encoding='UTF-8'?><Types xmlns='http://schemas.openxmlformats.org/package/2006/content-types'><Default Extension='rels' ContentType='application/vnd.openxmlformats-package.relationships+xml'/><Default Extension='xml' ContentType='application/xml'/><Override PartName='/word/document.xml' ContentType='application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml'/></Types>")
-        archive.writestr("_rels/.rels", "<?xml version='1.0' encoding='UTF-8'?><Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'><Relationship Id='rId1' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument' Target='word/document.xml'/></Relationships>")
-        escaped = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        archive.writestr("word/document.xml", f"<?xml version='1.0' encoding='UTF-8'?><w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'><w:body><w:p><w:r><w:t>{escaped}</w:t></w:r></w:p></w:body></w:document>")
+        archive.writestr(
+            "[Content_Types].xml",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+            "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">"
+            "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>"
+            "<Default Extension=\"xml\" ContentType=\"application/xml\"/>"
+            "<Default Extension=\"png\" ContentType=\"image/png\"/>"
+            "<Override PartName=\"/word/document.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/>"
+            "<Override PartName=\"/word/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml\"/>"
+            "<Override PartName=\"/word/numbering.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml\"/>"
+            "</Types>",
+        )
+        archive.writestr(
+            "_rels/.rels",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+            "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+            "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"word/document.xml\"/>"
+            "</Relationships>",
+        )
+        archive.writestr(
+            "word/_rels/document.xml.rels",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+            "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+            "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>"
+            "<Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering\" Target=\"numbering.xml\"/>"
+            f"{docx_image_relationships_xml(image_parts)}"
+            "</Relationships>",
+        )
+        archive.writestr("word/document.xml", document_xml)
+        archive.writestr("word/styles.xml", docx_styles_xml())
+        archive.writestr("word/numbering.xml", docx_numbering_xml())
+        for part in image_parts:
+            archive.writestr(f"word/{part.target}", part.image.content)
     return buffer.getvalue()
+
+
+def pdf_font_size(style: str) -> int:
+    if style == "title":
+        return 28
+    if style.startswith("heading"):
+        try:
+            level = int(style.removeprefix("heading"))
+        except ValueError:
+            level = 3
+        return max(26 - level * 2, 16)
+    if style == "code":
+        return 15
+    return 17
+
+
+def pdf_font_path() -> str:
+    configured = os.getenv("MEETINGMATE_PDF_FONT_PATH")
+    candidates = [configured] if configured else []
+    candidates.extend(PDF_FONT_CANDIDATES)
+    for candidate in candidates:
+        if candidate and Path(candidate).exists():
+            return candidate
+    raise RuntimeError("No font available for PDF export.")
+
+
+def pdf_text_bbox(font: Any, text: str) -> tuple[int, int, int, int]:
+    return font.getbbox(text or " ")
+
+
+def pdf_wrap_text(text: str, font: Any, max_width: int) -> list[str]:
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    wrapped: list[str] = []
+    for part in normalized.split("\n"):
+        if not part:
+            wrapped.append("")
+            continue
+        current = ""
+        for char in part:
+            candidate = current + char
+            left, _, right, _ = pdf_text_bbox(font, candidate)
+            if current and right - left > max_width:
+                wrapped.append(current)
+                current = char
+            else:
+                current = candidate
+        wrapped.append(current)
+    return wrapped or [""]
+
+
+def pdf_line_color(style: str) -> tuple[int, int, int]:
+    if style == "quote":
+        return (71, 85, 105)
+    if style == "image":
+        return (100, 116, 139)
+    return (15, 23, 42)
+
+
+def render_pdf_content(document: Document, images: dict[str, ExportImage]) -> bytes:
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError as exc:
+        raise RuntimeError("Pillow is required to render PDF exports.") from exc
+
+    font_path = pdf_font_path()
+    page_width = 1240
+    page_height = 1754
+    margin_x = 120
+    margin_top = 120
+    margin_bottom = 120
+    pages: list[Any] = []
+    page = Image.new("RGB", (page_width, page_height), "white")
+    draw = ImageDraw.Draw(page)
+    y = margin_top
+    font_cache: dict[int, Any] = {}
+
+    def font(size: int) -> Any:
+        if size not in font_cache:
+            font_cache[size] = ImageFont.truetype(font_path, size)
+        return font_cache[size]
+
+    def new_page() -> None:
+        nonlocal page, draw, y
+        pages.append(page)
+        page = Image.new("RGB", (page_width, page_height), "white")
+        draw = ImageDraw.Draw(page)
+        y = margin_top
+
+    def draw_export_line(line: ExportLine) -> None:
+        nonlocal y
+        font_size = pdf_font_size(line.style)
+        current_font = font(font_size)
+        line_height = int(font_size * (1.65 if line.style == "title" else 1.45))
+        indent_width = line.indent * 36
+        max_width = page_width - margin_x * 2 - indent_width
+        for text in pdf_wrap_text(line.text, current_font, max_width):
+            if y + line_height > page_height - margin_bottom:
+                new_page()
+            if text:
+                draw.text((margin_x + indent_width, y), text, font=current_font, fill=pdf_line_color(line.style))
+            y += line_height
+
+    def draw_export_image(image: ExportImage) -> None:
+        nonlocal y
+        try:
+            with Image.open(io.BytesIO(image.content)) as source:
+                picture = source.convert("RGBA")
+        except Exception:
+            return
+        max_width = page_width - margin_x * 2
+        max_height = 760
+        picture.thumbnail((max_width, max_height))
+        if y + picture.height > page_height - margin_bottom:
+            new_page()
+        background = Image.new("RGB", picture.size, "white")
+        background.paste(picture, mask=picture.getchannel("A"))
+        page.paste(background, (margin_x, y))
+        y += picture.height + 18
+
+    draw_export_line(ExportLine(document.title, "title"))
+    draw_export_line(ExportLine(""))
+    for block in document.blocks:
+        if block.deleted:
+            continue
+        if isinstance(block, DocumentImageBlock):
+            image = images.get(block.props.asset_id)
+            if image:
+                draw_export_image(image)
+                if block.props.caption:
+                    draw_export_line(ExportLine(block.props.caption, "image", 1))
+                draw_export_line(ExportLine(""))
+                continue
+        for line in export_lines_from_block(block):
+            draw_export_line(line)
+    pages.append(page)
+
+    buffer = io.BytesIO()
+    pages[0].save(buffer, format="PDF", save_all=True, append_images=pages[1:], resolution=150.0)
+    return buffer.getvalue()
+
+
+def render_export_content(document: Document, export_format: Literal["pdf", "docx"], images: dict[str, ExportImage] | None = None) -> bytes:
+    image_map = images or {}
+    if export_format == "pdf":
+        return render_pdf_content(document, image_map)
+    return render_docx_content(document, image_map)
 
 
 def speaker_segments_from_asr(result: AsrResult) -> list[SpeakerSegment]:
@@ -3938,8 +4456,33 @@ async def get_asset(asset_id: str, ctx: AuthContext = Depends(auth_context), db:
 
 
 @router.get("/assets/{asset_id}/stream")
-async def stream_asset(asset_id: str, ctx: AuthContext = Depends(auth_context), db: PostgresRepository = Depends(get_repository)) -> Response:
-    record = await get_asset_record(db, asset_id, ctx.user_id)
+async def stream_asset(
+    asset_id: str,
+    expires_at: int | None = None,
+    signature: str | None = None,
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)] = None,
+    db: PostgresRepository = Depends(get_repository),
+) -> Response:
+    record = await db.get_asset_record(asset_id)
+    if not record:
+        raise APIError(status.HTTP_404_NOT_FOUND, "not_found", "Asset not found.")
+    if credentials and credentials.scheme.lower() == "bearer":
+        session = await db.get_token_session(credentials.credentials.strip(), "access")
+        if not session or session.expires_at <= utcnow():
+            raise APIError(status.HTTP_401_UNAUTHORIZED, "unauthorized", "Access token is missing, expired, or invalid.")
+        user_record = await db.get_user_record(session.user_id)
+        if not user_record:
+            raise APIError(status.HTTP_401_UNAUTHORIZED, "unauthorized", "Access token is missing, expired, or invalid.")
+        assert_owner(session.user_id, record.owner_id)
+        await db.touch_device(session.user_id, session.client_id)
+    elif expires_at is not None and signature and record.asset.kind == "export":
+        if expires_at <= int(utcnow().timestamp()):
+            raise APIError(status.HTTP_403_FORBIDDEN, "forbidden", "Download URL has expired.")
+        expected_signature = asset_stream_signature(record.asset.id, record.owner_id, record.asset.checksum_sha256, expires_at)
+        if not secrets.compare_digest(signature, expected_signature):
+            raise APIError(status.HTTP_403_FORBIDDEN, "forbidden", "Download URL signature is invalid.")
+    else:
+        raise APIError(status.HTTP_401_UNAUTHORIZED, "unauthorized", "Authorization bearer token is required.")
     content = asset_content_bytes(record)
     if content is not None and record.asset.status in {"uploaded", "ready"}:
         return Response(
@@ -4394,7 +4937,8 @@ async def download_group_document(
     record = await db.get_group_document_message_record(group_id, message_id)
     if not record:
         raise APIError(status.HTTP_404_NOT_FOUND, "not_found", "Group document message not found.")
-    content = render_export_content(record.document_snapshot, export_format)
+    images = await collect_export_images(db, record.document_snapshot, record.message.sender_id)
+    content = render_export_content(record.document_snapshot, export_format, images)
     filename = f"{record.message.document_title}.{export_format}"
     content_type = "application/pdf" if export_format == "pdf" else "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     return Response(
@@ -4605,7 +5149,8 @@ async def create_export(
     asset_id = new_id("asset")
     filename = f"{document.id}.{payload.format}"
     content_type = "application/pdf" if payload.format == "pdf" else "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-    content = render_export_content(document, payload.format)
+    images = await collect_export_images(db, document, ctx.user_id)
+    content = render_export_content(document, payload.format, images)
     checksum = hashlib.sha256(content).hexdigest()
     asset = Asset(
         id=asset_id,
@@ -4659,9 +5204,11 @@ async def download_export(
 ) -> ExportDownloadResponse:
     record = await get_export_record(db, export_id, ctx.user_id)
     await get_document(db, record.document_id, ctx.user_id)
+    asset_record = await get_asset_record(db, record.asset_id, ctx.user_id)
+    expires_at = utcnow() + timedelta(minutes=15)
     return ExportDownloadResponse(
-        download_url=make_asset_stream_url(request, record.asset_id),
-        expires_at=utcnow() + timedelta(minutes=15),
+        download_url=make_asset_stream_url(request, asset_record, expires_at),
+        expires_at=expires_at,
     )
 
 

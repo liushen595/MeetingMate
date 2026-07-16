@@ -3,8 +3,11 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import io
 import json
 import os
+import xml.etree.ElementTree as ET
+import zipfile
 from datetime import datetime, timezone
 
 from fastapi.testclient import TestClient
@@ -299,6 +302,12 @@ class TestRepository:
             for block in document.blocks:
                 if isinstance(block, backend.DocumentImageBlock) and block.props.asset_id == asset_id:
                     return True
+        for record in self.group_messages.values():
+            if record.message.sender_id != owner_id:
+                continue
+            for block in record.document_snapshot.blocks:
+                if isinstance(block, backend.DocumentImageBlock) and block.props.asset_id == asset_id:
+                    return True
         return False
 
     async def list_manuscripts(self, owner_id: str, include_deleted: bool = False) -> list[backend.Manuscript]:
@@ -493,6 +502,15 @@ def upload_single_part(upload_response, content: bytes) -> dict:
     return metadata
 
 
+def make_test_png(width: int = 24, height: int = 16) -> bytes:
+    from PIL import Image
+
+    image = Image.new("RGB", (width, height), (30, 144, 255))
+    output = io.BytesIO()
+    image.save(output, format="PNG")
+    return output.getvalue()
+
+
 def upload_ready_image(auth: dict, device_id: str, idempotency_prefix: str, content: bytes = b"fake-png-image") -> str:
     checksum = hashlib.sha256(content).hexdigest()
     upload = client.post(
@@ -558,6 +576,41 @@ def create_agent_document(auth: dict, device_id: str = "device_agent") -> tuple[
     return response.json()["id"], response.json()["blocks"][0]["props"]["content"]
 
 
+def export_test_document() -> backend.Document:
+    now = backend.utcnow()
+    base = {
+        "revision": 1,
+        "created_at": now,
+        "updated_at": now,
+        "author_id": "user_export",
+        "client_id": "device_export",
+        "platform": "web",
+        "deleted": False,
+        "source_refs": [],
+    }
+    return backend.Document(
+        id="doc_export",
+        title="会议纪要",
+        owner_id="user_export",
+        source_manuscript_ids=[],
+        derived_from=None,
+        revision=1,
+        permission="owner",
+        created_at=now,
+        updated_at=now,
+        blocks=[
+            backend.DocumentHeadingBlock(id="doc_heading", type="heading", props=backend.HeadingProps(level=2, content="议题"), **base),
+            backend.DocumentParagraphBlock(id="doc_paragraph", type="paragraph", props=backend.TextProps(content="第一段 & 下一步 <同步>"), **base),
+            backend.DocumentListBlock(id="doc_bullet", type="list", props=backend.ListProps(style="bullet", items=["项目一", "项目二"]), **base),
+            backend.DocumentListBlock(id="doc_numbered", type="list", props=backend.ListProps(style="numbered", items=["第一步", "第二步"]), **base),
+            backend.DocumentQuoteBlock(id="doc_quote", type="quote", props=backend.QuoteProps(content="重要引用"), **base),
+            backend.DocumentImageBlock(id="doc_image", type="image", props=backend.ImageProps(asset_id="asset_image", caption="白板图"), **base),
+            backend.DocumentTableBlock(id="doc_table", type="table", props=backend.TableProps(rows=[["事项", "负责人"], ["导出", "小李"]]), **base),
+            backend.DocumentCodeBlock(id="doc_code", type="code", props=backend.CodeProps(language="python", content="print('ok')\nreturn 1"), **base),
+        ],
+    )
+
+
 def agent_payload(document_id: str, text: str, overrides: dict | None = None) -> dict:
     payload = {
         "document_id": document_id,
@@ -595,6 +648,137 @@ def sse_events(text: str, event_name: str) -> list[dict]:
             if line.startswith("data: "):
                 payloads.append(json.loads(line.removeprefix("data: ")))
     return payloads
+
+
+def test_pdf_export_has_valid_cross_reference_table_and_unicode_text() -> None:
+    content = backend.render_export_content(export_test_document(), "pdf")
+
+    assert content.startswith(b"%PDF-")
+    assert content.rstrip().endswith(b"%%EOF")
+    assert b"xref\n0 " in content
+    assert b"trailer" in content
+    assert b"/Subtype /Image" in content
+    assert b"STSong-Light" not in content
+    assert backend.pdf_font_path()
+
+    xref_index = content.index(b"xref\n")
+    xref_lines = content[xref_index:].splitlines()
+    object_count = int(xref_lines[1].split()[1])
+    offsets = [int(line.split()[0]) for line in xref_lines[3 : 3 + object_count - 1]]
+    for object_id, offset in enumerate(offsets, start=1):
+        assert content[offset:].startswith(f"{object_id} 0 obj".encode("ascii"))
+
+
+def test_docx_export_maps_document_block_types_to_word_formatting() -> None:
+    content = backend.render_export_content(export_test_document(), "docx")
+    namespace = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+
+    with zipfile.ZipFile(io.BytesIO(content)) as archive:
+        assert archive.testzip() is None
+        names = set(archive.namelist())
+        assert "word/document.xml" in names
+        assert "word/styles.xml" in names
+        assert "word/numbering.xml" in names
+        document_xml = archive.read("word/document.xml")
+        styles_xml = archive.read("word/styles.xml")
+        numbering_xml = archive.read("word/numbering.xml")
+
+    document = ET.fromstring(document_xml)
+    styles = ET.fromstring(styles_xml)
+    numbering = ET.fromstring(numbering_xml)
+    paragraphs = document.findall(".//w:p", namespace)
+
+    def paragraph_text(paragraph: ET.Element) -> str:
+        return "".join(node.text or "" for node in paragraph.findall(".//w:t", namespace))
+
+    def paragraph_style(paragraph: ET.Element) -> str | None:
+        style = paragraph.find("./w:pPr/w:pStyle", namespace)
+        return style.attrib.get(f"{{{namespace['w']}}}val") if style is not None else None
+
+    def paragraph_num_id(paragraph: ET.Element) -> str | None:
+        num_id = paragraph.find("./w:pPr/w:numPr/w:numId", namespace)
+        return num_id.attrib.get(f"{{{namespace['w']}}}val") if num_id is not None else None
+
+    text_to_paragraph = {paragraph_text(paragraph): paragraph for paragraph in paragraphs}
+    assert paragraph_style(text_to_paragraph["会议纪要"]) == "Title"
+    assert paragraph_style(text_to_paragraph["议题"]) == "Heading2"
+    assert paragraph_text(text_to_paragraph["第一段 & 下一步 <同步>"]) == "第一段 & 下一步 <同步>"
+    assert paragraph_num_id(text_to_paragraph["项目一"]) == "1"
+    assert paragraph_num_id(text_to_paragraph["第一步"]) == "2"
+    assert paragraph_style(text_to_paragraph["重要引用"]) == "Quote"
+    assert paragraph_style(text_to_paragraph["图片：白板图"]) == "Caption"
+    assert document.find(".//w:tbl", namespace) is not None
+    assert len(text_to_paragraph["print('ok')return 1"].findall(".//w:br", namespace)) == 1
+    assert styles.find(".//w:style[@w:styleId='Code']", namespace) is not None
+    assert numbering.find(".//w:num[@w:numId='1']", namespace) is not None
+    assert numbering.find(".//w:num[@w:numId='2']", namespace) is not None
+
+
+def test_document_export_embeds_image_assets_in_docx_and_pdf() -> None:
+    repo.reset()
+    auth = register_user("export-image@example.com", "device_export_image")
+    image_content = make_test_png(80, 50)
+    asset_id = upload_ready_image(auth, "device_export_image", "idem_export_image_asset", image_content)
+    created_at = iso_now()
+    document = client.post(
+        "/api/v1/documents",
+        json={
+            "title": "带图文档",
+            "client_id": "device_export_image",
+            "source_manuscript_ids": [],
+            "derived_from": None,
+            "initial_blocks": [
+                {
+                    "id": "doc_image_export",
+                    "type": "image",
+                    "revision": 1,
+                    "created_at": created_at,
+                    "updated_at": created_at,
+                    "author_id": auth["user"]["id"],
+                    "client_id": "device_export_image",
+                    "platform": "web",
+                    "deleted": False,
+                    "props": {"asset_id": asset_id, "caption": "白板图", "width": 80, "height": 50},
+                    "source_refs": [],
+                }
+            ],
+        },
+        headers=auth_headers(auth, "device_export_image", "idem_export_image_document"),
+    )
+    assert document.status_code == 201, document.text
+    document_id = document.json()["id"]
+
+    docx_export = client.post(
+        "/api/v1/exports",
+        json={"document_id": document_id, "format": "docx", "client_id": "device_export_image"},
+        headers=auth_headers(auth, "device_export_image", "idem_export_image_docx"),
+    )
+    assert docx_export.status_code == 202, docx_export.text
+    docx_download = client.get(f"/api/v1/exports/{docx_export.json()['result']['export_id']}/download", headers=auth_headers(auth, "device_export_image"))
+    docx_stream = client.get(docx_download.json()["download_url"].removeprefix("http://testserver"))
+    assert docx_stream.status_code == 200, docx_stream.text
+    with zipfile.ZipFile(io.BytesIO(docx_stream.content)) as archive:
+        names = set(archive.namelist())
+        assert "word/media/image1.png" in names
+        assert archive.read("word/media/image1.png").startswith(b"\x89PNG\r\n\x1a\n")
+        document_xml = archive.read("word/document.xml").decode("utf-8")
+        relationships_xml = archive.read("word/_rels/document.xml.rels").decode("utf-8")
+        assert "<w:drawing>" in document_xml
+        assert "r:embed=\"rId3\"" in document_xml
+        assert "Target=\"media/image1.png\"" in relationships_xml
+        assert "图片：白板图" not in document_xml
+
+    pdf_export = client.post(
+        "/api/v1/exports",
+        json={"document_id": document_id, "format": "pdf", "client_id": "device_export_image"},
+        headers=auth_headers(auth, "device_export_image", "idem_export_image_pdf"),
+    )
+    assert pdf_export.status_code == 202, pdf_export.text
+    pdf_download = client.get(f"/api/v1/exports/{pdf_export.json()['result']['export_id']}/download", headers=auth_headers(auth, "device_export_image"))
+    pdf_stream = client.get(pdf_download.json()["download_url"].removeprefix("http://testserver"))
+    assert pdf_stream.status_code == 200, pdf_stream.text
+    assert pdf_stream.content.startswith(b"%PDF-")
+    assert b"/Subtype /Image" in pdf_stream.content
 
 
 def test_cors_preflight_allows_localhost_and_10_private_network() -> None:
@@ -821,6 +1005,11 @@ def test_p0_flow_register_upload_manuscript_convert_export() -> None:
     download = client.get(f"/api/v1/exports/{export_id}/download", headers=auth_headers(auth))
     assert download.status_code == 200, download.text
     assert download.json()["download_url"].startswith("http://testserver/api/v1/assets/")
+    assert "signature=" in download.json()["download_url"]
+    stream = client.get(download.json()["download_url"].removeprefix("http://testserver"))
+    assert stream.status_code == 200, stream.text
+    assert stream.content.startswith(b"%PDF-")
+    assert b"xref\n0 " in stream.content
 
 
 def test_asset_stream_can_fallback_to_stored_part_contents() -> None:
@@ -969,9 +1158,31 @@ def test_group_flow_create_join_send_and_download_document_snapshot() -> None:
     )
     assert expired_join.status_code == 403
 
+    group_image_asset_id = upload_ready_image(alice, "device_group_alice", "idem_group_image", make_test_png(64, 40))
+    created_at = iso_now()
     document = client.post(
         "/api/v1/documents",
-        json={"title": "Group Minutes", "client_id": "device_group_alice", "source_manuscript_ids": [], "derived_from": None, "initial_blocks": []},
+        json={
+            "title": "Group Minutes",
+            "client_id": "device_group_alice",
+            "source_manuscript_ids": [],
+            "derived_from": None,
+            "initial_blocks": [
+                {
+                    "id": "doc_group_image",
+                    "type": "image",
+                    "revision": 1,
+                    "created_at": created_at,
+                    "updated_at": created_at,
+                    "author_id": alice["user"]["id"],
+                    "client_id": "device_group_alice",
+                    "platform": "web",
+                    "deleted": False,
+                    "props": {"asset_id": group_image_asset_id, "caption": "群组白板", "width": 64, "height": 40},
+                    "source_refs": [],
+                }
+            ],
+        },
         headers=auth_headers(alice, "device_group_alice", "idem_group_document"),
     )
     assert document.status_code == 201, document.text
@@ -1007,6 +1218,19 @@ def test_group_flow_create_join_send_and_download_document_snapshot() -> None:
     assert download.content.startswith(b"%PDF")
     assert "attachment" in download.headers["content-disposition"]
     assert "Group%20Minutes.pdf" in download.headers["content-disposition"]
+    group_docx = client.get(
+        f"/api/v1/groups/{group['id']}/documents/{message['id']}/download?format=docx",
+        headers=auth_headers(bob, "device_group_bob"),
+    )
+    assert group_docx.status_code == 200, group_docx.text
+    with zipfile.ZipFile(io.BytesIO(group_docx.content)) as archive:
+        assert "word/media/image1.png" in set(archive.namelist())
+        assert "Target=\"media/image1.png\"" in archive.read("word/_rels/document.xml.rels").decode("utf-8")
+    delete_referenced_image = client.delete(
+        f"/api/v1/assets/{group_image_asset_id}",
+        headers=auth_headers(alice, "device_group_alice"),
+    )
+    assert delete_referenced_image.status_code == 409, delete_referenced_image.text
 
     outsider_messages = client.get(f"/api/v1/groups/{group['id']}/messages", headers=auth_headers(outsider, "device_group_outsider"))
     assert outsider_messages.status_code == 403
