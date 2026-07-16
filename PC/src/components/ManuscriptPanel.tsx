@@ -11,7 +11,6 @@ import type { KonvaEventObject } from "konva/lib/Node";
 import { pcApi, type AudioTranscription, type ConvertWarning, type ImageRecognitionResult } from "../lib/api";
 import { useWorkspaceStore } from "../stores/workspaceStore";
 import type { ManuscriptBlock } from "../types/block";
-import type { Manuscript } from "../types/manuscript";
 
 type StrokeTool = "pen" | "highlighter" | "eraser" | "lasso";
 type StrokePoint = { x: number; y: number; t: number; pressure: number };
@@ -46,11 +45,6 @@ type MenuState = {
   selectedStrokeIds: string[];
 } | null;
 type RenameDialogState = { manuscriptId: string; title: string };
-type ConvertDialogState = {
-  title: string;
-  optimizeAudio: boolean;
-  submitting: boolean;
-};
 type UiPointEvent = MouseEvent<Element> | ReactPointerEvent<Element>;
 type DrawingState =
   | { mode: "none" }
@@ -129,14 +123,8 @@ export function ManuscriptPanel(): React.JSX.Element {
   const [renameDialog, setRenameDialog] = useState<RenameDialogState | null>(
     null,
   );
-  const [convertDialog, setConvertDialog] = useState<ConvertDialogState | null>(
-    null,
-  );
-  const [convertTask, setConvertTask] = useState<Task | null>(null);
-  const [convertError, setConvertError] = useState<string | null>(null);
   const longPressTimerRef = useRef<number | null>(null);
   const autoSaveTimerRef = useRef<number | null>(null);
-  const openedDocumentTaskRef = useRef<string | null>(null);
   const lastSavedBlocksRef = useRef("");
   const isColorTool = tool === "pen" || tool === "highlighter";
   const color = tool === "highlighter" ? highlighterColor : penColor;
@@ -174,51 +162,6 @@ export function ManuscriptPanel(): React.JSX.Element {
       if (autoSaveTimerRef.current) window.clearTimeout(autoSaveTimerRef.current);
     };
   }, [blocks, manuscript, updateManuscript]);
-
-  useEffect(() => {
-    if (!convertTask) return;
-    if (
-      convertTask.status === "succeeded" &&
-      convertTask.result?.document_id &&
-      openedDocumentTaskRef.current !== convertTask.id
-    ) {
-      openedDocumentTaskRef.current = convertTask.id;
-      let active = true;
-      pcApi
-        .getDocument(convertTask.result.document_id)
-        .then((document) => {
-          if (!active) return;
-          addDocument(document);
-          openDocumentEditor(document.id);
-        })
-        .catch((error) => {
-          if (active)
-            setConvertError(
-              error instanceof Error ? error.message : "生成文档加载失败",
-            );
-        });
-      return () => {
-        active = false;
-      };
-    }
-    if (
-      convertTask.status === "succeeded" ||
-      convertTask.status === "failed" ||
-      convertTask.status === "cancelled"
-    )
-      return;
-    const timer = window.setInterval(() => {
-      pcApi
-        .getTask(convertTask.id)
-        .then(setConvertTask)
-        .catch((error) =>
-          setConvertError(
-            error instanceof Error ? error.message : "转换任务状态刷新失败",
-          ),
-        );
-    }, 1800);
-    return () => window.clearInterval(timer);
-  }, [addDocument, convertTask, openDocumentEditor]);
 
   const createManuscript = async (): Promise<void> => {
     const nextManuscript = await pcApi.createManuscript("未命名手稿");
@@ -673,17 +616,6 @@ export function ManuscriptPanel(): React.JSX.Element {
             {isConverting ? "转换中" : "转文档"}
           </button>
         </header>
-
-        {convertTask ? <ConvertTaskBanner task={convertTask} /> : null}
-        {convertError ? (
-          <button
-            className="mx-auto mb-4 block max-w-4xl rounded-2xl bg-red-50 px-4 py-3 text-left text-sm text-red-700"
-            onClick={() => setConvertError(null)}
-            type="button"
-          >
-            {convertError}
-          </button>
-        ) : null}
 
         <div className="sticky top-4 z-40 mx-auto mb-4 flex w-fit flex-wrap items-center gap-2 rounded-2xl border border-[#e4d7c4] bg-[#fffaf0]/95 p-2 shadow-2xl backdrop-blur">
           {(["pen", "highlighter", "eraser", "lasso"] as StrokeTool[]).map(
@@ -1688,17 +1620,3 @@ function getEyeDropper() {
   return candidate ? new candidate() : null;
 }
 
-function defaultDocumentTitle(manuscriptTitle: string): string {
-  const trimmed = manuscriptTitle.trim();
-  if (!trimmed) return "未命名文档";
-  return trimmed.endsWith("手稿") ? trimmed.replace(/手稿$/, "文档") : `${trimmed} 文档`;
-}
-
-function isConvertTaskRunning(task: Task | null): boolean {
-  return Boolean(
-    task &&
-      task.status !== "succeeded" &&
-      task.status !== "failed" &&
-      task.status !== "cancelled",
-  );
-}

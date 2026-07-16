@@ -2,6 +2,7 @@ import type { Document } from "../types/document";
 import type { Manuscript } from "../types/manuscript";
 import type { DocumentBlock, ManuscriptBlock } from "../types/block";
 import type { GroupDocumentMessage, GroupSummary } from "../types/group";
+import type { DocumentAgentContext, DocumentAgentMode } from "./documentAgent";
 
 type Platform = "windows" | "mac" | "web";
 
@@ -96,26 +97,6 @@ type RemoteGroupDocumentMessage = {
   document_title: string;
   document_revision: number;
   sent_at: string;
-};
-
-type Task = {
-  id: string;
-  type: string;
-  status: "queued" | "processing" | "succeeded" | "failed" | "cancelled";
-  progress?: {
-    stage?: string;
-    current?: number;
-    total?: number;
-    message?: string;
-  } | null;
-  result: Record<string, unknown> | null;
-  error?: { message?: string } | null;
-};
-
-export type ConvertWarning = {
-  block_id: string;
-  code: string;
-  message: string;
 };
 
 export type ConvertProgress = {
@@ -449,6 +430,10 @@ class PcApiClient {
     );
   }
 
+  async getTask(id: string): Promise<Task> {
+    return this.request<Task>(`/tasks/${id}`);
+  }
+
   async convertManuscript(
     id: string,
     title: string,
@@ -460,7 +445,7 @@ class PcApiClient {
       idempotent: true,
       body: JSON.stringify({
         manuscript_id: id,
-        mode,
+        mode: "meeting_minutes",
         title,
         client_id: this.clientId,
         optimize_audio: optimizeAudio,
@@ -493,13 +478,75 @@ class PcApiClient {
         client_id: this.clientId,
       }),
     });
-    const exportId = task.result?.export_id;
+    const completedTask = await this.waitForTask(task, "导出任务超时未返回结果");
+    const exportId = completedTask.result?.export_id;
     if (typeof exportId !== "string")
       throw new Error("导出任务未返回 export_id");
     const download = await this.request<{ download_url: string }>(
       `/exports/${exportId}/download`,
     );
     return download.download_url;
+  }
+
+  async exportDocumentBlob(
+    documentId: string,
+    format: "pdf" | "docx" = "docx",
+  ): Promise<Blob> {
+    const downloadUrl = await this.exportDocument(documentId, format);
+    return this.downloadAuthenticatedBlob(downloadUrl);
+  }
+
+  private async downloadAuthenticatedBlob(downloadUrl: string): Promise<Blob> {
+    if (!this.session) throw new ApiError(401, "请先登录服务器");
+    const accessToken = this.session.access_token;
+    const response = await this.fetchAuthenticatedBlob(downloadUrl);
+    if (response.ok) return response.blob();
+    if (response.status !== 401) throw await responseToApiError(response);
+
+    await this.refreshSession(accessToken);
+    const retryResponse = await this.fetchAuthenticatedBlob(downloadUrl);
+    if (!retryResponse.ok) throw await responseToApiError(retryResponse);
+    return retryResponse.blob();
+  }
+
+  private async fetchAuthenticatedBlob(downloadUrl: string): Promise<Response> {
+    if (!this.session) throw new ApiError(401, "请先登录服务器");
+    const url = new URL(downloadUrl, API_BASE_URL).toString();
+    return fetch(url, {
+      headers: {
+        Authorization: `Bearer ${this.session.access_token}`,
+        "X-Client-Id": this.clientId,
+        "X-Request-Id": crypto.randomUUID(),
+      },
+    });
+  }
+
+  async streamAgent(
+    documentId: string,
+    selectedBlockIds: string[],
+    prompt: string,
+    mode: DocumentAgentMode = "rewrite",
+    options: {
+      context?: DocumentAgentContext;
+      toolsVersion?: string;
+      selection?: { block_id: string; start: number; end: number; text: string } | null;
+    } = {},
+  ): Promise<Response> {
+    const body: Record<string, unknown> = {
+      document_id: documentId,
+      selected_block_ids: selectedBlockIds,
+      prompt,
+      mode,
+      client_id: this.clientId,
+    };
+    if (options.context) body.context = options.context;
+    if (options.toolsVersion) body.tools_version = options.toolsVersion;
+    if ("selection" in options) body.selection = options.selection ?? null;
+    return this.requestRaw("/ai/agent/chat", {
+      method: "POST",
+      idempotent: true,
+      body: JSON.stringify(body),
+    });
   }
 
   async transcribeAudio(file: SelectedFile): Promise<AudioTranscription> {
@@ -758,6 +805,24 @@ class PcApiClient {
     return parseResponse<T>(await this.fetchWithSession(path, requestOptions));
   }
 
+  private async requestRaw(
+    path: string,
+    options: RequestInit & { idempotent?: boolean } = {},
+  ): Promise<Response> {
+    if (!this.session) throw new ApiError(401, "请先登录服务器");
+
+    const accessToken = this.session.access_token;
+    const requestOptions = this.withRequestHeaders(options);
+    const response = await this.fetchWithSession(path, requestOptions);
+    if (response.ok) return response;
+    if (response.status !== 401) throw await responseToApiError(response);
+
+    await this.refreshSession(accessToken);
+    const retryResponse = await this.fetchWithSession(path, requestOptions);
+    if (!retryResponse.ok) throw await responseToApiError(retryResponse);
+    return retryResponse;
+  }
+
   private withRequestHeaders(
     options: RequestInit & { idempotent?: boolean },
   ): RequestInit {
@@ -910,11 +975,27 @@ function extractConvertWarnings(result: Record<string, unknown> | null): Convert
   if (!result || !Array.isArray(result.warnings)) return [];
   return result.warnings
     .filter(isRecord)
-    .map((warning) => ({
-      block_id: String(warning.block_id ?? ""),
-      code: String(warning.code ?? ""),
-      message: String(warning.message ?? ""),
-    }));
+    .map((warning) => {
+      const code = String(warning.code ?? "");
+      if (!isConvertWarningCode(code)) return null;
+      return {
+        block_id: String(warning.block_id ?? ""),
+        code,
+        message: String(warning.message ?? ""),
+      };
+    })
+    .filter((warning): warning is ConvertWarning => warning !== null);
+}
+
+function isConvertWarningCode(code: string): code is ConvertWarning["code"] {
+  return (
+    code === "audio_transcript_missing" ||
+    code === "audio_optimization_failed" ||
+    code === "image_caption_failed" ||
+    code === "handwriting_empty" ||
+    code === "handwriting_render_failed" ||
+    code === "handwriting_recognition_failed"
+  );
 }
 
 function toManuscript(remote: RemoteManuscript): Manuscript {
@@ -1030,6 +1111,7 @@ function toDocumentBlock(block: Record<string, unknown>): DocumentBlock {
     updatedAt: String(block.updated_at ?? ""),
     content,
     items: Array.isArray(props.items) ? props.items.map(String) : undefined,
+    props,
     sourceRefs: Array.isArray(block.source_refs) ? block.source_refs : [],
   };
 }

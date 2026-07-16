@@ -37,6 +37,7 @@ export function EditorPanel(): React.JSX.Element {
   const [editorValue, setEditorValue] = useState<Descendant[]>(() => blocksToSlateValue(document?.blocks ?? []));
   const [editorDocumentId, setEditorDocumentId] = useState(document?.id ?? "");
   const [editorRevision, setEditorRevision] = useState(0);
+  const [exportStatus, setExportStatus] = useState<string | null>(null);
   const lastSavedValueRef = useRef(serializeValue(editorValue));
 
   useEffect(() => {
@@ -78,6 +79,32 @@ export function EditorPanel(): React.JSX.Element {
 
   const renderElement = useCallback((props: RenderElementProps) => <Element {...props} />, []);
 
+  async function exportDocx(): Promise<void> {
+    if (!document) return;
+    try {
+      setExportStatus("正在保存并导出 DOCX");
+      const nextBlocks = slateValueToBlocks(editorValue);
+      const nextDocument = await pcApi.saveDocument({
+        ...document,
+        title: getTitleFromBlocks(nextBlocks, document.title),
+        blocks: nextBlocks,
+      });
+      updateDocument(nextDocument);
+      lastSavedValueRef.current = serializeValue(blocksToSlateValue(nextDocument.blocks));
+      setSaveStatus("saved");
+      const blob = await pcApi.exportDocumentBlob(nextDocument.id, "docx");
+      const filename = `${safeFilename(nextDocument.title)}.docx`;
+      if (window.meetingMate?.saveBlobFile) {
+        await window.meetingMate.saveBlobFile({ filename, data: await blob.arrayBuffer() });
+      } else {
+        downloadBlobInBrowser(blob, filename);
+      }
+      setExportStatus("DOCX 已导出");
+    } catch (error) {
+      setExportStatus(error instanceof Error ? error.message : "DOCX 导出失败");
+    }
+  }
+
   if (!document) {
     return (
       <section className="min-h-0 overflow-auto bg-slate-50 px-10 py-8">
@@ -91,13 +118,23 @@ export function EditorPanel(): React.JSX.Element {
   return (
     <section className="min-h-0 overflow-auto bg-slate-50 px-10 py-8">
       <div className="mx-auto max-w-4xl rounded-3xl border border-slate-200 bg-white p-10 shadow-sm">
-        <div className="mb-8 flex items-center justify-between border-b border-slate-100 pb-5">
+        <div className="mb-8 flex items-center justify-between gap-4 border-b border-slate-100 pb-5">
           <div>
             <div className="text-xs uppercase tracking-[0.2em] text-slate-400">Slate Document Editor</div>
             <div className="mt-2 text-sm text-slate-500">正式文档编辑器，停止输入 5 秒后自动保存。</div>
           </div>
-          <span className="rounded-full bg-slate-100 px-3 py-1 text-xs text-slate-500">{document.status}</span>
+          <div className="flex shrink-0 items-center gap-2">
+            <button className="rounded-xl bg-slate-950 px-4 py-2 text-sm font-medium text-white hover:bg-slate-800 disabled:opacity-50" disabled={exportStatus === "正在保存并导出 DOCX"} onClick={() => void exportDocx()} type="button">
+              {exportStatus === "正在保存并导出 DOCX" ? "导出中" : "导出 DOCX"}
+            </button>
+            <span className="rounded-full bg-slate-100 px-3 py-1 text-xs text-slate-500">{document.status}</span>
+          </div>
         </div>
+        {exportStatus ? (
+          <button className="mb-6 rounded-2xl bg-blue-50 px-4 py-3 text-left text-sm text-blue-700" onClick={() => setExportStatus(null)} type="button">
+            {exportStatus}
+          </button>
+        ) : null}
         {activeConversionNotice ? (
           <div className="mb-6 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
             <div className="flex items-start justify-between gap-4">
@@ -289,4 +326,19 @@ function serializeValue(value: Descendant[]): string {
 function getTitleFromBlocks(blocks: DocumentBlock[], fallback: string): string {
   const heading = blocks.find((block) => block.type === "heading");
   return heading?.content || fallback;
+}
+
+function safeFilename(value: string): string {
+  return (value.trim() || "document").replace(/[<>:"/\\|?*\x00-\x1F]/g, "_").slice(0, 100);
+}
+
+function downloadBlobInBrowser(blob: Blob, filename: string): void {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
