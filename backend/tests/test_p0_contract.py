@@ -15,8 +15,8 @@ os.environ["MEETINGMATE_SKIP_DOTENV"] = "1"
 
 import app.main as backend
 from app.asr import AsrProvider, AsrResult, AsrSegment
-from app.text import TextProvider
-from app.vision import VisionProvider, VisionResult
+from app.text import TextProvider, TextStreamChunk
+from app.vision import VisionProvider, VisionResult, build_image_prompt, result_from_text as vision_result_from_text
 
 
 class TestAsrProvider(AsrProvider):
@@ -89,7 +89,18 @@ class TestVisionProvider(VisionProvider):
                 )
                 + "\n```",
             )
-        return VisionResult(caption="白板架构图", text="白板架构图\n移动端、PC 端和后端 API 协作。")
+        return VisionResult(
+            caption="白板架构图",
+            text="```json\n"
+            + json.dumps(
+                {
+                    "caption": "白板架构图",
+                    "text": "# 白板架构图\n- 移动端、PC 端和后端 API 协作。",
+                },
+                ensure_ascii=False,
+            )
+            + "\n```",
+        )
 
     async def stream_recognize(
         self,
@@ -103,14 +114,66 @@ class TestVisionProvider(VisionProvider):
         prompt: str | None = None,
     ):
         assert content
-        yield "白板架构图\n"
-        yield "白板架构图\n移动端、PC 端和后端 API 协作。"
+        text = "```json\n" + json.dumps({"caption": "白板架构图", "text": "# 白板架构图\n- 移动端、PC 端和后端 API 协作。"}, ensure_ascii=False) + "\n```"
+        yield "```json\n"
+        yield text
 
 
 class TestTextProvider(TextProvider):
+    result: dict = {
+        "summary": "将选中段落整理为 3 条要点",
+        "tool_calls": [
+            {
+                "name": "convert_to_list",
+                "args": {"block_id": "doc_block_1", "style": "bullet", "items": ["第一点", "第二点", "第三点"]},
+            }
+        ],
+    }
+
+    @classmethod
+    def set_result(cls, result: dict) -> None:
+        cls.result = result
+
     async def clean_transcript(self, text: str, language: str = "zh-CN") -> str:
         assert language == "zh-CN"
         return text.replace("嗯", "").replace("就是", "").strip()
+
+    async def stream_json_completion(self, *, messages: list[dict[str, str]], response_format: dict[str, str], enable_thinking: bool):
+        assert response_format == {"type": "json_object"}
+        assert enable_thinking is True
+        assert "JSON" in messages[0]["content"] or "json" in messages[0]["content"]
+        yield TextStreamChunk(reasoning_content="分析选中内容")
+        yield TextStreamChunk(content=json.dumps(self.result, ensure_ascii=False))
+        yield TextStreamChunk(usage={"input_tokens": 12, "output_tokens": 8})
+
+
+def test_vision_result_from_json_removes_caption_and_markdown() -> None:
+    raw = "```json\n" + json.dumps(
+        {
+            "caption": "白板架构图",
+            "text": "# 白板架构图\n|事项|负责人|\n|---|---|\n|移动端适配|小李|\n- 完成接口联调\n* 跟进验收",
+        },
+        ensure_ascii=False,
+    ) + "\n```"
+
+    result = vision_result_from_text(raw)
+
+    assert result.caption == "白板架构图"
+    assert result.text == "事项\t负责人\n移动端适配\t小李\n完成接口联调\n跟进验收"
+    assert "白板架构图" not in result.text
+    assert "#" not in result.text
+    assert "|---|" not in result.text
+
+
+def test_default_image_prompt_requests_frontend_ready_json() -> None:
+    prompt = build_image_prompt(None, "zh-CN", 320, 200)
+
+    assert "只输出 JSON" in prompt
+    assert '返回格式：\n{"caption":"","text":""}' in prompt
+    assert "text 不要重复 caption" in prompt
+    assert "不要使用 Markdown" in prompt
+    assert "用户语言偏好：zh-CN" in prompt
+    assert "图片尺寸：320x200" in prompt
 
 
 class TestRepository:
@@ -462,6 +525,64 @@ def upload_ready_image(auth: dict, device_id: str, idempotency_prefix: str, cont
     )
     assert complete.status_code == 200, complete.text
     return asset_id
+
+
+def create_agent_document(auth: dict, device_id: str = "device_agent") -> tuple[str, str]:
+    created_at = iso_now()
+    response = client.post(
+        "/api/v1/documents",
+        json={
+            "title": "移动端文档编辑讨论",
+            "client_id": device_id,
+            "source_manuscript_ids": [],
+            "derived_from": None,
+            "initial_blocks": [
+                {
+                    "id": "doc_block_1",
+                    "type": "paragraph",
+                    "revision": 1,
+                    "created_at": created_at,
+                    "updated_at": created_at,
+                    "author_id": auth["user"]["id"],
+                    "client_id": device_id,
+                    "platform": "web",
+                    "deleted": False,
+                    "props": {"content": "我们现在需要让移动端文档编辑更自然，不要暴露块的概念。"},
+                    "source_refs": [],
+                }
+            ],
+        },
+        headers=auth_headers(auth, device_id, f"idem_agent_doc_{device_id}"),
+    )
+    assert response.status_code == 201, response.text
+    return response.json()["id"], response.json()["blocks"][0]["props"]["content"]
+
+
+def agent_payload(document_id: str, text: str, overrides: dict | None = None) -> dict:
+    payload = {
+        "document_id": document_id,
+        "selected_block_ids": ["doc_block_1"],
+        "prompt": "把选中内容整理成三个要点",
+        "mode": "edit",
+        "client_id": "device_agent",
+        "tools_version": "mobile-doc-agent-v1",
+        "selection": None,
+        "context": {
+            "title": "移动端文档编辑讨论",
+            "blocks": [
+                {
+                    "id": "doc_block_1",
+                    "type": "paragraph",
+                    "text": text,
+                    "list_style": None,
+                    "level": None,
+                }
+            ],
+        },
+    }
+    if overrides:
+        payload.update(overrides)
+    return payload
 
 
 def sse_events(text: str, event_name: str) -> list[dict]:
@@ -967,7 +1088,7 @@ def test_image_recognition_task_updates_image_block_and_convert_keeps_source_ref
     assert task.status_code == 200, task.text
     assert task.json()["status"] == "succeeded"
     assert task.json()["type"] == "recognize_image"
-    assert task.json()["result"] == {"asset_id": asset_id, "caption": "白板架构图", "text": "白板架构图\n移动端、PC 端和后端 API 协作。"}
+    assert task.json()["result"] == {"asset_id": asset_id, "caption": "白板架构图", "text": "移动端、PC 端和后端 API 协作。"}
     fetched = client.get(f"/api/v1/manuscripts/{manuscript.json()['id']}", headers=auth_headers(auth, "device_image"))
     image_props = fetched.json()["blocks"][0]["props"]
     assert image_props["caption"] == "白板架构图"
@@ -986,6 +1107,7 @@ def test_image_recognition_task_updates_image_block_and_convert_keeps_source_ref
     assert done_task["type"] == "recognize_image"
     assert done_task["result"]["asset_id"] == asset_id
     assert done_task["result"]["caption"] == "白板架构图"
+    assert done_task["result"]["text"] == "移动端、PC 端和后端 API 协作。"
 
     convert = client.post(
         "/api/v1/tasks/convert-manuscript",
@@ -1269,6 +1391,106 @@ def test_handwriting_convert_does_not_send_svg_to_vision() -> None:
     warning_codes = {warning["code"] for warning in task.json()["result"].get("warnings", [])}
     assert "handwriting_render_failed" in warning_codes
     assert TestVisionProvider.calls == []
+
+
+def test_agent_stream_returns_structured_tool_calls_without_mutating_document() -> None:
+    repo.reset()
+    TestTextProvider.set_result(
+        {
+            "summary": "将选中段落整理为 3 条要点",
+            "tool_calls": [
+                {
+                    "name": "convert_to_list",
+                    "args": {"block_id": "doc_block_1", "style": "bullet", "items": ["第一点", "第二点", "第三点"]},
+                }
+            ],
+        }
+    )
+    auth = register_user("agent@example.com", "device_agent")
+    document_id, original_text = create_agent_document(auth)
+    with client.stream(
+        "POST",
+        "/api/v1/ai/agent/chat",
+        json=agent_payload(document_id, original_text),
+        headers=auth_headers(auth, "device_agent", "idem_agent_chat"),
+    ) as response:
+        assert response.status_code == 200, response.text
+        assert response.headers["content-type"].startswith("text/event-stream")
+        events = response.read().decode("utf-8")
+    assert sse_events(events, "status")[0] == {"message": "正在分析选中内容"}
+    assert sse_events(events, "delta") == [{"text": "正在生成编辑建议..."}]
+    result = sse_events(events, "result")[0]
+    assert result["summary"] == "将选中段落整理为 3 条要点"
+    assert result["tool_calls"][0] == {"name": "convert_to_list", "args": {"block_id": "doc_block_1", "style": "bullet", "items": ["第一点", "第二点", "第三点"]}}
+    assert sse_events(events, "done")[0]["usage"] == {"input_tokens": 12, "output_tokens": 8}
+
+    stored = client.get(f"/api/v1/documents/{document_id}", headers=auth_headers(auth, "device_agent"))
+    assert stored.status_code == 200, stored.text
+    assert stored.json()["revision"] == 1
+    assert stored.json()["blocks"][0]["props"]["content"] == original_text
+
+
+def test_agent_non_stream_uses_idempotency_cache() -> None:
+    repo.reset()
+    TestTextProvider.set_result({"summary": "改写完成", "tool_calls": [{"name": "replace_block_text", "args": {"block_id": "doc_block_1", "content": "改写后的整段文本"}}]})
+    auth = register_user("agent-json@example.com", "device_agent")
+    document_id, text = create_agent_document(auth)
+    response = client.post(
+        "/api/v1/ai/agent/chat?stream=false",
+        json=agent_payload(document_id, text),
+        headers=auth_headers(auth, "device_agent", "idem_agent_json"),
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["summary"] == "改写完成"
+    assert body["tool_calls"][0]["name"] == "replace_block_text"
+    assert body["usage"] == {"input_tokens": 12, "output_tokens": 8}
+
+    TestTextProvider.set_result({"summary": "不应返回", "tool_calls": []})
+    replay = client.post(
+        "/api/v1/ai/agent/chat?stream=false",
+        json=agent_payload(document_id, text),
+        headers=auth_headers(auth, "device_agent", "idem_agent_json"),
+    )
+    assert replay.status_code == 200, replay.text
+    assert replay.json() == body
+
+
+def test_agent_rejects_invalid_request_context() -> None:
+    repo.reset()
+    auth = register_user("agent-invalid@example.com", "device_agent")
+    document_id, text = create_agent_document(auth)
+    invalid_mode = client.post(
+        "/api/v1/ai/agent/chat",
+        json=agent_payload(document_id, text, {"mode": "rewrite"}),
+        headers=auth_headers(auth, "device_agent", "idem_agent_invalid_mode"),
+    )
+    assert invalid_mode.status_code == 400, invalid_mode.text
+    assert invalid_mode.json()["error"]["code"] == "invalid_request"
+
+    invalid_context = client.post(
+        "/api/v1/ai/agent/chat",
+        json=agent_payload(document_id, text, {"context": {"title": "移动端文档编辑讨论", "blocks": [{"id": "missing", "type": "paragraph", "text": text, "list_style": None, "level": None}]}}),
+        headers=auth_headers(auth, "device_agent", "idem_agent_invalid_context"),
+    )
+    assert invalid_context.status_code == 422, invalid_context.text
+    assert invalid_context.json()["error"]["code"] == "validation_error"
+
+
+def test_agent_returns_error_for_invalid_model_tool_protocol() -> None:
+    repo.reset()
+    TestTextProvider.set_result({"summary": "错误列表样式", "tool_calls": [{"name": "convert_to_list", "args": {"block_id": "doc_block_1", "style": "number", "items": ["第一点"]}}]})
+    auth = register_user("agent-tool-invalid@example.com", "device_agent")
+    document_id, text = create_agent_document(auth)
+    with client.stream(
+        "POST",
+        "/api/v1/ai/agent/chat",
+        json=agent_payload(document_id, text),
+        headers=auth_headers(auth, "device_agent", "idem_agent_invalid_tool"),
+    ) as response:
+        assert response.status_code == 200, response.text
+        events = response.read().decode("utf-8")
+    assert sse_events(events, "error")[0] == {"code": "ai_unavailable", "message": "AI 输出不符合工具协议", "retryable": True}
 
 
 def test_idempotency_conflict_and_revision_conflict() -> None:

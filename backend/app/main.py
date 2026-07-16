@@ -26,7 +26,7 @@ from fastapi.routing import APIRouter
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.websockets import WebSocket, WebSocketDisconnect
 from dotenv import load_dotenv
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, TypeAdapter, model_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, TypeAdapter, ValidationError, model_validator
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -34,8 +34,8 @@ from starlette.requests import HTTPConnection
 
 from app.asr import AsrProvider, AsrProviderError, AsrResult, provider_from_environment as asr_provider_from_environment, result_from_text, stream_delta
 from app.database import DatabaseSettings, DatabaseState, check_database, close_database, connect_database, load_database_settings
-from app.text import TextProvider, local_clean_transcript, provider_from_environment as text_provider_from_environment
-from app.vision import VisionProvider, VisionProviderError, VisionResult, provider_from_environment as vision_provider_from_environment, result_from_text as vision_result_from_text
+from app.text import TextProvider, TextProviderError, local_clean_transcript, provider_from_environment as text_provider_from_environment
+from app.vision import VisionProvider, VisionProviderError, VisionResult, normalize_result as vision_normalize_result, provider_from_environment as vision_provider_from_environment, result_from_text as vision_result_from_text
 
 
 API_PREFIX = "/api/v1"
@@ -51,6 +51,9 @@ MAX_HANDWRITING_POINTS = 5000
 MAX_CLIENT_TIME_SKEW_SECONDS = 24 * 60 * 60
 GROUP_INVITE_CODE_SECONDS = 24 * 60 * 60
 MAX_INVITE_CODE_ATTEMPTS = 10
+AGENT_TOOLS_VERSION = "mobile-doc-agent-v1"
+MAX_AGENT_TOOL_CALLS = 20
+AGENT_EDITABLE_BLOCK_TYPES = {"paragraph", "heading", "quote", "code", "list"}
 DEFAULT_CORS_ORIGIN_REGEX = r"^https?://(localhost|127\.0\.0\.1|10\.(?:\d{1,3}\.){2}\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3})(?::\d+)?$"
 HANDWRITING_BITMAP_CONTENT_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/bmp"}
 HANDWRITING_RENDER_SCALE = 2
@@ -88,6 +91,10 @@ TaskStage = Literal[
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+class StrictAgentModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
 
 
 class ErrorBody(StrictModel):
@@ -936,12 +943,160 @@ class ExportDownloadResponse(StrictModel):
     expires_at: datetime
 
 
-class AiChatRequest(StrictModel):
+class AgentSelection(StrictAgentModel):
+    block_id: str
+    start: int = Field(ge=0)
+    end: int = Field(ge=0)
+    text: str
+
+    @model_validator(mode="after")
+    def validate_range(self) -> "AgentSelection":
+        if self.end < self.start:
+            raise ValueError("selection.end must be greater than or equal to selection.start")
+        return self
+
+
+class AgentContextBlock(StrictAgentModel):
+    id: str
+    type: Literal["paragraph", "heading", "quote", "code", "list", "image", "table"]
+    text: str
+    list_style: Literal["bullet", "numbered"] | None = None
+    level: Literal[1, 2, 3] | None = None
+
+
+class AgentContext(StrictAgentModel):
+    title: str
+    blocks: list[AgentContextBlock] = Field(min_length=1)
+
+
+class AiAgentChatRequest(StrictAgentModel):
     document_id: str
     selected_block_ids: list[str] = Field(default_factory=list)
     prompt: str
-    mode: Literal["rewrite", "summary", "continue", "qa"] | str
+    mode: str
     client_id: str
+    tools_version: str
+    selection: AgentSelection | None = None
+    context: AgentContext
+
+
+class ReplaceBlockTextArgs(StrictAgentModel):
+    block_id: str
+    content: str
+
+
+class ReplaceTextRangeArgs(StrictAgentModel):
+    block_id: str
+    start: int = Field(ge=0)
+    end: int = Field(ge=0)
+    content: str
+
+    @model_validator(mode="after")
+    def validate_range(self) -> "ReplaceTextRangeArgs":
+        if self.end < self.start:
+            raise ValueError("end must be greater than or equal to start")
+        return self
+
+
+class InsertParagraphAfterArgs(StrictAgentModel):
+    after_block_id: str | None = None
+    content: str
+
+
+class ConvertToHeadingArgs(StrictAgentModel):
+    block_id: str
+    level: Literal[1, 2, 3]
+    content: str
+
+
+class ConvertToListArgs(StrictAgentModel):
+    block_id: str
+    style: Literal["bullet", "numbered"]
+    items: list[str] = Field(min_length=1)
+
+
+class SplitParagraphArgs(StrictAgentModel):
+    block_id: str
+    paragraphs: list[str] = Field(min_length=1)
+
+
+class MergeBlocksArgs(StrictAgentModel):
+    block_ids: list[str] = Field(min_length=1)
+    content: str
+
+
+class DeleteBlocksArgs(StrictAgentModel):
+    block_ids: list[str] = Field(min_length=1)
+
+
+class ReplaceBlockTextCall(StrictAgentModel):
+    name: Literal["replace_block_text"]
+    args: ReplaceBlockTextArgs
+
+
+class ReplaceTextRangeCall(StrictAgentModel):
+    name: Literal["replace_text_range"]
+    args: ReplaceTextRangeArgs
+
+
+class InsertParagraphAfterCall(StrictAgentModel):
+    name: Literal["insert_paragraph_after"]
+    args: InsertParagraphAfterArgs
+
+
+class ConvertToHeadingCall(StrictAgentModel):
+    name: Literal["convert_to_heading"]
+    args: ConvertToHeadingArgs
+
+
+class ConvertToListCall(StrictAgentModel):
+    name: Literal["convert_to_list"]
+    args: ConvertToListArgs
+
+
+class SplitParagraphCall(StrictAgentModel):
+    name: Literal["split_paragraph"]
+    args: SplitParagraphArgs
+
+
+class MergeBlocksCall(StrictAgentModel):
+    name: Literal["merge_blocks"]
+    args: MergeBlocksArgs
+
+
+class DeleteBlocksCall(StrictAgentModel):
+    name: Literal["delete_blocks"]
+    args: DeleteBlocksArgs
+
+
+AgentToolCall = Annotated[
+    ReplaceBlockTextCall
+    | ReplaceTextRangeCall
+    | InsertParagraphAfterCall
+    | ConvertToHeadingCall
+    | ConvertToListCall
+    | SplitParagraphCall
+    | MergeBlocksCall
+    | DeleteBlocksCall,
+    Field(discriminator="name"),
+]
+
+
+class AgentResult(StrictAgentModel):
+    summary: str
+    tool_calls: list[AgentToolCall] = Field(default_factory=list, max_length=MAX_AGENT_TOOL_CALLS)
+
+
+class AgentUsage(StrictAgentModel):
+    input_tokens: int = Field(ge=0)
+    output_tokens: int = Field(ge=0)
+
+
+class AgentChatResponse(StrictAgentModel):
+    message_id: str
+    summary: str
+    tool_calls: list[AgentToolCall]
+    usage: AgentUsage
 
 
 class DocumentVersion(StrictModel):
@@ -2686,14 +2841,14 @@ async def build_document_blocks_from_manuscript(
                         image_record = await get_asset_record(db, source.props.asset_id, manuscript.owner_id)
                         if image_record.asset.kind != "image" or image_record.asset.status != "ready":
                             raise validation_error("Image block references an unavailable image asset.")
-                        result = await vision_provider.recognize(
+                        result = vision_normalize_result(await vision_provider.recognize(
                             filename=image_record.asset.filename,
                             content_type=image_record.asset.content_type,
                             content=require_asset_content(image_record),
                             width=image_record.asset.width,
                             height=image_record.asset.height,
                             language="zh-CN",
-                        )
+                        ))
                         caption = result.caption
                         image_caption_cache[source.props.asset_id] = caption
                         requested_caption = True
@@ -2830,7 +2985,7 @@ async def apply_image_result_to_manuscripts(
                     continue
                 props = block.props.model_copy(
                     update={
-                        "caption": result.caption or result.text or block.props.caption,
+                        "caption": result.caption,
                         "recognition_task_id": task_id,
                         "recognition_generated_at": generated_at,
                     }
@@ -2876,6 +3031,244 @@ def provider_task_error_code(retryable: bool) -> str:
 
 def sse_event(event: str, data: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(jsonable_encoder(data), ensure_ascii=False)}\n\n"
+
+
+class AgentOutputError(Exception):
+    pass
+
+
+def undeleted_document_blocks_by_id(document: Document) -> dict[str, DocumentBlock]:
+    return {block.id: block for block in document.blocks if not block.deleted}
+
+
+def validate_agent_request(payload: AiAgentChatRequest, document: Document) -> dict[str, AgentContextBlock]:
+    if payload.mode != "edit":
+        raise APIError(status.HTTP_400_BAD_REQUEST, "invalid_request", "Only mode 'edit' is supported for the document Agent.")
+    if payload.tools_version != AGENT_TOOLS_VERSION:
+        raise APIError(status.HTTP_400_BAD_REQUEST, "invalid_request", "Unsupported Agent tools_version.")
+    if not payload.prompt.strip():
+        raise validation_error("prompt must not be empty.")
+
+    document_blocks = undeleted_document_blocks_by_id(document)
+    context_by_id: dict[str, AgentContextBlock] = {}
+    for context_block in payload.context.blocks:
+        if context_block.id in context_by_id:
+            raise validation_error("context.blocks must not contain duplicate block ids.", {"block_id": context_block.id})
+        document_block = document_blocks.get(context_block.id)
+        if document_block is None:
+            raise validation_error("context block id does not exist in the current document.", {"block_id": context_block.id})
+        if context_block.type != document_block.type:
+            raise validation_error("context block type does not match the current document.", {"block_id": context_block.id})
+        if isinstance(document_block, DocumentListBlock):
+            if context_block.list_style != document_block.props.style:
+                raise validation_error("context list_style does not match the current document.", {"block_id": context_block.id})
+        elif context_block.list_style is not None:
+            raise validation_error("context list_style is only valid for list blocks.", {"block_id": context_block.id})
+        if isinstance(document_block, DocumentHeadingBlock):
+            if context_block.level != document_block.props.level:
+                raise validation_error("context heading level does not match the current document.", {"block_id": context_block.id})
+        elif context_block.level is not None:
+            raise validation_error("context level is only valid for heading blocks.", {"block_id": context_block.id})
+        context_by_id[context_block.id] = context_block
+
+    for block_id in payload.selected_block_ids:
+        if block_id not in document_blocks:
+            raise validation_error("selected_block_ids contains a block id that does not exist in the current document.", {"block_id": block_id})
+        if payload.selected_block_ids and block_id not in context_by_id:
+            raise validation_error("selected_block_ids must be included in context.blocks.", {"block_id": block_id})
+
+    if payload.selection is not None:
+        selection_block = context_by_id.get(payload.selection.block_id)
+        if selection_block is None:
+            raise validation_error("selection.block_id must be included in context.blocks.", {"block_id": payload.selection.block_id})
+        if selection_block.type not in {"paragraph", "heading", "quote", "code"}:
+            raise validation_error("selection is only supported for paragraph, heading, quote, and code blocks.", {"block_id": payload.selection.block_id})
+        if payload.selection.end > len(selection_block.text):
+            raise validation_error("selection range is outside the block text.", {"block_id": payload.selection.block_id})
+        if selection_block.text[payload.selection.start : payload.selection.end] != payload.selection.text:
+            raise validation_error("selection.text does not match the selected range.", {"block_id": payload.selection.block_id})
+
+    return context_by_id
+
+
+def agent_prompt_system_message() -> str:
+    return f"""
+你是 MeetingMate 移动端文档编辑 Agent。你只负责根据用户指令生成受控工具调用，由前端预览和执行；你绝不能声称已经保存、同步或直接修改文档。
+
+你必须只输出一个合法 JSON 对象，不要输出 Markdown、代码块、解释文本或多余前后缀。JSON 顶层格式必须严格为：
+{{"summary":"对本次编辑建议的一句话中文摘要","tool_calls":[]}}
+
+工作边界：
+1. 只能使用下方允许的工具名称和参数结构，不得创造工具、字段或权限参数。
+2. 只能引用请求 context.blocks 中出现的 block id；不要创造不存在的 block_id。
+3. 如果用户选中了内容，默认只修改选中的 context.blocks。除非用户明确要求“全文”“整篇”“所有内容”，不要扩展修改范围。
+4. image 和 table 可以作为理解上下文，但首期不要对 image/table 返回编辑、转换、删除或合并工具。
+5. 当前文档模型不支持行内富文本。不要输出加粗、链接、颜色、HTML、Markdown 列表标记或其他富文本语法；需要列表时使用 convert_to_list。
+6. 编号列表的 style 必须使用 "numbered"，绝不能使用 "number"。
+7. 当前没有启用字符级 selection；除非请求 selection 非 null 且用户明确要求局部替换，否则不要使用 replace_text_range。
+8. 如果用户请求无法用当前工具表达，返回空 tool_calls，并在 summary 中说明原因。
+9. 工具数量最多 {MAX_AGENT_TOOL_CALLS} 个。优先生成最少且语义明确的工具调用。
+10. 你可以在内部思考编辑方案，但最终 content 只能是上述 JSON 对象，不能包含思考过程。
+
+允许工具 JSON schema 摘要：
+- replace_block_text: {{"name":"replace_block_text","args":{{"block_id":"doc_block_id","content":"替换后的整段文本"}}}}
+- replace_text_range: {{"name":"replace_text_range","args":{{"block_id":"doc_block_id","start":0,"end":12,"content":"替换文本"}}}}
+- insert_paragraph_after: {{"name":"insert_paragraph_after","args":{{"after_block_id":"doc_block_id 或 null","content":"新增段落"}}}}
+- convert_to_heading: {{"name":"convert_to_heading","args":{{"block_id":"doc_block_id","level":1,"content":"标题文本"}}}}，level 只能是 1、2、3。
+- convert_to_list: {{"name":"convert_to_list","args":{{"block_id":"doc_block_id","style":"bullet 或 numbered","items":["第一项","第二项"]}}}}，items 不能为空。
+- split_paragraph: {{"name":"split_paragraph","args":{{"block_id":"doc_block_id","paragraphs":["第一段","第二段"]}}}}，paragraphs 不能为空。
+- merge_blocks: {{"name":"merge_blocks","args":{{"block_ids":["doc_block_1","doc_block_2"],"content":"合并后的文本"}}}}，block_ids 不能为空。
+- delete_blocks: {{"name":"delete_blocks","args":{{"block_ids":["doc_block_1","doc_block_2"]}}}}，block_ids 不能为空。
+""".strip()
+
+
+def build_agent_messages(payload: AiAgentChatRequest) -> list[dict[str, str]]:
+    user_payload = {
+        "prompt": payload.prompt.strip(),
+        "selected_block_ids": payload.selected_block_ids,
+        "selection": payload.selection.model_dump(mode="json") if payload.selection else None,
+        "context": payload.context.model_dump(mode="json"),
+        "tools_version": payload.tools_version,
+        "response_contract": {"type": "JSON", "shape": {"summary": "string", "tool_calls": "array"}},
+    }
+    return [
+        {"role": "system", "content": agent_prompt_system_message()},
+        {"role": "user", "content": "请根据以下 JSON 请求生成文档编辑工具调用，只返回 JSON：\n" + json.dumps(user_payload, ensure_ascii=False, indent=2)},
+    ]
+
+
+def agent_usage_from_dict(value: dict[str, int] | None) -> AgentUsage:
+    if not value:
+        return AgentUsage(input_tokens=0, output_tokens=0)
+    return AgentUsage(input_tokens=int(value.get("input_tokens", 0) or 0), output_tokens=int(value.get("output_tokens", 0) or 0))
+
+
+def parse_agent_result(raw_text: str) -> AgentResult:
+    raw = raw_text.strip()
+    if not raw:
+        raise AgentOutputError("AI 输出不符合工具协议")
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        fenced = strip_json_fence(raw)
+        if fenced == raw:
+            raise AgentOutputError("AI 输出不符合工具协议")
+        try:
+            payload = json.loads(fenced)
+        except json.JSONDecodeError as exc:
+            raise AgentOutputError("AI 输出不符合工具协议") from exc
+    try:
+        return AgentResult.model_validate(payload)
+    except ValidationError as exc:
+        raise AgentOutputError("AI 输出不符合工具协议") from exc
+
+
+def require_agent_context_block(context_by_id: dict[str, AgentContextBlock], block_id: str, field_name: str) -> AgentContextBlock:
+    block = context_by_id.get(block_id)
+    if block is None:
+        raise AgentOutputError("AI 输出不符合工具协议")
+    return block
+
+
+def require_agent_editable_block(context_by_id: dict[str, AgentContextBlock], block_id: str, field_name: str) -> AgentContextBlock:
+    block = require_agent_context_block(context_by_id, block_id, field_name)
+    if block.type not in AGENT_EDITABLE_BLOCK_TYPES:
+        raise AgentOutputError("AI 输出不符合工具协议")
+    return block
+
+
+def require_non_empty_text_items(values: list[str], field_name: str) -> None:
+    if not values or any(not value.strip() for value in values):
+        raise AgentOutputError("AI 输出不符合工具协议")
+
+
+def validate_agent_result(result: AgentResult, context_by_id: dict[str, AgentContextBlock]) -> AgentResult:
+    for call in result.tool_calls:
+        if isinstance(call, ReplaceBlockTextCall):
+            require_agent_editable_block(context_by_id, call.args.block_id, "block_id")
+        elif isinstance(call, ReplaceTextRangeCall):
+            block = require_agent_editable_block(context_by_id, call.args.block_id, "block_id")
+            if block.type not in {"paragraph", "heading", "quote", "code"}:
+                raise AgentOutputError("AI 输出不符合工具协议")
+            if call.args.end > len(block.text):
+                raise AgentOutputError("AI 输出不符合工具协议")
+        elif isinstance(call, InsertParagraphAfterCall):
+            if call.args.after_block_id is not None:
+                require_agent_context_block(context_by_id, call.args.after_block_id, "after_block_id")
+        elif isinstance(call, ConvertToHeadingCall):
+            require_agent_editable_block(context_by_id, call.args.block_id, "block_id")
+        elif isinstance(call, ConvertToListCall):
+            require_agent_editable_block(context_by_id, call.args.block_id, "block_id")
+            require_non_empty_text_items(call.args.items, "items")
+        elif isinstance(call, SplitParagraphCall):
+            require_agent_editable_block(context_by_id, call.args.block_id, "block_id")
+            require_non_empty_text_items(call.args.paragraphs, "paragraphs")
+        elif isinstance(call, MergeBlocksCall):
+            require_non_empty_text_items(call.args.block_ids, "block_ids")
+            for block_id in call.args.block_ids:
+                require_agent_editable_block(context_by_id, block_id, "block_ids")
+        elif isinstance(call, DeleteBlocksCall):
+            require_non_empty_text_items(call.args.block_ids, "block_ids")
+            for block_id in call.args.block_ids:
+                require_agent_editable_block(context_by_id, block_id, "block_ids")
+    return result
+
+
+async def run_agent_completion(payload: AiAgentChatRequest, provider: TextProvider) -> tuple[AgentResult, AgentUsage]:
+    content_parts: list[str] = []
+    usage = AgentUsage(input_tokens=0, output_tokens=0)
+    async for chunk in provider.stream_json_completion(
+        messages=build_agent_messages(payload),
+        response_format={"type": "json_object"},
+        enable_thinking=True,
+    ):
+        if chunk.content:
+            content_parts.append(chunk.content)
+        if chunk.usage:
+            usage = agent_usage_from_dict(chunk.usage)
+    result = parse_agent_result("".join(content_parts))
+    context_by_id = {block.id: block for block in payload.context.blocks}
+    return validate_agent_result(result, context_by_id), usage
+
+
+async def make_agent_chat_response(payload: AiAgentChatRequest, provider: TextProvider) -> AgentChatResponse:
+    result, usage = await run_agent_completion(payload, provider)
+    return AgentChatResponse(message_id=new_id("msg"), summary=result.summary, tool_calls=result.tool_calls, usage=usage)
+
+
+async def stream_agent_chat_events(payload: AiAgentChatRequest, provider: TextProvider) -> AsyncIterator[str]:
+    yield sse_event("status", {"message": "正在分析选中内容"})
+    content_parts: list[str] = []
+    usage = AgentUsage(input_tokens=0, output_tokens=0)
+    reasoning_started = False
+    answer_started = False
+    try:
+        async for chunk in provider.stream_json_completion(
+            messages=build_agent_messages(payload),
+            response_format={"type": "json_object"},
+            enable_thinking=True,
+        ):
+            if chunk.reasoning_content and not reasoning_started:
+                reasoning_started = True
+                yield sse_event("status", {"message": "正在推理编辑方案"})
+            if chunk.content:
+                content_parts.append(chunk.content)
+                if not answer_started:
+                    answer_started = True
+                    yield sse_event("delta", {"text": "正在生成编辑建议..."})
+            if chunk.usage:
+                usage = agent_usage_from_dict(chunk.usage)
+        result = parse_agent_result("".join(content_parts))
+        context_by_id = {block.id: block for block in payload.context.blocks}
+        result = validate_agent_result(result, context_by_id)
+        yield sse_event("result", result.model_dump(mode="json"))
+        yield sse_event("done", {"message_id": new_id("msg"), "usage": usage.model_dump(mode="json")})
+    except AgentOutputError:
+        yield sse_event("error", {"code": "ai_unavailable", "message": "AI 输出不符合工具协议", "retryable": True})
+    except TextProviderError as exc:
+        yield sse_event("error", {"code": "ai_unavailable", "message": "LLM 生成失败", "retryable": exc.retryable})
+    except Exception:
+        yield sse_event("error", {"code": "ai_unavailable", "message": "LLM 生成失败", "retryable": True})
 
 
 async def process_asr_task(
@@ -3025,14 +3418,14 @@ async def process_image_task(
         if asset_record.asset.kind != "image" or asset_record.asset.status != "ready":
             raise validation_error("Image recognition requires a ready image asset.")
         content = require_asset_content(asset_record)
-        result = await provider.recognize(
+        result = vision_normalize_result(await provider.recognize(
             filename=asset_record.asset.filename,
             content_type=asset_record.asset.content_type,
             content=content,
             width=asset_record.asset.width,
             height=asset_record.asset.height,
             language=payload.language,
-        )
+        ))
         generated_at = utcnow()
         await apply_image_result_to_manuscripts(db, owner_id, payload.asset_id, task_id, result, generated_at)
         completed = processing.model_copy(
@@ -4272,35 +4665,44 @@ async def download_export(
     )
 
 
-@router.post("/ai/agent/chat", dependencies=IDEMPOTENT_WRITE_DEPENDENCIES)
+@router.post("/ai/agent/chat", response_model=None, dependencies=IDEMPOTENT_WRITE_DEPENDENCIES)
 async def ai_agent_chat(
     request: Request,
-    payload: AiChatRequest,
+    payload: AiAgentChatRequest,
+    stream: bool = True,
     last_event_id: Annotated[str | None, Header(alias="Last-Event-ID")] = None,
     ctx: AuthContext = Depends(auth_context),
     db: PostgresRepository = Depends(get_repository),
-) -> StreamingResponse:
+) -> StreamingResponse | JSONResponse:
     require_client_header(request, ctx, payload.client_id)
-    require_idempotency_header(request)
-    await get_document(db, payload.document_id, ctx.user_id)
     resume_after = 0
     if last_event_id:
         try:
             resume_after = int(last_event_id)
         except ValueError:
             raise APIError(status.HTTP_400_BAD_REQUEST, "invalid_request", "Last-Event-ID must be an integer event id.")
+    if not stream:
+        idem = await require_idempotency(request, ctx, db)
+        if idem[2]:
+            return await idempotent_json_response(db, idem, None, status.HTTP_200_OK)
+        document = await get_document(db, payload.document_id, ctx.user_id)
+        validate_agent_request(payload, document)
+        try:
+            response = await make_agent_chat_response(payload, get_text_provider(request))
+        except AgentOutputError as exc:
+            raise APIError(status.HTTP_503_SERVICE_UNAVAILABLE, "ai_unavailable", str(exc) or "AI 输出不符合工具协议", {"retryable": True}) from exc
+        except TextProviderError as exc:
+            raise APIError(status.HTTP_503_SERVICE_UNAVAILABLE, "ai_unavailable", "LLM 生成失败", {"retryable": exc.retryable}) from exc
+        except Exception as exc:
+            raise APIError(status.HTTP_503_SERVICE_UNAVAILABLE, "ai_unavailable", "LLM 生成失败", {"retryable": True}) from exc
+        return await idempotent_json_response(db, idem, response, status.HTTP_200_OK)
 
-    async def events():
-        yield ": heartbeat\n\n"
-        stream_events = [
-            (1, "delta", '{"text":"AI service placeholder"}'),
-            (2, "done", f'{{"message_id":"{new_id("msg")}","usage":{{"input_tokens":0,"output_tokens":0}}}}'),
-        ]
-        for event_id, event_name, data in stream_events:
-            if event_id > resume_after:
-                yield f"id: {event_id}\nevent: {event_name}\ndata: {data}\n\n"
-
-    return StreamingResponse(events(), media_type="text/event-stream")
+    require_idempotency_header(request)
+    if resume_after > 0:
+        raise APIError(status.HTTP_400_BAD_REQUEST, "invalid_request", "Agent chat stream resume is not supported yet.")
+    document = await get_document(db, payload.document_id, ctx.user_id)
+    validate_agent_request(payload, document)
+    return StreamingResponse(stream_agent_chat_events(payload, get_text_provider(request)), media_type="text/event-stream")
 
 
 @router.websocket("/ai/handwriting/complete")
